@@ -4,40 +4,63 @@ import pyotp
 from fyers_apiv3 import fyersModel, accessToken
 from supabase import create_client
 
-# Environment Variables (Render se aayenge)
-client_id = os.getenv("FYERS_CLIENT_ID")
-secret_key = os.getenv("FYERS_SECRET_KEY")
-fyers_id = os.getenv("FYERS_ID")
-totp_key = os.getenv("FYERS_TOTP_KEY")
-pin = os.getenv("FYERS_PIN")
+# --- ALL KEYS MIXED HERE ---
+# Fyers Details (From your screenshots)
+client_id = "BC7D6RF1O7-100"
+secret_key = "6MUU574Y06"
+fyers_id = "FA141352"
+# Dhyan de: TOTP Key aur PIN tujhe khud niche bharna hoga
+totp_key = "PASTE_YOUR_TOTP_SECRET_HERE" 
+pin = "8658"
 
-# Supabase Setup
+# Supabase Details (From your screenshots)
 SUPABASE_URL = "https://rcosgmsyisybusmuxzei.supabase.co"
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+# Screenshot 3 ki 'Secret Key' (sb_secret...) yahan dalo
+SUPABASE_KEY = "PASTE_YOUR_SUPABASE_SECRET_KEY_HERE" 
+
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def get_access_token():
-    print("Auto-logging into Fyers...")
-    # TOTP generate karega login ke liye
-    otp = pyotp.TOTP(totp_key).now()
-    # Note: Full auto-login flow requires handling Fyers redirect
-    # For now, we print status.
-    return "YOUR_ACCESS_TOKEN"
+    """Rozana naya token banane ke liye logic"""
+    print(f"Auto-Login start for {fyers_id}...")
+    try:
+        otp = pyotp.TOTP(totp_key).now()
+        # Note: Full automation ke liye Selenium lagta hai, 
+        # filhaal ye structure hai token receive karne ka.
+        return "YOUR_MANUAL_TOKEN_FOR_TESTING"
+    except Exception as e:
+        print(f"Login failed: {e}")
+        return None
 
 def start_sync():
-    print("Backend Active! Price sync starting...")
+    token = get_access_token()
+    if not token: return
+
+    fyers = fyersModel.FyersModel(client_id=client_id, token=token)
+    print("🚀 Backend Live! Syncing to Supabase...")
+
+    # Jo symbols app mein chahiye
+    symbols = ["NSE:NIFTY50-INDEX", "NSE:NIFTYBANK-INDEX"]
+
     while True:
         try:
-            # Testing ke liye dummy data (Asli symbols yahan dalenge)
-            supabase.table("market_updates").upsert({
-                "symbol": "NIFTY", 
-                "price": 21750.40
-            }).execute()
-            time.sleep(1)
+            res = fyers.quotes({"symbols": ",".join(symbols)})
+            if res['s'] == 'ok':
+                for item in res['d']:
+                    sym = item['n'].replace("NSE:", "")
+                    price = item['v']['lp']
+                    
+                    # Supabase mein update bhejna
+                    supabase.table("market_updates").upsert({
+                        "symbol": sym, 
+                        "price": float(price),
+                        "updated_at": "now()"
+                    }).execute()
+                print(f"Prices Updated: {time.strftime('%H:%M:%S')}")
         except Exception as e:
             print(f"Error: {e}")
             time.sleep(5)
+        time.sleep(1) # Har second update
 
 if __name__ == "__main__":
     start_sync()
-
