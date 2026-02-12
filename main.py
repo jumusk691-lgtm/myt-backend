@@ -10,13 +10,13 @@ client_id = "BC7D6RF1O7-100"
 secret_key = "6MUU574Y06"
 fyers_id = "FA141352"
 # Dhyan de: TOTP Key aur PIN tujhe khud niche bharna hoga
-totp_key = "PASTE_YOUR_TOTP_SECRET_HERE" 
+totp_key = "X5ULXCNYPF3UGA76XTY4CVA5JQQYVINZ"
 pin = "8658"
 
 # Supabase Details (From your screenshots)
 SUPABASE_URL = "https://rcosgmsyisybusmuxzei.supabase.co"
 # Screenshot 3 ki 'Secret Key' (sb_secret...) yahan dalo
-SUPABASE_KEY = "PASTE_YOUR_SUPABASE_SECRET_KEY_HERE" 
+SUPABASE_KEY = "sb_publishable_pnx6Vb-0H5s9snJocBpVOQ_btd8fQ85"
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
