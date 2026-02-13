@@ -3,3 +3,5 @@ smartapi-python
 pyotp
 supabase
 gunicorn
+logzero
+websocket-client
