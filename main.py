@@ -10,7 +10,7 @@ API_KEY = "UglQ6MMH"
 CLIENT_ID = "S52638556"
 PASSWORD = "0000"
 TOTP_SECRET = "XFTXZ2445N4V2UMB7EWUCBDRMU"
-SUPABASE_URL = "https://rcosgnsyisybusmuxzei.supabase.co"
+SUPABASE_URL = "https://rcosgmsyisybusmuxzei.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJjb3NnbXN5aXN5YnVzbXV4emVpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA4MzkxMzQsImV4cCI6MjA4NjQxNTEzNH0.7h-9tI7FMMRA_4YACKyPctFxfcLbEYBlhmWXfVOIOKs"
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
