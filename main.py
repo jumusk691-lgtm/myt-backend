@@ -11,7 +11,7 @@ app = Flask(__name__)
 client_id = "BC7D6RF1O7-100"
 secret_key = "J6QR47A85N"
 SUPABASE_URL = "https://rcosgmsyisybusmuxzei.supabase.co"
-SUPABASE_KEY = "EyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." # Poori key dalo
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJjb3NnbXN5aXN5YnVzbXV4emVpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA4MzkxMzQsImV4cCI6MjA4NjQxNTEzNH0.7h-9tI7FMMRA_4YACKyPctFxfcLbEYBlhmWXfVOIOKs"
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
