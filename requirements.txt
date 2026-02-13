@@ -1,4 +1,6 @@
 fyers-apiv3
 supabase
-pyotp
+flask
+gunicorn
 requests
+python-dotenv
