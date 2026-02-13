@@ -1,6 +1,4 @@
-fyers-apiv3
-supabase
 flask
-gunicorn
-requests
-python-dotenv
+smartapi-python
+pyotp
+supabase
