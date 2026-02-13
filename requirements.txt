@@ -2,3 +2,4 @@ flask
 smartapi-python
 pyotp
 supabase
+gunicorn
