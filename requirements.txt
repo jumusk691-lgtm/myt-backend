@@ -1,7 +1,7 @@
-flask
 smartapi-python
+python-socketio
+eventlet
 pyotp
+pandas
 supabase
-gunicorn
-logzero
-websocket-client
+requests
