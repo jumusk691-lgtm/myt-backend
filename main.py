@@ -1,12 +1,12 @@
 import eventlet
-eventlet.monkey_patch()  # इसे सबसे ऊपर ही रखें
+eventlet.monkey_patch()  # यह लाइन सबसे ऊपर ही होनी चाहिए
 
 import os
 import pyotp
-from SmartApi import SmartConnect
-from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 import socketio
 import eventlet.wsgi
+from SmartApi import SmartConnect
+from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 from supabase import create_client, Client
 
 # --- CONFIG ---
@@ -38,12 +38,12 @@ def subscribe(sid, data):
             token_list = [{"exchangeType": 1, "tokens": [t]} for t in new_tokens]
             sws_instance.subscribe("myt_pro", 3, token_list)
             subscribed_tokens.update(new_tokens)
-            print(f"📡 Subscribed to: {new_tokens}")
+            print(f"📡 Now Streaming: {len(subscribed_tokens)} tokens")
 
 def start_web_socket(session_data):
     global sws_instance
     sws_instance = SmartWebSocketV2(session_data['jwt'], API_KEY, CLIENT_ID, session_data['feed'])
-
+    
     def on_data(wsapp, msg):
         if 'last_traded_price' in msg:
             payload = {"tk": str(msg.get('token')), "lp": str(msg.get('last_traded_price') / 100)}
@@ -52,7 +52,6 @@ def start_web_socket(session_data):
     sws_instance.on_data = on_data
     eventlet.spawn(sws_instance.connect)
 
-# --- LOGIN & RUN ---
 if __name__ == '__main__':
     try:
         obj = SmartConnect(api_key=API_KEY)
@@ -63,13 +62,13 @@ if __name__ == '__main__':
             auth_data = {"jwt": session['data']['jwtToken'], "feed": session['data']['feedToken']}
             start_web_socket(auth_data)
             
-            # RENDER FIX: पोर्ट को एनवायरनमेंट से उठाना और 0.0.0.0 पर बाइंड करना
+            # Render Fix: Port assignment
             port = int(os.environ.get('PORT', 10000))
-            print(f"🚀 Server starting on port {port}...")
+            print(f"🔥 Starting server on 0.0.0.0:{port}")
             
-            # महत्वपूर्ण: log_output को True रखें ताकि आप Render logs देख सकें
+            # Use eventlet to serve the app
             eventlet.wsgi.server(eventlet.listen(('0.0.0.0', port)), app)
         else:
             print("❌ Angel Login Failed")
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"❌ Critical Error: {e}")
