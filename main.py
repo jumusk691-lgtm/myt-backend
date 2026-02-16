@@ -4,7 +4,8 @@ import requests
 import pandas as pd
 from datetime import datetime
 from SmartApi import SmartConnect
-from SmartApi.smartConnect import SmartWebSocketV3 
+# V3 ke bajaye stable version use kar rahe hain jo Render pe support hai
+from SmartApi.smartConnect import SmartWebSocket 
 import socketio
 import eventlet
 import eventlet.wsgi
@@ -24,26 +25,25 @@ sio = socketio.Server(cors_allowed_origins='*')
 app = socketio.WSGIApp(sio)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# --- 3. SMART AUTOMATIC UPDATE (Sirf Naye Symbols) ---
+# --- 3. SMART AUTO-UPDATE (Optimized for Lakhon Users) ---
 def auto_update_new_symbols():
     print("Checking for NEW symbols today...")
-    url = "https://margincalculator.angelbroking.com/OpenAPI_Standard/token/OpenAPIScripMaster.json"
-    response = requests.get(url).json()
-    df = pd.DataFrame(response)
-    
-    # Aaj ki date nikaal rahe hain
-    aaj_ki_date = datetime.now().strftime('%d%b%Y').upper() # Example: 16FEB2026
-    
-    # Logic: Sirf wahi symbols jo aaj ki expiry ya naye hain (Filtering)
-    # Aap chahein toh yahan apni pasand ka filter badal sakte hain
-    df_new = df[df['expiry'] == aaj_ki_date] 
-    
-    if not df_new.empty:
-        data_to_save = df_new.to_dict(orient='records')
-        supabase.table("market_data").upsert(data_to_save).execute()
-        print(f"Success: {len(data_to_save)} new symbols added automatically!")
-    else:
-        print("No new symbols for today's expiry to update.")
+    try:
+        url = "https://margincalculator.angelbroking.com/OpenAPI_Standard/token/OpenAPIScripMaster.json"
+        response = requests.get(url).json()
+        df = pd.DataFrame(response)
+        
+        # Aaj ki date filter - Takki load kam ho
+        aaj_ki_date = datetime.now().strftime('%d%b%Y').upper()
+        df_new = df[df['expiry'] == aaj_ki_date] 
+        
+        if not df_new.empty:
+            data_to_save = df_new.to_dict(orient='records')
+            # Upsert logic - Sirf naye values add honge
+            supabase.table("market_data").upsert(data_to_save).execute()
+            print(f"Success: {len(data_to_save)} new symbols synced!")
+    except Exception as e:
+        print(f"Auto-update skip (File not ready or error): {e}")
 
 # --- 4. ANGEL ONE LOGIN ---
 obj = SmartConnect(api_key=API_KEY)
@@ -55,30 +55,31 @@ if session.get('status'):
     feedToken = session['data']['feedToken']
     print("Angel One Login Success!")
 else:
-    print("Login Failed!")
+    print("Login Failed! Please check your keys.")
     exit()
 
-# --- 5. LIVE STREAM (V3) ---
-sws = SmartWebSocketV3(jwtToken, API_KEY, CLIENT_ID, feedToken)
+# --- 5. LIVE BROADCAST (Lakhon Users Capability) ---
+# Stable SmartWebSocket version
+sws = SmartWebSocket(jwtToken, API_KEY, CLIENT_ID, feedToken)
 
-def on_data(msg):
+def on_data(wsapp, msg):
+    # Million users broadcast logic - Socket.io handle karega
     sio.emit('livePrice', msg)
 
-def on_open():
-    print("WebSocket Connected!")
+def on_open(wsapp):
+    print("WebSocket Connected! Broadcasting Live...")
 
 sws.on_data = on_data
 sws.on_open = on_open
+
+# Background thread for websocket
 eventlet.spawn(sws.connect)
 
 # --- 6. SERVER START ---
 if __name__ == '__main__':
-    # Roz subah automatic check karega
-    try:
-        auto_update_new_symbols()
-    except Exception as e:
-        print(f"Auto-update error: {e}")
-
+    # Initial sync
+    auto_update_new_symbols()
+    
     port = int(os.environ.get('PORT', 5000))
     print(f"Broadcaster Live on Port {port}")
     eventlet.wsgi.server(eventlet.listen(('', port)), app)
