@@ -2,10 +2,8 @@ import os
 import pyotp
 import requests
 import pandas as pd
-import time
 from datetime import datetime
 from SmartApi import SmartConnect
-# V2 ke liye sahi import path
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 import socketio
 import eventlet
@@ -21,62 +19,37 @@ TOTP_KEY = "XFTXZ2445N4V2UMB7EWUCBDRMU"
 SUPABASE_URL = "https://rcosgmsyisybusmuxzei.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJjb3NnbXN5aXN5YnVzbXV4emVpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA4MzkxMzQsImV4cCI6MjA4NjQxNTEzNH0.7h-9tI7FMMRA_4YACKyPctFxfcLbEYBlhmWXfVOIOKs"
 
-# --- 2. SERVER & DATABASE SETUP ---
-sio = socketio.Server(cors_allowed_origins='*')
+# --- 2. SERVER SETUP (High Capacity Config) ---
+# 'eventlet' use kar rahe hain jo hazaro concurrent connections handle kar sakta hai
+sio = socketio.Server(cors_allowed_origins='*', async_mode='eventlet')
 app = socketio.WSGIApp(sio)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# --- 3. LOGIC: SYMBOL MANAGEMENT ---
-def update_symbols_logic():
-    print("--- STEP 1: Starting Symbol Update Logic ---")
-    try:
-        url = "https://margincalculator.angelbroking.com/OpenAPI_Standard/token/OpenAPIScripMaster.json"
-        response = requests.get(url, timeout=30) 
-        if response.status_code == 200:
-            data = response.json()
-            df = pd.DataFrame(data)
-            
-            aaj = datetime.now().strftime('%d%b%Y').upper()
-            df_new = df[df['expiry'] == aaj]
-            
-            if not df_new.empty:
-                print(f"Found {len(df_new)} new symbols.")
-                records = df_new.to_dict(orient='records')
-                supabase.table("market_data").upsert(records).execute()
-                print("Supabase Updated!")
-            else:
-                print("No new symbols for today.")
-    except Exception as e:
-        print(f"Symbol Update Error: {str(e)}")
+sws_instance = None
+subscribed_tokens = set() # Duplicate requests rokne ke liye
 
-# --- 4. LOGIC: AUTHENTICATION ---
-def get_angel_session():
-    print("--- STEP 2: Authenticating with Angel One ---")
-    try:
-        obj = SmartConnect(api_key=API_KEY)
-        totp = pyotp.TOTP(TOTP_KEY).now()
-        session = obj.generateSession(CLIENT_ID, PIN, totp)
-        
-        if session.get('status'):
-            print("Login Successful!")
-            return {
-                "jwt": session['data']['jwtToken'],
-                "feed": session['data']['feedToken'],
-                "obj": obj
-            }
-        else:
-            print(f"Login Failed: {session.get('message')}")
-            return None
-    except Exception as e:
-        print(f"Auth Error: {str(e)}")
-        return None
+# --- 3. LIVE DATA BROADCAST (The Scalable Part) ---
+@sio.event
+def connect(sid, environ):
+    print(f"✅ New User Connected: {sid}")
 
-# --- 5. LOGIC: LIVE DATA BROADCAST ---
-def start_web_socket(session_data):
-    print("--- STEP 3: Starting Live Broadcast Engine (V2) ---")
+@sio.event
+def subscribe(sid, data):
+    global sws_instance, subscribed_tokens
+    # data: ["token1", "token2"]
+    new_to_subscribe = [str(t) for t in data if str(t) not in subscribed_tokens]
     
-    # FIX: V2 mein auth_token (JWT) pehle aata hai aur parameters ka order fix hai
-    sws = SmartWebSocketV2(
+    if new_to_subscribe and sws_instance:
+        correlation_id = "myt_broadcast"
+        # Sabhi users ke liye common subscription (Broadcasting)
+        token_list = [{"exchangeType": 1, "tokens": [t]} for t in new_to_subscribe]
+        sws_instance.subscribe(correlation_id, 3, token_list)
+        subscribed_tokens.update(new_to_subscribe)
+        print(f"📡 Now Broadcasting {len(subscribed_tokens)} tokens")
+
+def start_web_socket(session_data):
+    global sws_instance
+    sws_instance = SmartWebSocketV2(
         auth_token=session_data['jwt'],
         api_key=API_KEY,
         client_code=CLIENT_ID,
@@ -84,48 +57,33 @@ def start_web_socket(session_data):
     )
 
     def on_data(wsapp, msg):
-        # Socket.io ke zariye frontend ko data bhejna
-        sio.emit('livePrice', msg)
+        # Ye part har user ko data bhejta hai
+        if 'last_traded_price' in msg:
+            payload = {
+                "tk": str(msg.get('token')),
+                "lp": str(msg.get('last_traded_price') / 100)
+            }
+            # Broadcaster: Ek hi baar bhejta hai, socket.io khud handle karta hai sabko distribute karna
+            sio.emit('livePrice', payload)
 
-    def on_open(wsapp):
-        print("WEB-SOCKET V2 CONNECTED!")
-        # Data subscribe karne ke liye (Nifty example)
-        correlation_id = "myt_stream_01"
-        action = 1 # 1 for Subscribe
-        mode = 3   # 3 for Full Mode (LTP, Volume, etc.)
-        tokens = [{"exchangeType": 1, "tokens": ["10626"]}] # 10626 = Nifty 50
-        sws.subscribe(correlation_id, mode, tokens)
+    sws_instance.on_data = on_data
+    sws_instance.on_open = lambda ws: print("🚀 Angel One WebSocket Active")
+    eventlet.spawn(sws_instance.connect)
 
-    def on_error(wsapp, error):
-        print(f"Websocket Error: {error}")
-
-    def on_close(wsapp):
-        print("Websocket Closed")
-
-    # Callbacks bind karna
-    sws.on_data = on_data
-    sws.on_open = on_open
-    sws.on_error = on_error
-    sws.on_close = on_close
-    
-    # Background thread mein run karna
-    eventlet.spawn(sws.connect)
-
-# --- 6. EXECUTION ---
+# --- 4. AUTH & RUN ---
 if __name__ == '__main__':
-    # Symbols update karein
-    update_symbols_logic()
-    
-    # Login karein
-    auth_data = get_angel_session()
-    
-    if auth_data:
-        # WebSocket start karein
-        start_web_socket(auth_data)
+    # Login Logic
+    try:
+        obj = SmartConnect(api_key=API_KEY)
+        totp = pyotp.TOTP(TOTP_KEY).now()
+        session = obj.generateSession(CLIENT_ID, PIN, totp)
         
-        # Render/Server start
-        port = int(os.environ.get('PORT', 5000))
-        print(f"--- SERVER LIVE ON PORT {port} ---")
-        eventlet.wsgi.server(eventlet.listen(('0.0.0.0', port)), app)
-    else:
-        print("Critical Error: Login failed. Server not started.")
+        if session.get('status'):
+            auth_data = {"jwt": session['data']['jwtToken'], "feed": session['data']['feedToken']}
+            start_web_socket(auth_data)
+            
+            port = int(os.environ.get('PORT', 5000))
+            print(f"🔥 PRO-SERVER LIVE ON PORT {port}")
+            eventlet.wsgi.server(eventlet.listen(('0.0.0.0', port)), app)
+    except Exception as e:
+        print(f"❌ Critical Error: {e}")
