@@ -14,8 +14,8 @@ CLIENT_ID = "S52638556"
 PIN = "0000"  # Apna 4-digit PIN yahan likhein
 TOTP_KEY = "XFTXZ2445N4V2UMB7EWUCBDRMU"
 
-SUPABASE_URL = "YOUR_SUPABASE_URL_HERE"
-SUPABASE_KEY = "YOUR_SUPABASE_ANON_KEY_HERE"
+SUPABASE_URL = "https://rcosgmsyisybusmuxzei.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJjb3NnbXN5aXN5YnVzbXV4emVpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA4MzkxMzQsImV4cCI6MjA4NjQxNTEzNH0.7h-9tI7FMMRA_4YACKyPctFxfcLbEYBlhmWXfVOIOKs"
 
 # --- 2. SETUP ---
 sio = socketio.Server(cors_allowed_origins='*')
