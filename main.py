@@ -4,7 +4,6 @@ eventlet.monkey_patch()  # यह सबसे ऊपर होना अनि�
 import os
 import pyotp
 import socketio
-import eventlet.wsgi
 from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 from supabase import create_client, Client
@@ -19,7 +18,7 @@ SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJ
 
 # --- SERVER SETUP ---
 sio = socketio.Server(cors_allowed_origins='*', async_mode='eventlet')
-app = socketio.WSGIApp(sio)  # Gunicorn इसी 'app' का उपयोग करेगा
+app = socketio.WSGIApp(sio)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 sws_instance = None
@@ -33,12 +32,22 @@ def connect(sid, environ):
 def subscribe(sid, data):
     global sws_instance, subscribed_tokens
     if data and sws_instance:
-        new_tokens = [str(t) for t in data if str(t) not in subscribed_tokens]
-        if new_tokens:
-            token_list = [{"exchangeType": 1, "tokens": [t]} for t in new_tokens]
+        # NSE/BSE के लिए (अक्सर 5 अंकों तक के टोकन)
+        nse_tokens = [str(t) for t in data if int(t) < 50000]
+        # MCX के लिए (अक्सर 50000 से ऊपर के टोकन)
+        mcx_tokens = [str(t) for t in data if int(t) >= 50000]
+
+        if nse_tokens:
+            token_list = [{"exchangeType": 1, "tokens": nse_tokens}] # 1 = NSE/BSE
             sws_instance.subscribe("myt_pro", 3, token_list)
-            subscribed_tokens.update(new_tokens)
-            print(f"📡 Subscribed to: {new_tokens}")
+            subscribed_tokens.update(nse_tokens)
+            print(f"📡 Subscribed NSE: {nse_tokens}")
+
+        if mcx_tokens:
+            token_list = [{"exchangeType": 5, "tokens": mcx_tokens}] # 5 = MCX
+            sws_instance.subscribe("myt_pro", 3, token_list)
+            subscribed_tokens.update(mcx_tokens)
+            print(f"📡 Subscribed MCX: {mcx_tokens}")
 
 def start_web_socket(session_data):
     global sws_instance
@@ -52,22 +61,23 @@ def start_web_socket(session_data):
     sws_instance.on_data = on_data
     eventlet.spawn(sws_instance.connect)
 
+# --- ANGEL LOGIN (GUNICORN COMPATIBLE) ---
+# इसे 'if __name__ == "__main__":' से बाहर रखा है ताकि Gunicorn इसे रन करे
+try:
+    obj = SmartConnect(api_key=API_KEY)
+    totp = pyotp.TOTP(TOTP_KEY).now()
+    session = obj.generateSession(CLIENT_ID, PIN, totp)
+    
+    if session.get('status'):
+        auth_data = {"jwt": session['data']['jwtToken'], "feed": session['data']['feedToken']}
+        start_web_socket(auth_data)
+        print("🚀 Angel Session Started for NSE/BSE/MCX")
+    else:
+        print("❌ Angel Login Failed")
+except Exception as e:
+    print(f"❌ Initial Login Error: {e}")
+
 if __name__ == '__main__':
-    try:
-        obj = SmartConnect(api_key=API_KEY)
-        totp = pyotp.TOTP(TOTP_KEY).now()
-        session = obj.generateSession(CLIENT_ID, PIN, totp)
-        
-        if session.get('status'):
-            auth_data = {"jwt": session['data']['jwtToken'], "feed": session['data']['feedToken']}
-            start_web_socket(auth_data)
-            
-            port = int(os.environ.get('PORT', 10000))
-            print(f"🚀 Starting server on 0.0.0.0:{port}")
-            
-            # पोर्ट बाइंडिंग फिक्स
-            eventlet.wsgi.server(eventlet.listen(('0.0.0.0', port)), app)
-        else:
-            print("❌ Angel Login Failed")
-    except Exception as e:
-        print(f"❌ Critical Error: {e}")
+    port = int(os.environ.get('PORT', 10000))
+    import eventlet.wsgi
+    eventlet.wsgi.server(eventlet.listen(('0.0.0.0', port)), app)
