@@ -7,3 +7,4 @@ requests
 pandas
 websocket-client
 gunicorn
+logzero
