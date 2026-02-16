@@ -19,7 +19,7 @@ SUPABASE_URL = "https://rcosgmsyisybusmuxzei.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJjb3NnbXN5aXN5YnVzbXV4emVpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA4MzkxMzQsImV4cCI6MjA4NjQxNTEzNH0.7h-9tI7FMMRA_4YACKyPctFxfcLbEYBlhmWXfVOIOKs"
 
 # --- SERVER SETUP ---
-# Logging on rakhi hai taaki Render logs mein detail dikhe
+# Logging on rakhi hai taaki Render dashboard par details dikhein
 sio = socketio.Server(cors_allowed_origins='*', async_mode='eventlet', logger=True, engineio_logger=True)
 app = socketio.WSGIApp(sio)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -64,12 +64,11 @@ if __name__ == '__main__':
             auth_data = {"jwt": session['data']['jwtToken'], "feed": session['data']['feedToken']}
             start_web_socket(auth_data)
             
-            # RENDER PEHCHAN: Render hamesha 'PORT' variable bhejta hai
+            # RENDER FIX: Render hamesha 'PORT' variable bhejta hai
             port = int(os.environ.get('PORT', 10000))
             print(f"🔥 Starting server on 0.0.0.0:{port}")
             
             # Ye line Render ko port open karke degi
-            # 'log_output=True' se humein Render dashboard pe request dikhengi
             socket_address = ('0.0.0.0', port)
             eventlet.wsgi.server(eventlet.listen(socket_address), app, log_output=True)
         else:
