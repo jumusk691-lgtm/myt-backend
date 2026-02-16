@@ -71,3 +71,6 @@ if __name__ == '__main__':
             print("❌ Angel Login Failed")
     except Exception as e:
         print(f"❌ Critical Error: {e}")
+
+if __name__ == "__main__":
+    app.run()
