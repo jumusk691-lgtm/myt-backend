@@ -4,7 +4,6 @@ eventlet
 pyotp
 supabase
 requests
-logzero
 pandas
 websocket-client
 gunicorn
