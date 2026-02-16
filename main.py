@@ -5,7 +5,7 @@ import pandas as pd
 import time
 from datetime import datetime
 from SmartApi import SmartConnect
-# Naya aur sahi import
+# V2 ke liye sahi import path
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 import socketio
 import eventlet
@@ -31,7 +31,6 @@ def update_symbols_logic():
     print("--- STEP 1: Starting Symbol Update Logic ---")
     try:
         url = "https://margincalculator.angelbroking.com/OpenAPI_Standard/token/OpenAPIScripMaster.json"
-        # Timeout 30 rakha hai taaki Render par network slow ho toh fail na ho
         response = requests.get(url, timeout=30) 
         if response.status_code == 200:
             data = response.json()
@@ -76,43 +75,57 @@ def get_angel_session():
 def start_web_socket(session_data):
     print("--- STEP 3: Starting Live Broadcast Engine (V2) ---")
     
-    # SmartWebSocketV2 use kar rahe hain
+    # FIX: V2 mein auth_token (JWT) pehle aata hai aur parameters ka order fix hai
     sws = SmartWebSocketV2(
-        session_data['jwt'], 
-        API_KEY, 
-        CLIENT_ID, 
-        session_data['feed']
+        auth_token=session_data['jwt'],
+        api_key=API_KEY,
+        client_code=CLIENT_ID,
+        feed_token=session_data['feed']
     )
 
     def on_data(wsapp, msg):
-        # Live data handling
+        # Socket.io ke zariye frontend ko data bhejna
         sio.emit('livePrice', msg)
 
     def on_open(wsapp):
         print("WEB-SOCKET V2 CONNECTED!")
-        # Example subscribe (BankNifty/Nifty tokens yahan dalein)
-        # sws.subscribe("correlation_id", "mode", [{"exchangeType": 1, "tokens": ["10626"]}])
+        # Data subscribe karne ke liye (Nifty example)
+        correlation_id = "myt_stream_01"
+        action = 1 # 1 for Subscribe
+        mode = 3   # 3 for Full Mode (LTP, Volume, etc.)
+        tokens = [{"exchangeType": 1, "tokens": ["10626"]}] # 10626 = Nifty 50
+        sws.subscribe(correlation_id, mode, tokens)
 
     def on_error(wsapp, error):
         print(f"Websocket Error: {error}")
 
+    def on_close(wsapp):
+        print("Websocket Closed")
+
+    # Callbacks bind karna
     sws.on_data = on_data
     sws.on_open = on_open
     sws.on_error = on_error
+    sws.on_close = on_close
     
+    # Background thread mein run karna
     eventlet.spawn(sws.connect)
 
 # --- 6. EXECUTION ---
 if __name__ == '__main__':
+    # Symbols update karein
     update_symbols_logic()
     
+    # Login karein
     auth_data = get_angel_session()
+    
     if auth_data:
+        # WebSocket start karein
         start_web_socket(auth_data)
         
+        # Render/Server start
         port = int(os.environ.get('PORT', 5000))
         print(f"--- SERVER LIVE ON PORT {port} ---")
-        # Render ke liye eventlet listener
         eventlet.wsgi.server(eventlet.listen(('0.0.0.0', port)), app)
     else:
-        print("Critical Error: Login failed.")
+        print("Critical Error: Login failed. Server not started.")
