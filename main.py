@@ -5,8 +5,8 @@ import pandas as pd
 import time
 from datetime import datetime
 from SmartApi import SmartConnect
-# Import ka sabse robust tarika taaki Render fail na ho
-import SmartApi.smartConnect as smartConnect
+# Naya aur sahi import
+from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 import socketio
 import eventlet
 import eventlet.wsgi
@@ -31,25 +31,22 @@ def update_symbols_logic():
     print("--- STEP 1: Starting Symbol Update Logic ---")
     try:
         url = "https://margincalculator.angelbroking.com/OpenAPI_Standard/token/OpenAPIScripMaster.json"
-        response = requests.get(url, timeout=10)
+        # Timeout 30 rakha hai taaki Render par network slow ho toh fail na ho
+        response = requests.get(url, timeout=30) 
         if response.status_code == 200:
             data = response.json()
             df = pd.DataFrame(data)
             
-            # Smart Filter: Sirf aaj ki expiry ke naye symbols
             aaj = datetime.now().strftime('%d%b%Y').upper()
             df_new = df[df['expiry'] == aaj]
             
             if not df_new.empty:
-                print(f"Found {len(df_new)} new symbols for today.")
+                print(f"Found {len(df_new)} new symbols.")
                 records = df_new.to_dict(orient='records')
-                # Bulk update in Supabase
                 supabase.table("market_data").upsert(records).execute()
-                print("Supabase Market Data Updated Successfully!")
+                print("Supabase Updated!")
             else:
-                print("No new symbols found for today's filter.")
-        else:
-            print("Failed to fetch symbols from Angel Server.")
+                print("No new symbols for today.")
     except Exception as e:
         print(f"Symbol Update Error: {str(e)}")
 
@@ -77,9 +74,10 @@ def get_angel_session():
 
 # --- 5. LOGIC: LIVE DATA BROADCAST ---
 def start_web_socket(session_data):
-    print("--- STEP 3: Starting Live Broadcast Engine ---")
-    # Using the most stable SmartWebSocket class
-    sws = smartConnect.SmartWebSocket(
+    print("--- STEP 3: Starting Live Broadcast Engine (V2) ---")
+    
+    # SmartWebSocketV2 use kar rahe hain
+    sws = SmartWebSocketV2(
         session_data['jwt'], 
         API_KEY, 
         CLIENT_ID, 
@@ -87,12 +85,13 @@ def start_web_socket(session_data):
     )
 
     def on_data(wsapp, msg):
-        # YAHAN SE MILLION USERS KO DATA JAYEGA
-        # msg mein live price, volume, etc. hota hai
+        # Live data handling
         sio.emit('livePrice', msg)
 
     def on_open(wsapp):
-        print("WEB-SOCKET CONNECTED: Broadcasting live data to all users...")
+        print("WEB-SOCKET V2 CONNECTED!")
+        # Example subscribe (BankNifty/Nifty tokens yahan dalein)
+        # sws.subscribe("correlation_id", "mode", [{"exchangeType": 1, "tokens": ["10626"]}])
 
     def on_error(wsapp, error):
         print(f"Websocket Error: {error}")
@@ -101,21 +100,19 @@ def start_web_socket(session_data):
     sws.on_open = on_open
     sws.on_error = on_error
     
-    # Run websocket in background
     eventlet.spawn(sws.connect)
 
-# --- 6. EXECUTION & SERVER START ---
+# --- 6. EXECUTION ---
 if __name__ == '__main__':
-    # Run the full logic sequence
     update_symbols_logic()
     
     auth_data = get_angel_session()
     if auth_data:
         start_web_socket(auth_data)
         
-        # Start the final Socket.io server
         port = int(os.environ.get('PORT', 5000))
         print(f"--- SERVER LIVE ON PORT {port} ---")
-        eventlet.wsgi.server(eventlet.listen(('', port)), app)
+        # Render ke liye eventlet listener
+        eventlet.wsgi.server(eventlet.listen(('0.0.0.0', port)), app)
     else:
-        print("Critical Error: Could not start server without Login.")
+        print("Critical Error: Login failed.")
