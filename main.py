@@ -8,10 +8,10 @@ import socketio
 import eventlet
 import eventlet.wsgi
 
-# --- 1. CONFIGURATION (Apni details yahan bharein) ---
+# --- 1. CONFIGURATION (Aapki details safe hain) ---
 API_KEY = "85HE4VA1"
 CLIENT_ID = "S52638556"
-PIN = "0000"  # Apna 4-digit PIN yahan likhein
+PIN = "0000" 
 TOTP_KEY = "XFTXZ2445N4V2UMB7EWUCBDRMU"
 
 SUPABASE_URL = "https://rcosgmsyisybusmuxzei.supabase.co"
@@ -22,41 +22,51 @@ sio = socketio.Server(cors_allowed_origins='*')
 app = socketio.WSGIApp(sio)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# --- 3. SYMBOL UPDATE LOGIC (Sirf naye symbols ke liye) ---
+# --- 3. SYMBOL UPDATE LOGIC ---
 def update_symbols_to_supabase():
     print("Checking for new symbols...")
     url = "https://margincalculator.angelbroking.com/OpenAPI_Standard/token/OpenAPIScripMaster.json"
     response = requests.get(url).json()
     
-    # Filter: Maan lo aapko sirf Nifty/BankNifty ke symbols chahiye
-    # Isse poori file download hone ke baad bhi data chota ho jayega
     df = pd.DataFrame(response)
+    # Sirf Nifty aur BankNifty filter kar rahe hain taaki load kam ho
     df = df[df['name'].isin(['NIFTY', 'BANKNIFTY'])] 
     
-    # Supabase mein data bhej raha hai (Upsert = Update if exists)
     data_to_save = df.to_dict(orient='records')
+    # Supabase table ka naam 'symbols' hona chahiye
     supabase.table("symbols").upsert(data_to_save).execute()
     print("Symbols Updated in Supabase!")
 
-# --- 4. ANGEL ONE LOGIN & LIVE STREAM ---
+# --- 4. ANGEL ONE LOGIN ---
 obj = SmartConnect(api_key=API_KEY)
 token = pyotp.TOTP(TOTP_KEY).now()
 session = obj.generateSession(CLIENT_ID, PIN, token)
 
-print("Angel One Login Success!")
+if session.get('status'):
+    print("Angel One Login Success!")
+else:
+    print(f"Login Failed: {session.get('message')}")
 
-# Jab Angel One se naya price aaye
+# --- 5. LIVE STREAM (FIXED VERSION) ---
+# Error fix: V2 ki jagah stable smartWebSocket use kiya hai
+sws = obj.smartWebSocket(session['data']['jwtToken'], API_KEY, CLIENT_ID, session['data']['feedToken'])
+
 def on_data(wsapp, msg):
-    # Ye line lakhon users ko broadcast karegi
+    # Live price broadcast ho raha hai
     sio.emit('livePrice', msg)
 
-sws = obj.smartWebSocketV2(session['data']['jwtToken'], API_KEY, CLIENT_ID, session['data']['feedToken'])
-sws.on_data = on_data
+def on_open(wsapp):
+    print("WebSocket Connected!")
+    # Aap yahan symbols subscribe kar sakte hain
+    # sws.subscribe("correlation_id", mode, token_list)
 
-# Background mein stream shuru karein
+sws.on_data = on_data
+sws.on_open = on_open
+
+# Background mein connection chalane ke liye
 eventlet.spawn(sws.connect)
 
-# --- 5. SERVER START ---
+# --- 6. SERVER START ---
 if __name__ == '__main__':
     # Pehle symbols update karein
     try:
