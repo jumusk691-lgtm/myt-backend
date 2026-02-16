@@ -1,5 +1,5 @@
 import eventlet
-eventlet.monkey_patch()  # यह लाइन सबसे ऊपर ही होनी चाहिए
+eventlet.monkey_patch()  # यह सबसे ऊपर होना अनिवार्य है
 
 import os
 import pyotp
@@ -19,7 +19,7 @@ SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJ
 
 # --- SERVER SETUP ---
 sio = socketio.Server(cors_allowed_origins='*', async_mode='eventlet')
-app = socketio.WSGIApp(sio)
+app = socketio.WSGIApp(sio)  # Gunicorn इसी 'app' का उपयोग करेगा
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 sws_instance = None
@@ -38,7 +38,7 @@ def subscribe(sid, data):
             token_list = [{"exchangeType": 1, "tokens": [t]} for t in new_tokens]
             sws_instance.subscribe("myt_pro", 3, token_list)
             subscribed_tokens.update(new_tokens)
-            print(f"📡 Now Streaming: {len(subscribed_tokens)} tokens")
+            print(f"📡 Subscribed to: {new_tokens}")
 
 def start_web_socket(session_data):
     global sws_instance
@@ -62,11 +62,10 @@ if __name__ == '__main__':
             auth_data = {"jwt": session['data']['jwtToken'], "feed": session['data']['feedToken']}
             start_web_socket(auth_data)
             
-            # Render Fix: Port assignment
             port = int(os.environ.get('PORT', 10000))
-            print(f"🔥 Starting server on 0.0.0.0:{port}")
+            print(f"🚀 Starting server on 0.0.0.0:{port}")
             
-            # Use eventlet to serve the app
+            # पोर्ट बाइंडिंग फिक्स
             eventlet.wsgi.server(eventlet.listen(('0.0.0.0', port)), app)
         else:
             print("❌ Angel Login Failed")
