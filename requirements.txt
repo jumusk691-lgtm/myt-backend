@@ -2,8 +2,8 @@ smartapi-python
 python-socketio
 eventlet
 pyotp
-pandas
 supabase
 requests
 logzero
 pandas
+websocket-client
