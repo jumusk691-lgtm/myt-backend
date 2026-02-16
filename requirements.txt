@@ -5,3 +5,5 @@ pyotp
 pandas
 supabase
 requests
+logzero
+pandas
