@@ -34,7 +34,9 @@ def subscribe(sid, data):
     if data and sws_instance:
         # NSE/BSE के लिए (अक्सर 5 अंकों तक के टोकन)
         nse_tokens = [str(t) for t in data if int(t) < 50000]
-        # MCX के लिए (अक्सर 50000 से ऊपर के टोकन)
+        
+        nse_fo = [str(t) for t in data if 35000 <= int(t) < 50000]
+        
         mcx_tokens = [str(t) for t in data if int(t) >= 50000]
 
         if nse_tokens:
