@@ -16,7 +16,7 @@ PIN = "0000"
 TOTP_KEY = "XFTXZ2445N4V2UMB7EWUCBDRMU"
 SUPABASE_URL ="https://rcosgmsyisybusmuxzei.supabase.co"
 # ZAROORI: Supabase -> Settings -> API se 'service_role' key yahan dalein
-SUPABASE_KEY = "YOUR_SERVICE_ROLE_KEY_HERE"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJjb3NnbXN5aXN5YnVzbXV4emVpIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MDgzOTEzNCwiZXhwIjoyMDg2NDE1MTM0fQ.5BofQbMKiMLGFjqcIGaCwpoO9pLZnuLg7nojP0aGhJw"
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
