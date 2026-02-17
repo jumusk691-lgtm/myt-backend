@@ -1,6 +1,7 @@
 smartapi-python
-python-socketio
-eventlet
+python-socketio==5.10.0
+python-engineio==4.8.0
+eventlet==0.33.3
 pyotp
 supabase
 requests
