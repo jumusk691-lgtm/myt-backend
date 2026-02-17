@@ -5,8 +5,9 @@ gunicorn==22.0.0
 Smartapi-python
 setuptools
 pyotp
-supabase
 requests
 pandas
 websocket-client
 logzero
+supabase==2.3.7
+httpx==0.24.1
