@@ -16,7 +16,7 @@ PIN = "0000"
 TOTP_KEY = "XFTXZ2445N4V2UMB7EWUCBDRMU"
 
 # --- SUPABASE CONFIG ---
-SUPABASE_URL = "https://rcosgmsyisybusmuxzei.supabase.co"
+SUPABASE_URL ="https://rcosgmsyisybusmuxzei.supabase.co"
 # ZAROORI: Yahan 'service_role' key hi dalna, anon key se update nahi hoga!
 SUPABASE_KEY = "sb_secret_wi99i_tvE_2DT5IK80PyYg_6nJSeZdn"
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
