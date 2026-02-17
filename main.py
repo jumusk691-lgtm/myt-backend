@@ -67,7 +67,7 @@ try:
 except Exception as e:
     print(f"❌ Critical Login Error: {e}")
 
-# --- SOCKET.IO EVENTS ---
+# --- SOCKET.I EVENTS ---
 @sio.event
 def connect(sid, environ):
     print(f"📱 Client Connected to Server: {sid}")
