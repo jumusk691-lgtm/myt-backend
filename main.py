@@ -1,6 +1,6 @@
 import eventlet
 # Sabse pehli line yahi honi chahiye
-eventlet.monkey_patch()
+eventlet.monkey_patch(all=True)
 
 import os
 import pyotp
