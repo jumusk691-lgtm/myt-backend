@@ -9,5 +9,4 @@ requests
 pandas
 websocket-client
 logzero
-supabase==2.3.7
-httpx==0.24.1
+supabase==2.4.0
