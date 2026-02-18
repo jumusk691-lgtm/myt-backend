@@ -4,11 +4,20 @@ eventlet.monkey_patch()
 
 import os
 import pyotp
+import redis
 import socketio
 import threading
 from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 from supabase import create_client, Client
+from supabase import create_client, Client
+
+# --- REDIS SETUP ---
+redis_url = os.environ.get("REDIS_URL")
+r = redis.from_url(redis_url, decode_responses=True)
+
+# --- CONFIG ---
+API_KEY = "85HE4VA1"
 
 # --- CONFIG ---
 API_KEY = "85HE4VA1"
@@ -51,7 +60,9 @@ def on_data(wsapp, msg):
         
         # Immediate data emission to APK
         sio.emit('livePrice', {"tk": token, "lp": lp})
-        
+       
+        r.set(f"price:{token}", lp)
+
         # Background DB update
         eventlet.spawn(update_db_async, token, lp)
 
