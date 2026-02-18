@@ -1,5 +1,4 @@
 import eventlet
-# Sabse pehle monkey_patch zaroori hai
 eventlet.monkey_patch()
 
 import os
@@ -7,17 +6,14 @@ import pyotp
 import redis
 import socketio
 import threading
+import time
 from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
-from supabase import create_client, Client
 from supabase import create_client, Client
 
 # --- REDIS SETUP ---
 redis_url = os.environ.get("REDIS_URL")
 r = redis.from_url(redis_url, decode_responses=True)
-
-# --- CONFIG ---
-API_KEY = "85HE4VA1"
 
 # --- CONFIG ---
 API_KEY = "85HE4VA1"
@@ -36,7 +32,7 @@ socketio_app = socketio.WSGIApp(sio)
 
 def index(environ, start_response):
     start_response('200 OK', [('Content-Type', 'text/plain')])
-    return [b"MYT Pro Backend is Running!"]
+    return [b"MYT Pro Backend is Running with Redis & Bulk Support!"]
 
 def app(environ, start_response):
     if environ.get('PATH_INFO') == '/':
@@ -45,12 +41,15 @@ def app(environ, start_response):
 
 sws_instance = None
 
-# --- DB UPDATE HELPER (Non-blocking) ---
+# --- DB UPDATE HELPER (Optimized for 2000 stocks) ---
 def update_db_async(token, lp):
+    # Sirf tabhi update karein jab price significant ho, ya Redis ka use karein
     try:
-        supabase.table("market_data").update({"last_price": lp}).filter("token", "ilike", f"%{token}").execute()
+        # Note: 2000 stocks ke liye har second Supabase update karna server ko slow karega.
+        # Redis is primary now. Supabase periodic update ke liye use karein.
+        supabase.table("market_data").update({"last_price": lp}).eq("token", token).execute()
     except Exception as e:
-        print(f"❌ DB Update Error: {e}")
+        pass # Errors ignore karein performance ke liye
 
 # --- ANGEL WEBSOCKET HANDLER ---
 def on_data(wsapp, msg):
@@ -58,18 +57,16 @@ def on_data(wsapp, msg):
         token = str(msg.get('token')).strip()
         lp = str(msg.get('last_traded_price') / 100)
         
-        # Immediate data emission to APK
-        sio.emit('livePrice', {"tk": token, "lp": lp})
-       
+        # 1. Redis mein save karein (Sabse Fast)
         r.set(f"price:{token}", lp)
-
-        # Background DB update
-        eventlet.spawn(update_db_async, token, lp)
+        
+        # 2. APK ko turant bhejein
+        sio.emit('livePrice', {"tk": token, "lp": lp})
 
 def on_open(wsapp):
     print("✅ Angel WebSocket Connected Successfully")
 
-# --- ANGEL LOGIN (Fixing Blocking Error) ---
+# --- ANGEL LOGIN ---
 def login_to_angel():
     global sws_instance
     try:
@@ -87,21 +84,18 @@ def login_to_angel():
             sws_instance.on_data = on_data
             sws_instance.on_open = on_open
             
-            # Using threading to avoid 'Blocking functions from mainloop' error
             threading.Thread(target=sws_instance.connect, daemon=True).start()
-            print("🚀 Angel Session Live in Background Thread")
+            print("🚀 Angel Session Live (Background Thread)")
     except Exception as e:
         print(f"❌ Login Error: {e}")
 
 # --- SMART EXCHANGE MAPPING ---
 def get_exchange_type(token):
-    # Yeh function token ke hisaab se exchange decide karega
     t = int(token)
-    if t < 20000: return 1      # NSE Cash
-    if 35000 <= t <= 75000: return 1 # Nifty/BankNifty
-    if 100000 <= t <= 999999: return 5 # MCX (Natural Gas, etc.)
-    if t > 1000000: return 2    # NSE Derivatives
-    return 1 # Default NSE
+    if t < 20000: return 1      # NSE
+    if 35000 <= t <= 75000: return 1 # Indices
+    if 100000 <= t <= 999999: return 5 # MCX
+    return 2 # NFO/Derivatives
 
 # --- SOCKET.IO EVENTS ---
 @sio.event
@@ -114,20 +108,36 @@ def connect(sid, environ):
 def subscribe(sid, data):
     global sws_instance
     if data and sws_instance:
-        print(f"📡 Subscribing to: {data}")
+        # data: ['1062', '1234', ...] - 1500 to 2000 tokens
+        print(f"📡 Subscribing to {len(data)} tokens")
         
-        # Grouping tokens by exchange
-        subs = {}
-        for t in data:
-            etype = get_exchange_type(t)
-            if etype not in subs: subs[etype] = []
-            subs[etype].append(str(t))
-        
-        for etype, tokens in subs.items():
-            subscription_list = [{"exchangeType": etype, "tokens": tokens}]
-            eventlet.spawn(sws_instance.subscribe, "myt_pro_feed", 3, subscription_list)
+        # Batching: 2000 stocks ko 500-500 ke groups mein baantna
+        chunk_size = 500
+        for i in range(0, len(data), chunk_size):
+            chunk = data[i:i + chunk_size]
+            subs = {}
+            for t in chunk:
+                etype = get_exchange_type(t)
+                if etype not in subs: subs[etype] = []
+                subs[etype].append(str(t))
+            
+            for etype, tokens in subs.items():
+                subscription_list = [{"exchangeType": etype, "tokens": tokens}]
+                sws_instance.subscribe("myt_pro_feed", 3, subscription_list)
+            
+            time.sleep(0.5) # Angel One server ko overload se bachane ke liye
+
+# API for App to fetch Bulk prices from Redis
+@sio.event
+def get_all_prices_request(sid, tokens):
+    # App se list aayegi tokens ki, Redis se batch mein fetch hoga
+    keys = [f"price:{t}" for t in tokens]
+    prices = r.mget(keys)
+    result = {t: p for t, p in zip(tokens, prices) if p is not None}
+    sio.emit('bulkPrices', result, room=sid)
 
 if __name__ == '__main__':
     import eventlet.wsgi
-    # Render port configuration
-    eventlet.wsgi.server(eventlet.listen(('0.0.0.0', 10000)), app)
+    # Port 10000 for Render
+    port = int(os.environ.get("PORT", 10000))
+    eventlet.wsgi.server(eventlet.listen(('0.0.0.0', port)), app)
