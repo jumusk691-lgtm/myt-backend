@@ -9,4 +9,4 @@ requests
 pandas
 websocket-client
 logzero
-supabase==2.4.0
+supabase
