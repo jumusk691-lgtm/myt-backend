@@ -1,55 +1,58 @@
 import eventlet
-# Sabse pehle monkey patch zaroori hai
+# Sabse pehli line yahi honi chahiye
 eventlet.monkey_patch()
 
 import os
 import pyotp
 import socketio
-from SmartApi import SmartConnect
-from SmartApi.smartWebSocketV2 import SmartWebSocketV2
-
-# --- DELAYED IMPORTS ---
-import redis
-from supabase import create_client, Client
-
-# --- SETUP ---
-REDIS_URL = os.environ.get("REDIS_URL")
-r = redis.from_url(REDIS_URL, decode_responses=True)
-
-API_KEY = "85HE4VA1"
-CLIENT_ID = "S52638556"
-PIN = "0000" 
-TOTP_KEY = "XFTXZ2445N4V2UMB7EWUCBDRMU"
-SUPABASE_URL ="https://rcosgmsyisybusmuxzei.supabase.co"
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJjb3NnbXN5aXN5YnVzbXV4emVpIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MDgzOTEzNCwiZXhwIjoyMDg2NDE1MTM0fQ.5BofQbMKiMLGFjqcIGaCwpoO9pLZnuLg7nojP0aGhJw")
-
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-# Server setup
-sio = socketio.Server(cors_allowed_origins='*', async_mode='eventlet')
-socketio_app = socketio.WSGIApp(sio)
 
 # --- GLOBAL STATE ---
 sws_instance = None
 is_ws_ready = False 
 
+# --- INITIALIZE LATER ---
+# Inhe global rakhenge par initialize function mein karenge
+r = None
+supabase = None
+
+def initialize_clients():
+    global r, supabase
+    import redis
+    from supabase import create_client
+    
+    redis_url = os.environ.get("REDIS_URL")
+    r = redis.from_url(redis_url, decode_responses=True)
+    
+    supabase_url = "https://rcosgmsyisybusmuxzei.supabase.co"
+    supabase_key = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJjb3NnbXN5aXN5YnVzbXV4emVpIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MDgzOTEzNCwiZXhwIjoyMDg2NDE1MTM0fQ.5BofQbMKiMLGFjqcIGaCwpoO9pLZnuLg7nojP0aGhJw")
+    supabase = create_client(supabase_url, supabase_key)
+
+# Initialize clients after monkey patch
+initialize_clients()
+
+from SmartApi import SmartConnect
+from SmartApi.smartWebSocketV2 import SmartWebSocketV2
+
+sio = socketio.Server(cors_allowed_origins='*', async_mode='eventlet')
+socketio_app = socketio.WSGIApp(sio)
+
 def on_data(wsapp, msg):
     if isinstance(msg, dict) and 'last_traded_price' in msg:
         token = str(msg.get('token')).strip()
         lp = str(msg.get('last_traded_price') / 100)
-        # Redis set non-blocking
         r.set(f"price:{token}", lp)
         sio.emit('livePrice', {"tk": token, "lp": lp})
 
 def on_open(wsapp):
     global is_ws_ready
     is_ws_ready = True
-    print("✅ WebSocket Connected")
+    print("✅ Angel WebSocket Connected")
 
 def on_error(wsapp, error):
     global is_ws_ready
     is_ws_ready = False
     print(f"❌ WS Error: {error}")
-    eventlet.sleep(5) # Kabhi bhi time.sleep use na karein
+    eventlet.sleep(5)
     eventlet.spawn(login_to_angel)
 
 def on_close(wsapp):
@@ -62,6 +65,12 @@ def on_close(wsapp):
 def login_to_angel():
     global sws_instance, is_ws_ready
     try:
+        # Angel SmartApi details
+        API_KEY = "85HE4VA1"
+        CLIENT_ID = "S52638556"
+        PIN = "0000" 
+        TOTP_KEY = "XFTXZ2445N4V2UMB7EWUCBDRMU"
+        
         obj = SmartConnect(api_key=API_KEY)
         totp = pyotp.TOTP(TOTP_KEY).now()
         session = obj.generateSession(CLIENT_ID, PIN, totp)
@@ -84,13 +93,11 @@ def login_to_angel():
         print(f"❌ Login Failed: {e}")
 
 def get_exchange_type(token):
-    try:
-        t = int(token)
-        if t < 30000: return 1           
-        if 35000 <= t <= 99999: return 1 
-        if 100000 <= t <= 999999: return 5 
-        return 2
-    except: return 1
+    t = int(token)
+    if t < 30000: return 1           
+    if 35000 <= t <= 99999: return 1 
+    if 100000 <= t <= 999999: return 5 
+    return 2                         
 
 @sio.event
 def connect(sid, environ):
@@ -116,20 +123,16 @@ def subscribe(sid, data):
                     try:
                         sws_instance.subscribe("myt_pro_feed", 3, [{"exchangeType": etype, "tokens": tokens}])
                     except: pass
-                eventlet.sleep(0.1) # Blocking se bachne ke liye chota pause
+                eventlet.sleep(0.5)
         
-        eventlet.spawn(do_subscribe) # Isko alag greenlet mein chalayein
+        eventlet.spawn(do_subscribe)
 
 @sio.event
 def get_all_prices_request(sid, tokens):
-    # Redis mget ko handle karne ke liye
-    try:
-        keys = [f"price:{t}" for t in tokens]
-        prices = r.mget(keys)
-        result = {t: p for t, p in zip(tokens, prices) if p is not None}
-        sio.emit('bulkPrices', result, room=sid)
-    except Exception as e:
-        print(f"Redis Error: {e}")
+    keys = [f"price:{t}" for t in tokens]
+    prices = r.mget(keys)
+    result = {t: p for t, p in zip(tokens, prices) if p is not None}
+    sio.emit('bulkPrices', result, room=sid)
 
 def app(environ, start_response):
     if environ.get('PATH_INFO') == '/':
