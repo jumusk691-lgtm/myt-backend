@@ -28,7 +28,7 @@ socketio_app = socketio.WSGIApp(sio)
 
 # --- GLOBAL STATE ---
 sws_instance = None
-is_ws_ready = False  # Connection status track karne ke liye
+is_ws_ready = False 
 
 def on_data(wsapp, msg):
     if isinstance(msg, dict) and 'last_traded_price' in msg:
@@ -45,12 +45,16 @@ def on_open(wsapp):
 def on_error(wsapp, error):
     global is_ws_ready
     is_ws_ready = False
-    print(f"❌ WS Error: {error}")
+    print(f"❌ WS Error: {error}. Retrying in 5s...")
+    time.sleep(5)
+    eventlet.spawn(login_to_angel) # Auto retry on error
 
 def on_close(wsapp):
     global is_ws_ready
     is_ws_ready = False
-    print("🔌 Connection Closed. Retrying login...")
+    print("🔌 Connection Closed. Retrying login in 5s...")
+    time.sleep(5)
+    eventlet.spawn(login_to_angel) # Auto retry on close
 
 def login_to_angel():
     global sws_instance, is_ws_ready
@@ -71,37 +75,35 @@ def login_to_angel():
             sws_instance.on_error = on_error
             sws_instance.on_close = on_close
             
-            # Non-blocking connection
-            threading.Thread(target=sws_instance.connect, daemon=True).start()
+            # Using eventlet spawn for better Render compatibility
+            eventlet.spawn(sws_instance.connect)
+            print("🚀 Angel Login Successful")
     except Exception as e:
         print(f"❌ Login Failed: {e}")
 
 def get_exchange_type(token):
     t = int(token)
-    if t < 30000: return 1           # NSE Stocks
-    if 35000 <= t <= 99999: return 1 # Indices
-    if 100000 <= t <= 999999: return 5 # MCX
-    return 2                         # NFO/Options
+    if t < 30000: return 1           
+    if 35000 <= t <= 99999: return 1 
+    if 100000 <= t <= 999999: return 5 
+    return 2                         
 
 @sio.event
 def connect(sid, environ):
     print(f"📱 App Connected: {sid}")
-    if not sws_instance:
+    if not is_ws_ready:
         eventlet.spawn(login_to_angel)
 
 @sio.event
 def subscribe(sid, data):
     global sws_instance, is_ws_ready
     
-    # 1. Connection check with wait
-    wait_count = 0
-    while not is_ws_ready and wait_count < 5:
-        print("⏳ Waiting for WebSocket to stabilize...")
+    # Wait for connection
+    for _ in range(5):
+        if is_ws_ready: break
         time.sleep(1)
-        wait_count += 1
 
     if data and sws_instance and is_ws_ready:
-        print(f"📡 Subscribing to {len(data)} tokens")
         chunk_size = 500
         for i in range(0, len(data), chunk_size):
             chunk = data[i:i + chunk_size]
@@ -114,12 +116,8 @@ def subscribe(sid, data):
             for etype, tokens in subs.items():
                 try:
                     sws_instance.subscribe("myt_pro_feed", 3, [{"exchangeType": etype, "tokens": tokens}])
-                except Exception as e:
-                    print(f"Subscribe Error: {e}")
-            
-            time.sleep(0.8) # Thoda extra gap for stability
-    else:
-        print("⚠️ Failed to subscribe: WebSocket not ready.")
+                except: pass
+            time.sleep(0.8)
 
 @sio.event
 def get_all_prices_request(sid, tokens):
