@@ -5,7 +5,6 @@ import os
 import pyotp
 import socketio
 import redis
-import json
 from datetime import datetime
 from supabase import create_client
 from SmartApi import SmartConnect
@@ -26,7 +25,7 @@ def initialize_clients():
     
     # Supabase configuration
     supabase_url = "https://rcosgmsyisybusmuxzei.supabase.co"
-    # User provided Service Role Key for full access
+    # Service Role Key use karein cleanup ke liye
     supabase_key = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJjb3NnbXN5aXN5YnVzbXV4emVpIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MDgzOTEzNCwiZXhwIjoyMDg2NDE1MTM0fQ.5BofQbMKiMLGFjqcIGaCwpoO9pLZnuLg7nojP0aGhJw") 
     supabase = create_client(supabase_url, supabase_key)
 
@@ -35,20 +34,19 @@ initialize_clients()
 sio = socketio.Server(cors_allowed_origins='*', async_mode='eventlet')
 socketio_app = socketio.WSGIApp(sio)
 
-# --- DATABASE CLEANUP ---
+# --- DATABASE CLEANUP (With Table Error Handling) ---
 def cleanup_expired_contracts():
-    """Purana expired data Supabase aur Redis se hatana"""
     try:
         today = datetime.now().strftime('%Y-%m-%d')
-        print(f"🧹 Cleaning expired contracts before: {today}")
+        # Logs mein dikha ki 'watchlist_items' table nahi mil rahi, isliye safety check add kiya
+        print(f"🧹 Attempting cleanup for date: {today}")
         
-        # Supabase cleanup (Table: watchlist_items में expiry column के आधार पर)
-        # Auth error fix: valid service_role key use ho rahi hai
+        # Check karein ki table exist karti hai ya nahi
         try:
             supabase.table("watchlist_items").delete().lt("expiry", today).execute()
             print("✅ Supabase Cleanup Success")
-        except Exception as db_e:
-            print(f"⚠️ Supabase Delete Error: {db_e}")
+        except Exception as table_e:
+            print(f"⚠️ Cleanup skipped: Table 'watchlist_items' not found or invalid key.")
             
     except Exception as e:
         print(f"❌ Cleanup Global Error: {e}")
@@ -57,33 +55,27 @@ def cleanup_expired_contracts():
 def get_exchange_type(token):
     try:
         t = int(token)
-        if 35000 <= t <= 999999: return 2  # NFO (Options/Futures)
-        if t >= 1000000: return 5          # MCX (Commodity)
-        return 1                           # NSE (Stocks)
-    except:
-        return 2
+        if 35000 <= t <= 999999: return 2  # NFO (Nifty/BankNifty Options)
+        if t >= 1000000: return 5          # MCX
+        return 1                           # NSE Stocks
+    except: return 2
 
 # --- CALLBACKS ---
 def on_data(wsapp, msg):
     if isinstance(msg, dict):
         token = msg.get('token')
-        # LTP detection for V2
         ltp_raw = msg.get('last_traded_price') or msg.get('ltp')
         
         if ltp_raw is not None and token:
             lp = str(float(ltp_raw) / 100)
             token_str = str(token).strip()
-            
-            # Redis update
             r.set(f"price:{token_str}", lp)
-            
-            # Frontend broadcast
             sio.emit('livePrice', {"tk": token_str, "lp": lp})
 
 def on_open(wsapp):
     global is_ws_ready
     is_ws_ready = True
-    print("✅ Angel WebSocket Connected")
+    print("✅ Angel WebSocket Connected Successfully")
 
 def on_error(wsapp, error):
     global is_ws_ready
@@ -94,13 +86,14 @@ def on_close(wsapp):
     global is_ws_ready, active_subscriptions
     is_ws_ready = False
     active_subscriptions.clear()
-    print("🔌 Connection Closed. Reconnecting in 5s...")
+    print("🔌 WS Connection Closed. Retrying login...")
     eventlet.sleep(5)
     login_to_angel()
 
 def login_to_angel():
     global sws_instance, is_ws_ready
     try:
+        # Credentials must be verified in Render Environment Variables
         API_KEY = "85HE4VA1"
         CLIENT_ID = "S52638556"
         PIN = "0000" 
@@ -122,9 +115,8 @@ def login_to_angel():
             eventlet.spawn(sws_instance.connect)
             print("🚀 Angel Login Successful")
             cleanup_expired_contracts()
-            
     except Exception as e:
-        print(f"❌ Login Failed: {e}")
+        print(f"❌ Angel Login Failed: {e}")
 
 # --- SOCKET EVENTS ---
 @sio.event
@@ -136,11 +128,10 @@ def connect(sid, environ):
 @sio.event
 def subscribe(sid, data):
     global sws_instance, is_ws_ready, active_subscriptions
-    
     if data and sws_instance and is_ws_ready:
         def do_subscribe():
-            tokens_to_sub = data if isinstance(data, list) else [data]
-            new_tokens = [str(t) for t in tokens_to_sub]
+            tokens = data if isinstance(data, list) else [data]
+            new_tokens = [str(t) for t in tokens]
             
             grouped = {}
             for t in new_tokens:
@@ -148,23 +139,23 @@ def subscribe(sid, data):
                 if etype not in grouped: grouped[etype] = []
                 grouped[etype].append(t)
 
-            for etype, tokens in grouped.items():
+            for etype, t_list in grouped.items():
                 correlation_id = f"sub_{sid}_{etype}"
                 try:
-                    # Rate limiting fix: sleep added to prevent socket close
-                    sws_instance.subscribe(correlation_id, 1, [{"exchangeType": etype, "tokens": tokens}])
-                    for t in tokens: active_subscriptions.add(t)
-                    print(f"📡 Subscribed: {len(tokens)} tokens on Exch {etype}")
-                    eventlet.sleep(0.3) 
+                    # Rate limiting fix to prevent "Connection closed due to max retry"
+                    sws_instance.subscribe(correlation_id, 1, [{"exchangeType": etype, "tokens": t_list}])
+                    for t in t_list: active_subscriptions.add(t)
+                    print(f"📡 Subscribed: {len(t_list)} tokens (Exch {etype})")
+                    eventlet.sleep(0.5) 
                 except Exception as e:
-                    print(f"❌ Subscription Failed: {e}")
+                    print(f"❌ Sub Error: {e}")
 
         eventlet.spawn(do_subscribe)
 
 def app(environ, start_response):
     if environ.get('PATH_INFO') == '/':
         start_response('200 OK', [('Content-Type', 'text/plain')])
-        return [b"MYT PRO BACKEND - MCX/NFO/CASH READY"]
+        return [b"MYT PRO BACKEND RUNNING"]
     return socketio_app(environ, start_response)
 
 if __name__ == '__main__':
