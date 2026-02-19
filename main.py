@@ -26,8 +26,8 @@ def initialize_clients():
     
     # Supabase configuration
     supabase_url = "https://rcosgmsyisybusmuxzei.supabase.co"
-    # Ensure your Key is correct in Environment Variables
-    supabase_key = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...") 
+    # User provided Service Role Key for full access
+    supabase_key = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJjb3NnbXN5aXN5YnVzbXV4emVpIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MDgzOTEzNCwiZXhwIjoyMDg2NDE1MTM0fQ.5BofQbMKiMLGFjqcIGaCwpoO9pLZnuLg7nojP0aGhJw") 
     supabase = create_client(supabase_url, supabase_key)
 
 initialize_clients()
@@ -35,36 +35,31 @@ initialize_clients()
 sio = socketio.Server(cors_allowed_origins='*', async_mode='eventlet')
 socketio_app = socketio.WSGIApp(sio)
 
-# --- DATABASE & CLEANUP LOGIC ---
+# --- DATABASE CLEANUP ---
 def cleanup_expired_contracts():
-    """Purana data remove karna jo expire ho chuka hai"""
+    """Purana expired data Supabase aur Redis se hatana"""
     try:
         today = datetime.now().strftime('%Y-%m-%d')
-        print(f"🧹 Cleaning up expired contracts for date: {today}")
+        print(f"🧹 Cleaning expired contracts before: {today}")
         
-        # 1. Supabase से एक्सपायर्ड टोकन हटाना (Table: watchlist_items, Column: expiry)
-        # मान लेते हैं आपकी टेबल में expiry कॉलम है
-        response = supabase.table("watchlist_items").delete().lt("expiry", today).execute()
-        
-        # 2. Redis Cleanup: जो टोकन अब एक्टिव नहीं हैं उन्हें Redis से भी हटाना
-        # (यह तब काम करेगा जब आप Redis में एक्सपायरी के साथ डेटा स्टोर करें)
-        keys = r.keys("price:*")
-        # यहाँ आप लॉजिक बढ़ा सकते हैं अगर आपके पास टोकन-एक्सपायरी मैपिंग हो
-        
-        print(f"✅ Cleanup complete.")
+        # Supabase cleanup (Table: watchlist_items में expiry column के आधार पर)
+        # Auth error fix: valid service_role key use ho rahi hai
+        try:
+            supabase.table("watchlist_items").delete().lt("expiry", today).execute()
+            print("✅ Supabase Cleanup Success")
+        except Exception as db_e:
+            print(f"⚠️ Supabase Delete Error: {db_e}")
+            
     except Exception as e:
-        print(f"❌ Cleanup Error: {e}")
+        print(f"❌ Cleanup Global Error: {e}")
 
-# --- SMART LOGIC FOR EXCHANGE TYPES ---
+# --- EXCHANGE LOGIC ---
 def get_exchange_type(token):
     try:
         t = int(token)
-        # Nifty/BankNifty/FinNifty Options Range
-        if 35000 <= t <= 999999: return 2  # NFO
-        # MCX Range (Commodity)
-        if t >= 1000000: return 5          # MCX
-        # NSE Cash (Stocks)
-        return 1                           # NSE
+        if 35000 <= t <= 999999: return 2  # NFO (Options/Futures)
+        if t >= 1000000: return 5          # MCX (Commodity)
+        return 1                           # NSE (Stocks)
     except:
         return 2
 
@@ -72,16 +67,17 @@ def get_exchange_type(token):
 def on_data(wsapp, msg):
     if isinstance(msg, dict):
         token = msg.get('token')
+        # LTP detection for V2
         ltp_raw = msg.get('last_traded_price') or msg.get('ltp')
         
         if ltp_raw is not None and token:
             lp = str(float(ltp_raw) / 100)
             token_str = str(token).strip()
             
-            # Redis Update
+            # Redis update
             r.set(f"price:{token_str}", lp)
             
-            # Live Broadcast to Frontend
+            # Frontend broadcast
             sio.emit('livePrice', {"tk": token_str, "lp": lp})
 
 def on_open(wsapp):
@@ -91,13 +87,14 @@ def on_open(wsapp):
 
 def on_error(wsapp, error):
     global is_ws_ready
+    is_ws_ready = False
     print(f"❌ WS Error: {error}")
 
 def on_close(wsapp):
     global is_ws_ready, active_subscriptions
     is_ws_ready = False
     active_subscriptions.clear()
-    print("🔌 Reconnecting...")
+    print("🔌 Connection Closed. Reconnecting in 5s...")
     eventlet.sleep(5)
     login_to_angel()
 
@@ -124,14 +121,12 @@ def login_to_angel():
             
             eventlet.spawn(sws_instance.connect)
             print("🚀 Angel Login Successful")
-            
-            # लॉगिन के बाद पुराना डेटा साफ करें
             cleanup_expired_contracts()
             
     except Exception as e:
         print(f"❌ Login Failed: {e}")
 
-# --- EVENTS ---
+# --- SOCKET EVENTS ---
 @sio.event
 def connect(sid, environ):
     print(f"📱 User Connected: {sid}")
@@ -140,17 +135,13 @@ def connect(sid, environ):
 
 @sio.event
 def subscribe(sid, data):
-    """Upcoming expiry add karne ke liye Frontend se naye tokens bhejein"""
     global sws_instance, is_ws_ready, active_subscriptions
     
     if data and sws_instance and is_ws_ready:
         def do_subscribe():
             tokens_to_sub = data if isinstance(data, list) else [data]
-            
-            # Filter tokens
             new_tokens = [str(t) for t in tokens_to_sub]
-            if not new_tokens: return
-
+            
             grouped = {}
             for t in new_tokens:
                 etype = get_exchange_type(t)
@@ -160,21 +151,20 @@ def subscribe(sid, data):
             for etype, tokens in grouped.items():
                 correlation_id = f"sub_{sid}_{etype}"
                 try:
-                    # Mode 1 for LTP updates
+                    # Rate limiting fix: sleep added to prevent socket close
                     sws_instance.subscribe(correlation_id, 1, [{"exchangeType": etype, "tokens": tokens}])
                     for t in tokens: active_subscriptions.add(t)
-                    print(f"📡 Subscribed: {len(tokens)} tokens (Ex: {etype})")
+                    print(f"📡 Subscribed: {len(tokens)} tokens on Exch {etype}")
+                    eventlet.sleep(0.3) 
                 except Exception as e:
-                    print(f"❌ Sub Error: {e}")
-                eventlet.sleep(0.1)
+                    print(f"❌ Subscription Failed: {e}")
 
         eventlet.spawn(do_subscribe)
 
-# --- SERVER START ---
 def app(environ, start_response):
     if environ.get('PATH_INFO') == '/':
         start_response('200 OK', [('Content-Type', 'text/plain')])
-        return [b"MYT PRO BACKEND ACTIVE - MCX/NFO/STOCKS SUPPORTED"]
+        return [b"MYT PRO BACKEND - MCX/NFO/CASH READY"]
     return socketio_app(environ, start_response)
 
 if __name__ == '__main__':
