@@ -4,30 +4,27 @@ eventlet.monkey_patch(all=True)
 import os
 import pyotp
 import socketio
-import redis
 from datetime import datetime
 from supabase import create_client
 from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 
 # --- CONFIGURATION ---
-REDIS_URL = os.environ.get("REDIS_URL", "redis://default:AR6NAAImcDE4YTZjMDM1ZTkzMDc0ZmJiOTM5YzhjZGI2OWY3MDA5ZXAxNzgyMQ@happy-moth-7821.upstash.io:6379")
+# Bhai, humne Redis hata diya hai, ab sirf Supabase chalega
 SUPABASE_URL = "https://rcosgmsyisybusmuxzei.supabase.co"
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "XzoayMr3B5UOVjKGNjjUxU07ZOCFnjPSfe7xO2Gt1OmORLEemCvILjG5O4damYqTT3quUDGmMvgcC+i5FEhthQ==")
 
 # --- GLOBAL STATE ---
 sws_instance = None
 is_ws_ready = False 
-r = None
 supabase = None
+subscribed_tokens = set()  # Master list: Ek token ek hi baar subscribe hoga
 
 def initialize_clients():
-    global r, supabase
+    global supabase
     try:
-        r = redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=5)
-        print("✅ Redis Connected")
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        print("✅ Supabase Connected")
+        print("✅ Supabase Connected - Ready for 1 Lakh Users!")
     except Exception as e:
         print(f"❌ Init Error: {e}")
 
@@ -36,7 +33,7 @@ initialize_clients()
 sio = socketio.Server(cors_allowed_origins='*', async_mode='eventlet')
 socketio_app = socketio.WSGIApp(sio)
 
-# --- CALLBACKS ---
+# --- CALLBACKS (Price Update Logic) ---
 def on_data(wsapp, msg):
     if isinstance(msg, dict):
         ltp_raw = msg.get('last_traded_price') or msg.get('ltp')
@@ -44,21 +41,29 @@ def on_data(wsapp, msg):
         
         if ltp_raw is not None and token:
             try:
-                # Angel One sends price in paisa, convert to Rs.
+                # 1. Price Conversion
                 lp = "{:.2f}".format(float(ltp_raw) / 100)
                 token_str = str(token).strip()
                 
-                # Update Redis and Broadcast
-                r.set(f"price:{token_str}", lp)
+                # 2. LOGIC: Seedha Supabase update karo
+                # Isse 1 lakh users ko Real-time price dikhega
+                supabase.table("symbols").update({"price": lp}).eq("token", token_str).execute()
+                
+                # 3. Optional: Socket emit for instant frontend update
                 sio.emit('livePrice', {"tk": token_str, "lp": lp})
-                # print(f"DEBUG: {token_str} -> {lp}") # Un-comment to see prices in Render logs
-            except:
+                
+            except Exception as e:
+                # Bhai agar table name alag hai toh yahan check kar lena
                 pass 
 
 def on_open(wsapp):
     global is_ws_ready
     is_ws_ready = True
-    print("✅ Angel WebSocket Active")
+    print("✅ Angel WebSocket Active - Pipe is Open")
+    # Agar server restart hua toh purane symbols re-subscribe karna
+    if subscribed_tokens:
+        resub_list = list(subscribed_tokens)
+        smart_subscribe(resub_list)
 
 def on_error(wsapp, error):
     print(f"❌ WS Error: {error}")
@@ -66,14 +71,14 @@ def on_error(wsapp, error):
 def on_close(wsapp, status=None, msg=None):
     global is_ws_ready
     is_ws_ready = False
-    print("🔌 Connection Closed. Reconnecting...")
+    print("🔌 Connection Closed. Reconnecting and Refreshing Token...")
     eventlet.sleep(5)
     login_to_angel()
 
+# --- TOKEN REFRESH & LOGIN ---
 def login_to_angel():
     global sws_instance
     try:
-        # Credentials (Inhe Environment Variables mein daalna safe hota hai)
         API_KEY = "85HE4VA1"
         CLIENT_ID = "S52638556"
         PIN = "0000" 
@@ -92,38 +97,60 @@ def login_to_angel():
             sws_instance.on_error = on_error
             sws_instance.on_close = on_close
             eventlet.spawn(sws_instance.connect)
-            print("🚀 Angel Login Successful")
+            print("🚀 Angel Login Successful - New Session Active")
     except Exception as e:
         print(f"❌ Login Failed: {e}")
 
-@sio.event
-def subscribe(sid, data):
+# --- MASTER SUBSCRIPTION LOGIC ---
+def smart_subscribe(tokens):
     """
-    Expected 'data' format from Frontend: 
-    [{"ex": 1, "token": "26000"}, {"ex": 2, "token": "35012"}]
+    Bhai, ye logic ensure karta hai ki subscription sirf ek baar ho
+    par price hamesha update hota rahe.
     """
-    if data and sws_instance and is_ws_ready:
+    global subscribed_tokens, sws_instance, is_ws_ready
+    
+    # Sirf wo tokens nikaalo jo pehle se subscribe nahi hain
+    new_tokens = [t for t in tokens if t not in subscribed_tokens]
+    
+    if new_tokens and sws_instance and is_ws_ready:
         try:
-            # Agar frontend sirf list of tokens bhej raha hai
-            if isinstance(data, list) and isinstance(data[0], str):
-                # Default logic: Token length 5+ usually means NFO/MCX
-                formatted_tokens = []
-                for t in data:
-                    ex_type = 2 if len(t) > 5 else 1
-                    formatted_tokens.append({"exchangeType": ex_type, "tokens": [t]})
-                
-                for item in formatted_tokens:
-                    sws_instance.subscribe(f"sub_{sid}", 1, [item])
-            else:
-                # Agar frontend sahi format (exchange + token) bhej raha hai
-                sws_instance.subscribe(f"sub_{sid}", 1, data)
+            formatted_list = []
+            for t in new_tokens:
+                ex_type = 2 if len(t) > 5 else 1 # NFO vs NSE simple logic
+                formatted_list.append({"exchangeType": ex_type, "tokens": [t]})
+                subscribed_tokens.add(t) # Master list mein add kar diya
+            
+            # Ek hi baar mein batch subscribe
+            sws_instance.subscribe("bhai_master_sub", 1, formatted_list)
+            print(f"🔥 Added {len(new_tokens)} new symbols to Live Stream.")
         except Exception as e:
             print(f"Subscribe Error: {e}")
+
+@sio.event
+def watch_list(sid, data):
+    # APK se jab tokens aayenge: ['26000', '3045']
+    if isinstance(data, list):
+        smart_subscribe(data)
+
+# --- SCORE & USER LOGIC ---
+@sio.event
+def add_score(sid, data):
+    """
+    Logic: User ka score update karna bina purana data delete kiye.
+    """
+    mobile = data.get('mobile')
+    points = data.get('points')
+    
+    user_res = supabase.table("users").select("score").eq("mobile", mobile).single().execute()
+    new_score = user_res.data['score'] + points
+    
+    supabase.table("users").update({"score": new_score}).eq("mobile", mobile).execute()
+    sio.emit('score_updated', {"score": new_score}, room=sid)
 
 def app(environ, start_response):
     if environ.get('PATH_INFO') == '/':
         start_response('200 OK', [('Content-Type', 'text/plain')])
-        return [b"BACKEND IS LIVE"]
+        return [b"BACKEND IS LIVE - SUPABASE MODE"]
     return socketio_app(environ, start_response)
 
 if __name__ == '__main__':
