@@ -12,7 +12,7 @@ from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 # --- CONFIGURATION ---
 # Bhai, humne Redis hata diya hai, ab sirf Supabase chalega
 SUPABASE_URL = "https://rcosgmsyisybusmuxzei.supabase.co"
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "XzoayMr3B5UOVjKGNjjUxU07ZOCFnjPSfe7xO2Gt1OmORLEemCvILjG5O4damYqTT3quUDGmMvgcC+i5FEhthQ==")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJjb3NnbXN5aXN5YnVzbXV4emVpIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MDgzOTEzNCwiZXhwIjoyMDg2NDE1MTM0fQ.5BofQbMKiMLGFjqcIGaCwpoO9pLZnuLg7nojP0aGhJw")
 
 # --- GLOBAL STATE ---
 sws_instance = None
