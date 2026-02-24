@@ -71,7 +71,7 @@ def watchlist_live_tunnel():
                         subscribed_tokens.add(token)
                         print(f"✅ Subscribed {token} on Exch {ex_code}")
         except Exception as e: print(f"Tunnel 2 Error: {e}")
-        eventlet.sleep(1) # 🔥 1 Second Sync
+        eventlet.sleep(0.5) # 🔥 1 Second Sync
 
 if __name__ == '__main__':
     eventlet.spawn(login_to_angel)
