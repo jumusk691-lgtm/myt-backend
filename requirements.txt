@@ -10,4 +10,4 @@ pandas
 websocket-client
 logzero
 supabase
-radis
+redis
