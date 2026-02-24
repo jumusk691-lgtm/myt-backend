@@ -7,7 +7,7 @@ from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 
 # --- CONFIGURATION ---
 SUPABASE_URL = "https://rcosgmsyisybusmuxzei.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJjb3NnbXN5aXN5YnVzbXV4emVpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Mzk5NTE4MzksImV4cCI6MjA1NTUyNzgzOX0.999f_8f-I4E6-LzS6fR-eH5_99999999999" # Apni puri key yahan dalein
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJjb3NnbXN5aXN5YnVzbXV4emVpIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MDgzOTEzNCwiZXhwIjoyMDg2NDE1MTM0fQ.5BofQbMKiMLGFjqcIGaCwpoO9pLZnuLg7nojP0aGhJw"
 REDIS_URL = os.environ.get("REDIS_URL")
 
 # Socket.io with Redis for 1 Lakh Users
