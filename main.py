@@ -97,4 +97,4 @@ def subscribe_all_from_db():
 if __name__ == '__main__':
     login_to_angel()
     port = int(os.environ.get("PORT", 10000))
-    eventlet.wsgi.server(eventlet.listen(('0.0.0.0', port)), socketio_app)
+    eventlet.wsgi.server(eventlet.listen(('0.0.0.0', port)), socketio_app)me jab comit changes kar rahahu ti ese arahihe
