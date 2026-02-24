@@ -39,43 +39,43 @@ def login_to_angel():
             eventlet.spawn(sws_instance.connect)
     except Exception as e: print(f"❌ Login Error: {e}")
 
-# 🚀 Tunnel 1: Morning 9 AM & Night 9 PM Cleanup Logic
 def market_data_tunnel():
     global subscribed_tokens
     while True:
         try:
             now = datetime.datetime.now().strftime("%H:%M")
             if now in ["09:00", "21:00"]:
-                print(f"⏰ Scheduled Cleanup at {now}: Refreshing Tokens...")
-                subscribed_tokens.clear() # Sari memory clear taaki naye expiry/tokens load ho sakein
-                eventlet.sleep(65) # Ek minute wait taaki loop repeat na ho
+                print(f"⏰ Scheduled Cleanup at {now}...")
+                subscribed_tokens.clear() 
+                eventlet.sleep(65)
             eventlet.sleep(30)
         except Exception as e: print(f"Tunnel 1 Error: {e}"); eventlet.sleep(60)
 
-# 🚀 Tunnel 2: 0.1s Fast Sync with Unique Set Logic
+# 🚀 Tunnel 2: Smart Batching (500 tokens) & Unique Logic
 def watchlist_live_tunnel():
     global subscribed_tokens
     while True:
         try:
             if sws_instance and is_ws_ready:
                 res = supabase.table("watchlist_items").select("token, exch_seg").execute()
-                # Set comprehension se duplicates database level par hi hat jayenge
-                active_db_data = { (str(item['token']), item['exch_seg']) for item in res.data if item.get('token') }
+                # Unique Set: 10k users same token dekhenge tab bhi 1 hi count hoga
+                all_unique_data = { (str(item['token']), item['exch_seg']) for item in res.data if item.get('token') }
                 
-                for token, exch in active_db_data:
-                    if token not in subscribed_tokens:
-                        if exch == "MCX": ex_code = 5
-                        elif exch == "NFO": ex_code = 2
-                        elif exch == "BSE": ex_code = 3
-                        elif exch == "BFO": ex_code = 4
-                        elif exch == "CDS": ex_code = 7
-                        else: ex_code = 1
-                        
-                        sws_instance.subscribe("bhai_task", 1, [{"exchangeType": ex_code, "tokens": [token]}])
-                        subscribed_tokens.add(token)
-                        print(f"✅ Live: {token} ({exch})")
+                # Filter naye tokens
+                new_to_sub = [t for t in all_unique_data if t[0] not in subscribed_tokens]
+
+                if new_to_sub:
+                    # 500-500 ke batch mein divide karna
+                    for i in range(0, len(new_to_sub), 500):
+                        batch = new_to_sub[i:i+500]
+                        for ex_name, ex_code in [("MCX", 5), ("NFO", 2), ("BSE", 3), ("BFO", 4), ("NSE", 1)]:
+                            tokens = [t[0] for t in batch if t[1] == ex_name]
+                            if tokens:
+                                sws_instance.subscribe("bhai_task", 1, [{"exchangeType": ex_code, "tokens": tokens}])
+                                for t in tokens: subscribed_tokens.add(t)
+                                print(f"✅ Batched {len(tokens)} tokens for {ex_name}")
         except Exception as e: print(f"Tunnel 2 Error: {e}")
-        eventlet.sleep(0.1) # 🔥 Super Fast Update
+        eventlet.sleep(0.5)
 
 if __name__ == '__main__':
     eventlet.spawn(login_to_angel)
