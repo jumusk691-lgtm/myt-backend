@@ -1,6 +1,6 @@
 import eventlet
 eventlet.monkey_patch(all=True)
-import os, pyotp, socketio, redis, time
+import os, pyotp, socketio, redis, time, datetime
 from supabase import create_client
 from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
@@ -25,7 +25,6 @@ def on_data(wsapp, msg):
         ltp = msg.get('last_traded_price') or msg.get('ltp')
         if ltp and token:
             lp = "{:.2f}".format(float(ltp) / 100)
-            # 🚀 Broadcaster: Ek hi baar bhejega sabhi 1 lakh users ko
             sio.emit('livePrice', {"tk": str(token).strip(), "lp": lp})
 
 def login_to_angel():
@@ -40,38 +39,43 @@ def login_to_angel():
             eventlet.spawn(sws_instance.connect)
     except Exception as e: print(f"❌ Login Error: {e}")
 
-# 🚀 Tunnel 1: 5 Ghante wala Cleanup
+# 🚀 Tunnel 1: Morning 9 AM & Night 9 PM Cleanup Logic
 def market_data_tunnel():
+    global subscribed_tokens
     while True:
         try:
-            print("📡 Expiry Cleanup Tunnel Active...")
-            eventlet.sleep(18000) # 5 Ghante
+            now = datetime.datetime.now().strftime("%H:%M")
+            if now in ["09:00", "21:00"]:
+                print(f"⏰ Scheduled Cleanup at {now}: Refreshing Tokens...")
+                subscribed_tokens.clear() # Sari memory clear taaki naye expiry/tokens load ho sakein
+                eventlet.sleep(65) # Ek minute wait taaki loop repeat na ho
+            eventlet.sleep(30)
         except Exception as e: print(f"Tunnel 1 Error: {e}"); eventlet.sleep(60)
 
-# 🚀 Tunnel 2: 1 Second Fast Sync (All Exchanges)
+# 🚀 Tunnel 2: 0.1s Fast Sync with Unique Set Logic
 def watchlist_live_tunnel():
     global subscribed_tokens
     while True:
         try:
             if sws_instance and is_ws_ready:
                 res = supabase.table("watchlist_items").select("token, exch_seg").execute()
+                # Set comprehension se duplicates database level par hi hat jayenge
                 active_db_data = { (str(item['token']), item['exch_seg']) for item in res.data if item.get('token') }
                 
-                for token, exch in list(active_db_data)[:3000]:
+                for token, exch in active_db_data:
                     if token not in subscribed_tokens:
-                        # 🔥 All Exchange Logic
                         if exch == "MCX": ex_code = 5
                         elif exch == "NFO": ex_code = 2
                         elif exch == "BSE": ex_code = 3
                         elif exch == "BFO": ex_code = 4
                         elif exch == "CDS": ex_code = 7
-                        else: ex_code = 1 # NSE Default
+                        else: ex_code = 1
                         
                         sws_instance.subscribe("bhai_task", 1, [{"exchangeType": ex_code, "tokens": [token]}])
                         subscribed_tokens.add(token)
-                        print(f"✅ Subscribed {token} on Exch {ex_code}")
+                        print(f"✅ Live: {token} ({exch})")
         except Exception as e: print(f"Tunnel 2 Error: {e}")
-        eventlet.sleep(0.5) # 🔥 1 Second Sync
+        eventlet.sleep(0.1) # 🔥 Super Fast Update
 
 if __name__ == '__main__':
     eventlet.spawn(login_to_angel)
