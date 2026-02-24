@@ -45,7 +45,7 @@ def market_data_tunnel():
         try:
             print("📡 Market Data Tunnel: Checking for new expiry tokens...")
             # Yahan aap market_data table ko update ya purane tokens cleanup kar sakte hain
-            eventlet.sleep(3600) # Har ghante check karega
+            eventlet.sleep(18000) # Har ghante check karega
         except Exception as e: print(f"Tunnel 1 Error: {e}"); eventlet.sleep(60)
 
 # 🚀 Tunnel 2: Unique Watchlist Live (Broadcaster)
