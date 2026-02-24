@@ -1,55 +1,39 @@
 import eventlet
 eventlet.monkey_patch(all=True)
-
-import os
-import pyotp
-import socketio
-import redis
+import os, pyotp, socketio, redis, time
 from supabase import create_client
 from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 
 # --- CONFIGURATION ---
 SUPABASE_URL = "https://rcosgmsyisybusmuxzei.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." # Apni puri key rakhein
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJjb3NnbXN5aXN5YnVzbXV4emVpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Mzk5NTE4MzksImV4cCI6MjA1NTUyNzgzOX0.999f_8f-I4E6-LzS6fR-eH5_99999999999" # Apni puri key yahan dalein
+REDIS_URL = os.environ.get("REDIS_URL")
 
-# --- REDIS SETUP (Scaling ke liye zaroori) ---
-# Jab aap Koyeb ya VPS par honge, toh wahan Redis ka URL milega
-REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
-
-# Socket.io with Redis Adapter
+# Socket.io with Redis for 1 Lakh Users
 mgr = socketio.RedisManager(REDIS_URL)
 sio = socketio.Server(cors_allowed_origins='*', async_mode='eventlet', client_manager=mgr)
 socketio_app = socketio.WSGIApp(sio)
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# --- GLOBAL STATE ---
+# Global State
 sws_instance = None
 is_ws_ready = False 
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 subscribed_tokens = set()
 
-# --- CALLBACKS (Optimized for 1 Lakh Users) ---
 def on_data(wsapp, msg):
     if isinstance(msg, dict):
-        ltp_raw = msg.get('last_traded_price') or msg.get('ltp')
         token = msg.get('token')
-        
-        if ltp_raw is not None and token:
-            lp = "{:.2f}".format(float(ltp_raw) / 100)
-            token_str = str(token).strip()
-            
-            # 🔥 CRITICAL LOGIC: DB ke bajaye seedha Broadcast karein
-            # Database update har 1 second mein 1 lakh baar nahi ho sakta, 
-            # isliye hum seedha Socket se bhej rahe hain.
-            sio.emit('livePrice', {"tk": token_str, "lp": lp})
+        ltp = msg.get('last_traded_price') or msg.get('ltp')
+        if ltp and token:
+            lp = "{:.2f}".format(float(ltp) / 100)
+            sio.emit('livePrice', {"tk": str(token).strip(), "lp": lp})
 
 def on_open(wsapp):
     global is_ws_ready
     is_ws_ready = True
-    print("✅ Angel WebSocket Active")
-    subscribe_all_from_db()
+    print("✅ WebSocket Connected!")
 
-# --- ANGEL LOGIN & RECONNECT ---
 def login_to_angel():
     global sws_instance
     try:
@@ -74,27 +58,34 @@ def login_to_angel():
     except Exception as e:
         print(f"❌ Login Error: {e}")
 
-def subscribe_all_from_db():
+# 🔥 AUTO SYNC LOGIC: Har 60 sec mein Supabase se naye tokens check honge
+def sync_supabase_data():
     global subscribed_tokens, sws_instance, is_ws_ready
-    try:
-        res = supabase.table("market_data").select("token").execute()
-        tokens = [str(item['token']) for item in res.data if item['token']]
-        
-        if tokens and sws_instance and is_ws_ready:
-            formatted_list = []
-            for t in tokens:
-                if t not in subscribed_tokens:
-                    ex_type = 2 if len(t) > 5 else 1
-                    formatted_list.append({"exchangeType": ex_type, "tokens": [t]})
-                    subscribed_tokens.add(t)
-            
-            if formatted_list:
-                sws_instance.subscribe("bhai_master", 1, formatted_list)
-    except Exception as e:
-        print(f"DB Error: {e}")
+    while True:
+        try:
+            if sws_instance and is_ws_ready:
+                res = supabase.table("market_data").select("token").execute()
+                current_db_tokens = {str(item['token']) for item in res.data if item['token']}
+                
+                # Agar DB mein naye tokens aaye ya purane delete huye
+                if current_db_tokens != subscribed_tokens:
+                    print(f"🔄 Syncing Data: {len(current_db_tokens)} tokens found")
+                    
+                    # Naye tokens ko format karke subscribe karein
+                    token_list = []
+                    for t in current_db_tokens:
+                        ex_type = 2 if len(t) > 5 else 1 # Simple logic for NSE vs OPT
+                        token_list.append({"exchangeType": ex_type, "tokens": [t]})
+                    
+                    sws_instance.subscribe("bhai_master", 1, token_list)
+                    subscribed_tokens = current_db_tokens
+        except Exception as e:
+            print(f"Sync Error: {e}")
+        eventlet.sleep(60)
 
-# --- SERVER START ---
 if __name__ == '__main__':
-    login_to_angel()
+    eventlet.spawn(login_to_angel)
+    eventlet.spawn(sync_supabase_data)
     port = int(os.environ.get("PORT", 10000))
-    eventlet.wsgi.server(eventlet.listen(('0.0.0.0', port)), socketio_app)me jab comit changes kar rahahu ti ese arahihe
+    print(f"🚀 Server running on port {port}")
+    eventlet.wsgi.server(eventlet.listen(('0.0.0.0', port)), socketio_app)
