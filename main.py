@@ -1,20 +1,17 @@
 import eventlet
 eventlet.monkey_patch(all=True)
-import os, pyotp, socketio, redis, time, datetime
-from supabase import create_client
+import os, pyotp, socketio, redis, time, datetime, requests
 from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 
 # --- CONFIGURATION ---
-SUPABASE_URL = "https://rcosgmsyisybusmuxzei.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJjb3NnbXN5aXN5YnVzbXV4emVpIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MDgzOTEzNCwiZXhwIjoyMDg2NDE1MTM0fQ.5BofQbMKiMLGFjqcIGaCwpoO9pLZnuLg7nojP0aGhJw"
 REDIS_URL = os.environ.get("REDIS_URL")
+# Google Drive Direct Link (Aapki JSON file ka link yahan aayega)
+MASTER_JSON_URL = "https://your_google_drive_direct_link.json" 
 
-# Redis for SocketIO and Fast Caching
 mgr = socketio.RedisManager(REDIS_URL)
 sio = socketio.Server(cors_allowed_origins='*', async_mode='eventlet', client_manager=mgr)
 socketio_app = socketio.WSGIApp(sio)
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 r_client = redis.from_url(REDIS_URL, decode_responses=True)
 
 sws_instance = None
@@ -40,41 +37,25 @@ def login_to_angel():
             eventlet.spawn(sws_instance.connect)
     except Exception as e: print(f"❌ Login Error: {e}")
 
-def market_data_tunnel():
-    while True:
-        try:
-            now = datetime.datetime.now().strftime("%H:%M")
-            if now in ["09:00", "21:00"]:
-                r_client.delete("global_subscribed_tokens") # Redis clear for refresh
-                eventlet.sleep(65)
-            eventlet.sleep(30)
-        except Exception as e: print(f"Tunnel 1 Error: {e}"); eventlet.sleep(60)
-
 def watchlist_live_tunnel():
     while True:
         try:
             if sws_instance and is_ws_ready:
-                res = supabase.table("watchlist_items").select("token, exch_seg").execute()
-                # Deduplication: Unique tokens for all users
-                all_unique_data = { (str(item['token']), item['exch_seg']) for item in res.data if item.get('token') }
+                # Ab data Supabase se nahi, Redis ya Local memory se aayega
+                # Jo tokens users ne watchlist mein add kiye hain unhe subscribe karo
+                all_tokens = r_client.smembers("active_user_tokens") 
                 
-                # Redis Fast Filter: Check what's NOT in Redis
-                new_to_sub = [t for t in all_unique_data if not r_client.sismember("global_subscribed_tokens", t[0])]
+                new_to_sub = [t for t in all_tokens if not r_client.sismember("global_subscribed_tokens", t)]
 
                 if new_to_sub:
-                    for i in range(0, len(new_to_sub), 500):
-                        batch = new_to_sub[i:i+500]
-                        for ex_name, ex_code in [("MCX", 5), ("NFO", 2), ("BSE", 3), ("BFO", 4), ("NSE", 1)]:
-                            tokens = [t[0] for t in batch if t[1] == ex_name]
-                            if tokens:
-                                sws_instance.subscribe("bhai_task", 1, [{"exchangeType": ex_code, "tokens": tokens}])
-                                r_client.sadd("global_subscribed_tokens", *tokens)
-                                print(f"🚀 Redis Sync: {len(tokens)} tokens for {ex_name}")
+                    # Yahan exchange-wise subscribe logic (NSE, NFO, etc.)
+                    # Ex: sws_instance.subscribe("bhai_task", 1, [{"exchangeType": 1, "tokens": new_to_sub}])
+                    r_client.sadd("global_subscribed_tokens", *new_to_sub)
+                    print(f"🚀 Redis Sync: {len(new_to_sub)} new tokens")
         except Exception as e: print(f"Tunnel 2 Error: {e}")
-        eventlet.sleep(0.1) # 🔥 Super Fast 0.1s
+        eventlet.sleep(0.5)
 
 if __name__ == '__main__':
     eventlet.spawn(login_to_angel)
-    eventlet.spawn(market_data_tunnel)
     eventlet.spawn(watchlist_live_tunnel)
     eventlet.wsgi.server(eventlet.listen(('0.0.0.0', int(os.environ.get("PORT", 10000)))), socketio_app)
