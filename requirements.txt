@@ -9,5 +9,4 @@ requests
 pandas
 websocket-client
 logzero
-supabase
 redis
