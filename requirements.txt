@@ -9,3 +9,4 @@ requests
 pandas
 websocket-client
 logzero
+firebase-admin
