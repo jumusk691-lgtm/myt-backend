@@ -7,7 +7,6 @@ from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 
 # --- 1. FIREBASE SETUP ---
-# Ensure "serviceAccountKey.json" is added in Render Secret Files
 cred = credentials.Certificate("serviceAccountKey.json") 
 firebase_admin.initialize_app(cred, {
     'databaseURL': 'https://trade-f600a-default-rtdb.firebaseio.com/'
@@ -32,7 +31,7 @@ def check_and_sync_morning():
         now = datetime.datetime.now()
         if now.hour == 9 and now.minute == 0:
             print("🚀 9:00 AM: Cleaning central_watchlist for fresh start...")
-            time.sleep(65) 
+            eventlet.sleep(65) # Pure system ko freeze nahi karega
         eventlet.sleep(30)
 
 # --- 3. LIVE PRICE HANDLER ---
@@ -53,7 +52,14 @@ def on_data(wsapp, msg):
                     })
                 last_sent_prices[token] = ltp
 
-# --- 4. AUTO-RECONNECT ENGINE ---
+# --- 4. AUTO-RECONNECT ENGINE (UPGRADED) ---
+def on_close(wsapp, code, reason):
+    global is_ws_ready
+    is_ws_ready = False
+    print(f"🔌 Connection Lost (Code: {code}). Reconnecting in 5s...")
+    eventlet.sleep(5)
+    login_and_connect()
+
 def login_and_connect():
     global sws, is_ws_ready
     while True:
@@ -65,12 +71,21 @@ def login_and_connect():
             if session.get('status'):
                 sws = SmartWebSocketV2(session['data']['jwtToken'], API_KEY, CLIENT_CODE, session['data']['feedToken'])
                 sws.on_data = on_data
-                sws.on_open = lambda ws: exec("global is_ws_ready; is_ws_ready=True; print('✅ WebSocket Connected')")
+                sws.on_close = on_close # Reconnect logic added here
+                
+                def setup_ws(ws):
+                    global is_ws_ready
+                    is_ws_ready = True
+                    print('✅ WebSocket Connected')
+                
+                sws.on_open = setup_ws
                 eventlet.spawn(sws.connect)
                 break 
+            else:
+                print("❌ Session generation failed. Retrying...")
         except Exception as e:
-            print(f"❌ Connection Failed: {e}. Retrying in 5s...")
-            time.sleep(5)
+            print(f"❌ Connection Error: {e}. Retrying in 5s...")
+        eventlet.sleep(5)
 
 # --- 5. SYSTEM MAINTENANCE ---
 def maintenance_loop():
@@ -115,20 +130,20 @@ def cron_keep_alive():
 
 # --- 7. MAIN ENGINE AND SERVER BINDING ---
 if __name__ == '__main__':
-    login_and_connect()
+    # Start login sequence
+    eventlet.spawn(login_and_connect)
     
+    # Start background tasks
     eventlet.spawn(maintenance_loop)
     eventlet.spawn(check_and_sync_morning)
     eventlet.spawn(cron_keep_alive)
     
-    # FIXED: Proper import for Render compatibility
     from eventlet import wsgi
-    
     port = int(os.environ.get("PORT", 10000))
+    
     def app(environ, start_response):
         start_response('200 OK', [('Content-Type', 'text/plain')])
         return [b"Render Live Engine Active"]
     
     print(f"🌍 Server starting on port {port}")
-    # Using the imported wsgi module to prevent AttributeError
     wsgi.server(eventlet.listen(('0.0.0.0', port)), app)
