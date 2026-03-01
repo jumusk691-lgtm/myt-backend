@@ -6,8 +6,7 @@ from firebase_admin import credentials, db
 from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 
-# --- 1. FIREBASE SETUP (Point 6: Firebase Only) ---
-# Paste your service account key path or use environment variables
+# --- 1. FIREBASE SETUP ---
 cred = credentials.Certificate("serviceAccountKey.json") 
 firebase_admin.initialize_app(cred, {
     'databaseURL': 'https://trade-f600a-default-rtdb.firebaseio.com/'
@@ -19,45 +18,52 @@ CLIENT_CODE = "S52638556"
 PWD = "0000"
 TOTP_STR = "XFTXZ2445N4V2UMB7EWUCBDRMU"
 
-# --- GLOBAL STATE (Point 4 & 7: RAM/Cleanup Management) ---
+# --- GLOBAL STATE ---
 sws = None
 is_ws_ready = False
-active_subscriptions = set() # Point 2: Unique Subscription
-last_sent_prices = {} # Point 3: 0.1s update check
+active_subscriptions = set() 
+last_sent_prices = {}
+token_to_fb_keys = {} # Mapping for Screenshot structure
 
-# --- 2. 9:00 AM TOKEN SYNC (Point 1 & 8) ---
-def daily_token_sync():
-    print(f"[{datetime.datetime.now()}] 🚀 Running 9:00 AM Sync...")
-    # Token master download aur purane tokens delete karne ka logic yahan aayega
-    # Firebase 'central_watchlist' ko clean karke naya data inject karein
-    db.reference('central_watchlist').delete() 
-    print("✅ Purana data deleted. Ready for new tokens.")
+# --- 2. DAILY SYNC LOGIC (Point 1 & 8) ---
+def check_and_sync_morning():
+    """Subah 9:00 AM par tokens refresh karne ke liye"""
+    while True:
+        now = datetime.datetime.now()
+        if now.hour == 9 and now.minute == 0:
+            print("🚀 9:00 AM: Cleaning central_watchlist for fresh start...")
+            # db.reference('central_watchlist').delete() 
+            # Yahan aap apna naya token download logic dal sakte hain
+            time.sleep(65) # Avoid multiple triggers in the same minute
+        eventlet.sleep(30)
 
-# --- 3. LIVE PRICE HANDLER (Point 3 & 9) ---
+# --- 3. LIVE PRICE HANDLER (Point 3, 6 & 9) ---
 def on_data(wsapp, msg):
-    global last_sent_prices
+    global last_sent_prices, token_to_fb_keys
     if isinstance(msg, dict):
         token = msg.get('token')
-        # Point 9: Market price format (/100 if required by Angel API)
-        ltp = float(msg.get('last_traded_price', 0))
+        # Point 9: Proper formatting for display
+        ltp_raw = msg.get('last_traded_price') or msg.get('ltp', 0)
+        ltp = float(ltp_raw) / 100 
         
-        if ltp > 0 and token:
-            # Point 3: 0.1s Speed - Update only if price changed
+        if ltp > 0 and token in token_to_fb_keys:
+            # Point 3: 0.1s Speed check (Only push if price changed)
             if ltp != last_sent_prices.get(token):
-                # Update in Firebase 'central_watchlist'
-                # Isse market band hone par bhi last price save rahegi
-                db.reference(f'central_watchlist/{token}').update({
-                    "price": ltp,
-                    "last_update": str(datetime.datetime.now())
-                })
+                formatted_lp = "{:.2f}".format(ltp)
+                # Update all unique user-keys in central_watchlist
+                for fb_key in token_to_fb_keys[token]:
+                    db.reference(f'central_watchlist/{fb_key}').update({
+                        "price": formatted_lp,
+                        "utime": datetime.datetime.now().strftime("%H:%M:%S")
+                    })
                 last_sent_prices[token] = ltp
 
-# --- 4. AUTO-RECONNECT LOGIC (Point 5) ---
+# --- 4. AUTO-RECONNECT ENGINE (Point 5) ---
 def login_and_connect():
     global sws, is_ws_ready
     while True:
         try:
-            print("🔄 Attempting Login & Connection...")
+            print("🔄 Attempting Angel Login...")
             obj = SmartConnect(api_key=API_KEY)
             session = obj.generateSession(CLIENT_CODE, PWD, pyotp.TOTP(TOTP_STR).now())
             
@@ -65,66 +71,71 @@ def login_and_connect():
                 sws = SmartWebSocketV2(session['data']['jwtToken'], API_KEY, CLIENT_CODE, session['data']['feedToken'])
                 sws.on_data = on_data
                 sws.on_open = lambda ws: exec("global is_ws_ready; is_ws_ready=True; print('✅ WebSocket Connected')")
-                
-                # Start WebSocket in a thread
                 eventlet.spawn(sws.connect)
                 break 
         except Exception as e:
-            print(f"❌ Connection Error: {e}. Retrying in 5s...")
+            print(f"❌ Connection Failed: {e}. Retrying in 5s...")
             time.sleep(5)
 
-# --- 5. SMART TUNNEL & CLEANUP (Point 2, 4 & 8) ---
-def maintain_system():
-    global active_subscriptions, last_sent_prices
-    minute_counter = 0
-    
+# --- 5. SYSTEM MAINTENANCE (Point 2, 4 & Screenshot Logic) ---
+def maintenance_loop():
+    global active_subscriptions, token_to_fb_keys, last_sent_prices
     while True:
         try:
-            # 1-Minute Resource Cleanup (Point 4)
-            minute_counter += 1
-            if minute_counter >= 120: # Approx 1 min (0.5s * 120)
-                print("🧹 1-Min Cleanup: Flushing temporary logs...")
-                last_sent_prices.clear() 
-                minute_counter = 0
+            # Step A: Screenshot Logic - TOKEN_USERID parse karna
+            ref = db.reference('central_watchlist').get()
+            if ref:
+                current_map = {}
+                tokens_to_sub = []
+                
+                for fb_key in ref.keys():
+                    # Token extract (Example: "500089" from "500089_UserID")
+                    t_id = fb_key.split('_')[0]
+                    if t_id not in current_map:
+                        current_map[t_id] = []
+                        if t_id not in active_subscriptions:
+                            tokens_to_sub.append({"exchangeType": 1, "tokens": [str(t_id)]})
+                    current_map[t_id].append(fb_key)
+                
+                token_to_fb_keys = current_map
 
-            # Unique Subscription Logic (Point 2)
-            if is_ws_ready:
-                ref = db.reference('central_watchlist').get()
-                if ref:
-                    # Sirf wahi tokens jo pehle se subscribe nahi hain
-                    current_tokens = set(ref.keys())
-                    new_tokens = current_tokens - active_subscriptions
-                    
-                    if new_tokens:
-                        to_sub = [{"exchangeType": 1, "tokens": [str(t)]} for t in new_tokens]
-                        sws.subscribe("bhai_task", 1, to_sub)
-                        active_subscriptions.update(new_tokens)
-                        print(f"🚀 Subscribed to {len(new_tokens)} new tokens")
+                # Step B: Unique Subscription (Point 2)
+                if is_ws_ready and tokens_to_sub:
+                    sws.subscribe("myt_task", 1, tokens_to_sub)
+                    for item in tokens_to_sub:
+                        active_subscriptions.add(item['tokens'][0])
+                    print(f"🚀 New Subscriptions: {len(tokens_to_sub)}")
 
-        except Exception as e: print(f"⚠️ System Maintenance Error: {e}")
-        eventlet.sleep(0.5)
+            # Step C: 1-Min Resource Cleanup (Point 4)
+            if datetime.datetime.now().second < 5: # Har minute ke shuru mein cleanup
+                last_sent_prices.clear()
+                print("🧹 RAM Cleanup: last_sent_prices cleared.")
 
-# --- 6. CRON WAKEUP / 15-MIN TASK (Point 8) ---
-def cron_wakeup():
+        except Exception as e:
+            print(f"⚠️ Maintenance Error: {e}")
+        
+        eventlet.sleep(20) # 20 sec check cycle
+
+# --- 6. RENDER ALIVE (Point 8 - 15 Min Cron) ---
+def cron_keep_alive():
     while True:
-        # Har 15 minute mein wakeup signal (Point 8)
-        print(f"⏰ Cron Heartbeat: {datetime.datetime.now()}")
-        eventlet.sleep(900) 
+        print(f"⏰ Heartbeat: {datetime.datetime.now()} - System Live")
+        eventlet.sleep(900) # 15 Minutes
 
 if __name__ == '__main__':
-    # Initial Login
+    # Initial startup
     login_and_connect()
     
-    # Run tasks
-    eventlet.spawn(maintain_system)
-    eventlet.spawn(cron_wakeup)
+    # Spawn background tasks
+    eventlet.spawn(maintenance_loop)
+    eventlet.spawn(check_and_sync_morning)
+    eventlet.spawn(cron_keep_alive)
     
-    # Run Web Server for Render
+    # Render Web Server Binding
     port = int(os.environ.get("PORT", 10000))
-    print(f"🌍 Server running on port {port}")
-    # Dummy app to keep Render happy
     def app(environ, start_response):
         start_response('200 OK', [('Content-Type', 'text/plain')])
-        return [b"Render Live Engine is Running"]
+        return [b"Render Live Engine Active"]
     
+    print(f"🌍 Server starting on port {port}")
     eventlet.wsgi.server(eventlet.listen(('0.0.0.0', port)), app)
