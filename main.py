@@ -22,7 +22,7 @@ IST = pytz.timezone('Asia/Kolkata')
 sws = None
 is_ws_ready = False
 active_subscriptions = set()
-token_to_fb_keys = {} # Mapping of token -> list of Firebase keys
+token_to_fb_keys = {} 
 last_price_cache = {} 
 last_tick_time = time.time() 
 
@@ -30,31 +30,28 @@ last_tick_time = time.time()
 def is_market_open():
     now = datetime.datetime.now(IST)
     if now.weekday() >= 5: return False 
-    # Current time ke hisaab se check (9:00 AM to 11:30 PM)
-    return 9 <= now.hour < 24 
+    return 9 <= now.hour < 24 # Crude/MCX ke liye raat tak open
 
-# --- 3. PRO TICK ENGINE (FIXED LOGIC) ---
+# --- 3. PRO TICK ENGINE ---
 def on_data(wsapp, msg):
     global last_price_cache, last_tick_time
     if isinstance(msg, dict) and 'token' in msg:
         token = msg.get('token')
-        last_tick_time = time.time() # Tick milte hi time update karo
+        last_tick_time = time.time() 
         
         ltp_raw = msg.get('last_traded_price') or msg.get('ltp', 0)
         ltp = float(ltp_raw) / 100
         
         if ltp > 0 and token in token_to_fb_keys:
-            # Check if price actually changed to save Firebase bandwidth
             if last_price_cache.get(token) == ltp: 
                 return 
 
             now_time = datetime.datetime.now(IST).strftime("%H:%M:%S")
             updates = {}
-            
             for fb_key in token_to_fb_keys[token]:
-                # Dynamic Precision: MCX/CDS ke liye 4 decimal, baaki 2
-                is_high_precision = any(x in fb_key.upper() for x in ["MCX", "CDS"])
-                formatted_lp = "{:.4f}".format(ltp) if is_high_precision else "{:.2f}".format(ltp)
+                # Dynamic Precision: MCX/CDS = 4, Stocks = 2
+                is_hi_prec = any(x in fb_key.upper() for x in ["MCX", "CDS", "GOLD"])
+                formatted_lp = "{:.4f}".format(ltp) if is_hi_prec else "{:.2f}".format(ltp)
                 
                 updates[f"central_watchlist/{fb_key}/price"] = formatted_lp
                 updates[f"central_watchlist/{fb_key}/utime"] = now_time
@@ -63,83 +60,79 @@ def on_data(wsapp, msg):
                 try:
                     db.reference().update(updates)
                     last_price_cache[token] = ltp
-                except Exception as e:
-                    print(f"❌ Firebase Update Error: {e}")
+                except: pass
 
-# --- 4. WATCHDOG & LOGIN ---
-def watchdog_monitor():
-    global is_ws_ready
-    while True:
-        if is_ws_ready and is_market_open():
-            if time.time() - last_tick_time > 60: # 60 seconds gap
-                print("⚠️ [WATCHDOG] Stream Frozen! Reconnecting...")
-                is_ws_ready = False
-                if sws: 
-                    try: sws.close()
-                    except: pass
-        eventlet.sleep(15)
-
+# --- 4. WATCHDOG & AUTH ---
 def login_and_connect():
-    global sws, is_ws_ready
+    global sws, is_ws_ready, active_subscriptions
     while True:
         if is_market_open():
             try:
-                print(f"🔄 [AUTH] Connecting to Angel One...")
+                print(f"🔄 [AUTH] Logging into Angel One...")
                 obj = SmartConnect(api_key=API_KEY)
                 session = obj.generateSession(CLIENT_CODE, PWD, pyotp.TOTP(TOTP_STR).now())
                 if session.get('status'):
+                    # Connection naya hai, toh purani sub-list clear karo
+                    active_subscriptions.clear()
                     sws = SmartWebSocketV2(session['data']['jwtToken'], API_KEY, CLIENT_CODE, session['data']['feedToken'])
                     sws.on_data = on_data
                     sws.on_open = lambda ws: exec("global is_ws_ready; is_ws_ready=True; print('🟢 [ENGINE] System Live')")
+                    sws.on_close = lambda ws, c, r: exec("global is_ws_ready; is_ws_ready=False")
                     eventlet.spawn(sws.connect)
                     break
             except Exception as e: print(f"❌ Login Error: {e}")
         eventlet.sleep(15)
 
-# --- 5. MAINTENANCE LOOP (IMPROVED MAPPING) ---
+def watchdog_monitor():
+    global is_ws_ready
+    while True:
+        if is_ws_ready and is_market_open():
+            if time.time() - last_tick_time > 60:
+                print("⚠️ [WATCHDOG] Stream Frozen! Reconnecting...")
+                is_ws_ready = False
+                if sws: 
+                    try: sws.close()
+                    except: pass
+                # Reset connect process
+                eventlet.spawn(login_and_connect)
+        eventlet.sleep(20)
+
+# --- 5. MAINTENANCE LOOP ---
 def maintenance_loop():
     global active_subscriptions, token_to_fb_keys
     while True:
         try:
             ref = db.reference('central_watchlist').get()
-            if ref:
+            if ref and is_ws_ready:
                 temp_map, batch = {}, {1: [], 2: [], 3: [], 5: []}
                 for fb_key, data in ref.items():
                     if not isinstance(data, dict): continue
-                    
                     t_id = str(data.get('token', ''))
                     ex_name = str(data.get('exch_seg', 'NSE')).upper()
                     
                     if not t_id or t_id == 'None': continue
 
-                    # Exchange Logic
-                    ex_type = 1
-                    if "MCX" in ex_name: ex_type = 5
-                    elif "BSE" in ex_name: ex_type = 3
-                    elif any(x in ex_name for x in ["NFO", "FUT", "OPT"]): ex_type = 2
+                    # Exchange Logic (NSE=1, NFO=2, BSE=3, MCX=5)
+                    ex_type = 5 if "MCX" in ex_name else (3 if "BSE" in ex_name else (2 if any(x in ex_name for x in ["NFO", "FUT"]) else 1))
                     
-                    # Grouping tokens for subscription
-                    sub_key = f"{t_id}_{ex_type}"
-                    if t_id not in temp_map:
-                        temp_map[t_id] = []
+                    if t_id not in temp_map: temp_map[t_id] = []
                     temp_map[t_id].append(fb_key)
 
+                    sub_key = f"{t_id}_{ex_type}"
                     if sub_key not in active_subscriptions:
                         batch[ex_type].append(t_id)
                         active_subscriptions.add(sub_key)
                 
                 token_to_fb_keys = temp_map
-                
-                if is_ws_ready:
-                    for ex_type, tokens in batch.items():
-                        if tokens:
-                            sws.subscribe("myt_task", 1, [{"exchangeType": ex_type, "tokens": tokens}])
-                            print(f"🚀 [SYNC] Subscribing: {tokens} on Exch: {ex_type}")
+                for ex_type, tokens in batch.items():
+                    if tokens:
+                        sws.subscribe("myt_task", 1, [{"exchangeType": ex_type, "tokens": tokens}])
+                        print(f"🚀 [SYNC] Subscribed {len(tokens)} symbols on Exchange {ex_type}")
             del ref
         except Exception as e: print(f"⚠️ Loop Error: {e}")
         eventlet.sleep(30)
 
-# --- 6. WEB SERVER ---
+# --- 6. SERVER ---
 if __name__ == '__main__':
     eventlet.spawn(login_and_connect)
     eventlet.spawn(maintenance_loop)
