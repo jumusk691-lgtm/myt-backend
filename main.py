@@ -1,6 +1,6 @@
 import eventlet
 eventlet.monkey_patch(all=True)
-import os, pyotp, time, datetime, firebase_admin
+import os, pyotp, time, datetime, firebase_admin, pytz
 from firebase_admin import credentials, db
 from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
@@ -16,6 +16,7 @@ print("✅ Firebase Connected! Master Hybrid Engine Ready.")
 
 # --- CONFIGURATION ---
 API_KEY, CLIENT_CODE, PWD, TOTP_STR = "85HE4VA1", "S52638556", "0000", "XFTXZ2445N4V2UMB7EWUCBDRMU"
+IST = pytz.timezone('Asia/Kolkata') # 🔥 Force India Time
 
 # --- GLOBAL STATE ---
 sws = None
@@ -25,11 +26,14 @@ token_to_fb_keys = {}
 last_price_cache = {} 
 last_tick_time = time.time() 
 
-# --- 2. MARKET HOURS TIMER ---
+# --- 2. MARKET HOURS TIMER (IST Force) ---
 def is_market_open():
-    now = datetime.datetime.now()
+    now = datetime.datetime.now(IST) # 🔥 Get current India time
     if now.weekday() >= 5: return False 
-    return now.replace(hour=9, minute=0) <= now <= now.replace(hour=23, minute=30)
+    # Morning 9:00 AM to Night 11:30 PM
+    start_time = now.replace(hour=9, minute=0, second=0, microsecond=0)
+    end_time = now.replace(hour=23, minute=30, second=0, microsecond=0)
+    return start_time <= now <= end_time
 
 # --- 3. PRO TICK ENGINE ---
 def on_data(wsapp, msg):
@@ -42,15 +46,13 @@ def on_data(wsapp, msg):
         if ltp > 0 and token in token_to_fb_keys:
             last_tick_time = time.time() 
             
-            # 🔥 Delta Logic
             if last_price_cache.get(token) == ltp:
                 return 
 
-            # 🔥 Precision Check
             is_cds = any("CDS" in k.upper() for k in token_to_fb_keys[token])
             formatted_lp = "{:.4f}".format(ltp) if is_cds else "{:.2f}".format(ltp)
             
-            now_time = datetime.datetime.now().strftime("%H:%M:%S")
+            now_time = datetime.datetime.now(IST).strftime("%H:%M:%S")
             updates = {}
             for fb_key in token_to_fb_keys[token]:
                 updates[f"central_watchlist/{fb_key}/price"] = formatted_lp
@@ -59,7 +61,6 @@ def on_data(wsapp, msg):
             if updates:
                 db.reference().update(updates)
                 last_price_cache[token] = ltp
-                # Instant Memory Release
                 del updates 
 
 # --- 4. WATCHDOG MONITOR ---
@@ -68,7 +69,7 @@ def watchdog_monitor():
     while True:
         if is_ws_ready and is_market_open():
             if time.time() - last_tick_time > 45:
-                print("⚠️ [WATCHDOG] Stream Frozen! Restarting...")
+                print("⚠️ [WATCHDOG] Stream Frozen! Resetting...")
                 if sws: 
                     try: sws.close()
                     except: pass
@@ -80,7 +81,7 @@ def login_and_connect():
     while True:
         if is_market_open():
             try:
-                print("🔄 [AUTH] Logging into Angel One...")
+                print(f"🔄 [AUTH] Logging into Angel One (IST: {datetime.datetime.now(IST).strftime('%H:%M:%S')})")
                 obj = SmartConnect(api_key=API_KEY)
                 session = obj.generateSession(CLIENT_CODE, PWD, pyotp.TOTP(TOTP_STR).now())
                 
@@ -94,7 +95,7 @@ def login_and_connect():
             except Exception as e:
                 print(f"❌ [AUTH] Login Error: {e}")
         else:
-            print("💤 [SLEEP] Market Closed. Engine resting...")
+            print(f"💤 [SLEEP] Market Closed (IST: {datetime.datetime.now(IST).strftime('%H:%M:%S')}). Engine resting...")
             eventlet.sleep(300) 
         eventlet.sleep(10)
 
@@ -111,8 +112,6 @@ def maintenance_loop():
                         t_id = str(fb_key.split('_')[0])
                         k = fb_key.upper()
                         ex = 5 if "MCX" in k else (2 if any(x in k for x in ["NFO", "FUT", "OPT"]) else (3 if "BSE" in k else 1))
-                        
-                        # Sub-key for tracking (Token + Exchange)
                         sub_key = f"{t_id}_{ex}"
                         
                         if t_id not in temp_map:
