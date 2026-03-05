@@ -148,7 +148,7 @@ def sync_watchlist():
                                 sws.subscribe("myt_task", 1, [{"exchangeType": etype, "tokens": batch}])
                                 print(f"🚀 Subscribed {len(batch)} tokens on Exch {etype}")
                                 
-            eventlet.sleep(2) # Har 1 minute mein sync karo agar naya symbol add hua ho
+            eventlet.sleep(60) # Har 1 minute mein sync karo agar naya symbol add hua ho
         except Exception as e:
             print(f"⚠️ Sync Loop Error: {e}")
             eventlet.sleep(10)
