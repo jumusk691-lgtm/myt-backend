@@ -151,7 +151,7 @@ def sync_watchlist():
             eventlet.sleep(2) # Har 1 minute mein sync karo agar naya symbol add hua ho
         except Exception as e:
             print(f"⚠️ Sync Loop Error: {e}")
-            eventlet.sleep(100000000)
+            eventlet.sleep(10)
 
 if __name__ == '__main__':
     # Start all threads
