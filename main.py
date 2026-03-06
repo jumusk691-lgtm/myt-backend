@@ -32,26 +32,29 @@ is_ws_ready = False
 token_to_fb_keys = {} 
 last_price_cache = {} 
 
-# --- 3. MASTER DATA SYNC (Updated with New Working Links) ---
+# --- 3. MASTER DATA SYNC (Latest Stable Endpoints) ---
 def refresh_supabase_master():
     print("🔄 [System] Starting Master Data Sync...")
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         
-        # Session login
+        # Session login to ensure authentication
         smart_api = SmartConnect(api_key=API_KEY)
         smart_api.generateSession(CLIENT_CODE, PWD, pyotp.TOTP(TOTP_STR).now())
         
+        # Comprehensive headers to avoid blocking
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            'Accept': 'application/json',
-            'Referer': 'https://smartapi.angelbroking.com/'
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive'
         }
         
-        # नए लिंक्स (SmartAPI New Documentation के अनुसार)
+        # Latest working URLs for Angel Master Data
         urls = [
             "https://margincalculator.angelbroking.com/OpenApiData/smartlights/AllTickers.json",
-            "https://txt.angelone.in/OpenAPI_File/files/OpenAPIScriptMaster.json" # New Link
+            "http://margincalculator.angelbroking.com/OpenApiData/smartlights/AllTickers.json", # HTTP fallback
+            "https://smartapi.angelbroking.com/publisher-api/master-data" # Publisher Backup
         ]
         
         json_data = None
@@ -59,20 +62,21 @@ def refresh_supabase_master():
         
         for url in urls:
             try:
-                print(f"📡 Trying URL: {url}...")
-                res = session.get(url, headers=headers, timeout=60)
+                print(f"📡 Trying URL: {url} (No timeout limits)...")
+                # Using a session for better connection handling
+                res = session.get(url, headers=headers, timeout=None) 
                 if res.status_code == 200:
                     json_data = res.json()
                     print(f"✅ Connection Successful! Found {len(json_data)} instruments.")
                     break
                 else:
-                    print(f"❌ HTTP {res.status_code} on {url}")
+                    print(f"❌ HTTP {res.status_code} Error on {url}")
             except Exception as e: 
-                print(f"⚠️ Failed: {e}")
+                print(f"⚠️ Connection Attempt failed for {url}: {str(e)}")
                 continue
 
         if json_data:
-            print(f"✅ Building Database...")
+            print(f"✅ Building Database and Syncing to Supabase...")
             db_conn = sqlite3.connect(':memory:')
             cursor = db_conn.cursor()
             cursor.execute('''CREATE TABLE IF NOT EXISTS symbols 
@@ -89,19 +93,21 @@ def refresh_supabase_master():
             cursor.executemany("INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?)", data_to_insert)
             db_conn.commit()
             
+            # Dump to buffer
             buffer = io.BytesIO()
             for line in db_conn.iterdump():
                 buffer.write(f'{line}\n'.encode('utf-8'))
             
+            # Upsert to Supabase bucket
             supabase.storage.from_(BUCKET_NAME).upload(
                 path="angel_master.db", 
                 file=buffer.getvalue(), 
                 file_options={"x-upsert": "true", "content-type": "application/octet-stream"}
             )
             db_conn.close()
-            print("✅ [Success] Master Data Synced to Supabase!")
+            print("✅ [Success] Master Data Database has been updated on Supabase!")
         else:
-            print("⚠️ [Warning] All URLs failed. Please check Angel One API status.")
+            print("⚠️ [Warning] All Master Data URLs failed. Trading may use old backup.")
 
     except Exception as e:
         print(f"❌ [Critical] Master Sync Error: {str(e)}")
