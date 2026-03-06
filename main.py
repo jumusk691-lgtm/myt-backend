@@ -32,29 +32,27 @@ is_ws_ready = False
 token_to_fb_keys = {} 
 last_price_cache = {} 
 
-# --- 3. MASTER DATA SYNC (Latest Stable Endpoints) ---
+# --- 3. MASTER DATA SYNC (New Stable Routes) ---
 def refresh_supabase_master():
     print("🔄 [System] Starting Master Data Sync...")
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         
-        # Session login to ensure authentication
+        # Session login for authentication
         smart_api = SmartConnect(api_key=API_KEY)
         smart_api.generateSession(CLIENT_CODE, PWD, pyotp.TOTP(TOTP_STR).now())
         
-        # Comprehensive headers to avoid blocking
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            'Accept': 'application/json, text/plain, */*',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive'
+            'Accept': 'application/json'
         }
         
-        # Latest working URLs for Angel Master Data
+        # इन URLs को प्राथमिकता दी गई है (GitHub सबसे स्टेबल है)
         urls = [
+            "https://raw.githubusercontent.com/angel-one/smartapi-python/master/OpenAPIScriptMaster.json",
             "https://margincalculator.angelbroking.com/OpenApiData/smartlights/AllTickers.json",
-            "http://margincalculator.angelbroking.com/OpenApiData/smartlights/AllTickers.json", # HTTP fallback
-            "https://smartapi.angelbroking.com/publisher-api/master-data" # Publisher Backup
+            "https://txt.angelone.in/OpenAPI_File/files/OpenAPIScriptMaster.json",
+            "https://smartapi.angelbroking.com/publisher-api/master-data"
         ]
         
         json_data = None
@@ -62,21 +60,20 @@ def refresh_supabase_master():
         
         for url in urls:
             try:
-                print(f"📡 Trying URL: {url} (No timeout limits)...")
-                # Using a session for better connection handling
-                res = session.get(url, headers=headers, timeout=None) 
+                print(f"📡 Trying URL: {url}")
+                res = session.get(url, headers=headers, timeout=60) 
                 if res.status_code == 200:
                     json_data = res.json()
                     print(f"✅ Connection Successful! Found {len(json_data)} instruments.")
                     break
                 else:
-                    print(f"❌ HTTP {res.status_code} Error on {url}")
+                    print(f"❌ HTTP {res.status_code} Error on this URL.")
             except Exception as e: 
-                print(f"⚠️ Connection Attempt failed for {url}: {str(e)}")
+                print(f"⚠️ Failed to connect: {str(e)}")
                 continue
 
         if json_data:
-            print(f"✅ Building Database and Syncing to Supabase...")
+            print(f"✅ Processing Data into SQLite...")
             db_conn = sqlite3.connect(':memory:')
             cursor = db_conn.cursor()
             cursor.execute('''CREATE TABLE IF NOT EXISTS symbols 
@@ -93,21 +90,21 @@ def refresh_supabase_master():
             cursor.executemany("INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?)", data_to_insert)
             db_conn.commit()
             
-            # Dump to buffer
+            # Convert to Binary
             buffer = io.BytesIO()
             for line in db_conn.iterdump():
                 buffer.write(f'{line}\n'.encode('utf-8'))
             
-            # Upsert to Supabase bucket
+            # Upload to Supabase
             supabase.storage.from_(BUCKET_NAME).upload(
                 path="angel_master.db", 
                 file=buffer.getvalue(), 
                 file_options={"x-upsert": "true", "content-type": "application/octet-stream"}
             )
             db_conn.close()
-            print("✅ [Success] Master Data Database has been updated on Supabase!")
+            print("✅ [Success] angel_master.db updated on Supabase!")
         else:
-            print("⚠️ [Warning] All Master Data URLs failed. Trading may use old backup.")
+            print("⚠️ [Warning] All URLs failed. Trading will continue with old master data.")
 
     except Exception as e:
         print(f"❌ [Critical] Master Sync Error: {str(e)}")
@@ -175,6 +172,7 @@ def sync_watchlist():
                         token = str(val.get('token', ''))
                         exch = str(val.get('exch_seg', 'NSE')).upper()
                         if not token or token == "None": continue
+                        
                         if token not in new_token_map: new_token_map[token] = []
                         new_token_map[token].append(fb_key)
                         
@@ -194,10 +192,14 @@ def sync_watchlist():
             eventlet.sleep(10)
 
 if __name__ == '__main__':
+    # शुरुआत में मास्टर डेटा सिंक करें
     refresh_supabase_master()
+    
+    # थ्रेड्स शुरू करें
     eventlet.spawn(login_and_connect)
     eventlet.spawn(sync_watchlist)
     
+    # Render Dashboard Port binding
     from eventlet import wsgi
     def app(env, res):
         res('200 OK', [('Content-Type', 'text/plain')])
