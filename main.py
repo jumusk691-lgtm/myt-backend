@@ -32,54 +32,65 @@ is_ws_ready = False
 token_to_fb_keys = {}  # { "token": ["fb_key1", "fb_key2"] }
 last_price_cache = {} 
 
-# --- 3. MASTER DATA SYNC (Mix Logic: SmartApi + Backup URLs + Supabase) ---
+# --- 3. MASTER DATA SYNC (Improved Logic) ---
 def refresh_supabase_master():
     print("🔄 [System] Starting Master Data Sync...")
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         
-        # Method 1: SmartApi Login to bypass 404
+        # Method 1: Generate Session to get valid auth state
         smart_api = SmartConnect(api_key=API_KEY)
-        smart_api.generateSession(CLIENT_CODE, PWD, pyotp.TOTP(TOTP_STR).now())
+        login_data = smart_api.generateSession(CLIENT_CODE, PWD, pyotp.TOTP(TOTP_STR).now())
+        
+        # Enhanced Headers to prevent 403/404 on Render
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Origin': 'https://smartapi.angelbroking.com',
+            'Referer': 'https://smartapi.angelbroking.com/'
+        }
         
         urls = [
             "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScriptMaster.json",
             "https://margincalculator.angelbroking.com/OpenApiData/smartlights/AllTickers.json"
         ]
         
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'application/json',
-            'Referer': 'https://smartapi.angelbroking.com/'
-        }
-        
         json_data = None
         for url in urls:
             try:
                 print(f"📡 Trying URL: {url}")
-                res = requests.get(url, headers=headers, timeout=30)
+                # Using a session object for better persistence
+                session = requests.Session()
+                res = session.get(url, headers=headers, timeout=40)
                 if res.status_code == 200:
                     json_data = res.json()
+                    print(f"✅ Connection Successful with {url}")
                     break
-            except: continue
+                else:
+                    print(f"❌ Failed with status: {res.status_code}")
+            except Exception as e: 
+                print(f"⚠️ URL attempt failed: {e}")
+                continue
 
         if json_data:
             print(f"✅ Data fetched! Processing {len(json_data)} instruments...")
             db_conn = sqlite3.connect(':memory:')
             cursor = db_conn.cursor()
             
-            # Exact Table Structure from your Termux screenshot
             cursor.execute('''CREATE TABLE IF NOT EXISTS symbols 
                              (token TEXT, symbol TEXT, name TEXT, 
                               expiry TEXT, strike TEXT, lotsize TEXT, 
                               instrumenttype TEXT, exch_seg TEXT, tick_size TEXT)''')
             
-            # Original Individual Row Logic
-            for i in json_data:
-                cursor.execute("INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?)", 
-                             (i.get('token'), i.get('symbol'), i.get('name'),
-                              i.get('expiry'), i.get('strike'), i.get('lotsize'),
-                              i.get('instrumenttype'), i.get('exch_seg'), i.get('tick_size')))
+            # Efficient batch insert
+            data_to_insert = [
+                (i.get('token'), i.get('symbol'), i.get('name'),
+                 i.get('expiry'), i.get('strike'), i.get('lotsize'),
+                 i.get('instrumenttype'), i.get('exch_seg'), i.get('tick_size'))
+                for i in json_data
+            ]
+            cursor.executemany("INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?)", data_to_insert)
             
             db_conn.commit()
             
@@ -101,7 +112,7 @@ def refresh_supabase_master():
     except Exception as e:
         print(f"❌ [Critical] Master Sync Error: {str(e)}")
 
-# --- 4. TICK ENGINE (Mixed LTP & pChange Logic) ---
+# --- 4. TICK ENGINE ---
 def on_data(wsapp, msg):
     global last_price_cache
     if isinstance(msg, dict) and 'token' in msg:
@@ -117,14 +128,12 @@ def on_data(wsapp, msg):
             for fb_key in token_to_fb_keys[token]:
                 path = f"central_watchlist/{fb_key}"
                 
-                # Precision Logic (MCX/Gold = 4 decimals, Others = 2)
                 is_mcx = any(x in fb_key.upper() for x in ["MCX", "GOLD", "SILVER"])
                 fmt = "{:.4f}" if is_mcx else "{:.2f}"
                 
                 updates[f"{path}/price"] = str(fmt.format(ltp))
                 updates[f"{path}/utime"] = now_time
                 
-                # % Change Logic from msg
                 if 'close' in msg and msg['close'] > 0:
                     cp = float(msg['close']) / 100
                     p_chng = ((ltp - cp) / cp) * 100
@@ -163,7 +172,7 @@ def sync_watchlist():
                 full_data = db.reference('central_watchlist').get()
                 if full_data:
                     new_token_map = {}
-                    subscriptions = {1: [], 2: [], 5: []} # 1:NSE, 2:NFO, 5:MCX
+                    subscriptions = {1: [], 2: [], 5: []} 
                     for fb_key, val in full_data.items():
                         token = str(val.get('token', ''))
                         exch = str(val.get('exch_seg', 'NSE')).upper()
@@ -172,7 +181,6 @@ def sync_watchlist():
                         if token not in new_token_map: new_token_map[token] = []
                         new_token_map[token].append(fb_key)
                         
-                        # Exchange mapping logic
                         if "MCX" in exch: e_type = 5
                         elif any(x in exch for x in ["NFO", "FUT", "OPT"]): e_type = 2
                         else: e_type = 1
@@ -189,14 +197,10 @@ def sync_watchlist():
             eventlet.sleep(10)
 
 if __name__ == '__main__':
-    # Initial Master Sync
     refresh_supabase_master()
-    
-    # Run Threads
     eventlet.spawn(login_and_connect)
     eventlet.spawn(sync_watchlist)
     
-    # Web Dashboard for Render
     from eventlet import wsgi
     def app(env, res):
         res('200 OK', [('Content-Type', 'text/plain')])
