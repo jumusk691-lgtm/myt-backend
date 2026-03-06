@@ -29,10 +29,10 @@ BUCKET_NAME = "Myt"
 # --- GLOBAL STATE ---
 sws = None
 is_ws_ready = False
-token_to_fb_keys = {}  # { "token": ["fb_key1", "fb_key2"] }
+token_to_fb_keys = {} 
 last_price_cache = {} 
 
-# --- 3. MASTER DATA SYNC (Improved Logic) ---
+# --- 3. MASTER DATA SYNC (No Timeout Logic) ---
 def refresh_supabase_master():
     print("🔄 [System] Starting Master Data Sync...")
     try:
@@ -40,11 +40,11 @@ def refresh_supabase_master():
         
         # Method 1: Generate Session to get valid auth state
         smart_api = SmartConnect(api_key=API_KEY)
-        login_data = smart_api.generateSession(CLIENT_CODE, PWD, pyotp.TOTP(TOTP_STR).now())
+        smart_api.generateSession(CLIENT_CODE, PWD, pyotp.TOTP(TOTP_STR).now())
         
-        # Enhanced Headers to prevent 403/404 on Render
+        # Enhanced Headers to mimic a browser
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
             'Accept': 'application/json, text/plain, */*',
             'Accept-Language': 'en-US,en;q=0.9',
             'Origin': 'https://smartapi.angelbroking.com',
@@ -57,15 +57,16 @@ def refresh_supabase_master():
         ]
         
         json_data = None
+        session = requests.Session()
+        
         for url in urls:
             try:
-                print(f"📡 Trying URL: {url}")
-                # Using a session object for better persistence
-                session = requests.Session()
-                res = session.get(url, headers=headers, timeout=40)
+                print(f"📡 Trying URL: {url} (No timeout - Waiting until finished)")
+                # timeout=None का मतलब है कि जब तक डेटा नहीं आएगा, कोड आगे नहीं बढ़ेगा
+                res = session.get(url, headers=headers, timeout=None)
                 if res.status_code == 200:
                     json_data = res.json()
-                    print(f"✅ Connection Successful with {url}")
+                    print(f"✅ Connection Successful! Data Size: {len(json_data)}")
                     break
                 else:
                     print(f"❌ Failed with status: {res.status_code}")
@@ -74,7 +75,7 @@ def refresh_supabase_master():
                 continue
 
         if json_data:
-            print(f"✅ Data fetched! Processing {len(json_data)} instruments...")
+            print(f"✅ Processing {len(json_data)} instruments into SQLite...")
             db_conn = sqlite3.connect(':memory:')
             cursor = db_conn.cursor()
             
@@ -91,7 +92,6 @@ def refresh_supabase_master():
                 for i in json_data
             ]
             cursor.executemany("INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?)", data_to_insert)
-            
             db_conn.commit()
             
             # Binary dump for Supabase
@@ -107,7 +107,7 @@ def refresh_supabase_master():
             db_conn.close()
             print("✅ [Success] angel_master.db updated on Supabase!")
         else:
-            print("⚠️ [Warning] Master Data Fetch failed, keeping existing backup.")
+            print("⚠️ [Warning] Master Data Fetch failed completely.")
 
     except Exception as e:
         print(f"❌ [Critical] Master Sync Error: {str(e)}")
@@ -197,10 +197,14 @@ def sync_watchlist():
             eventlet.sleep(10)
 
 if __name__ == '__main__':
+    # शुरुआत में मास्टर डेटा सिंक करें
     refresh_supabase_master()
+    
+    # थ्रेड्स शुरू करें
     eventlet.spawn(login_and_connect)
     eventlet.spawn(sync_watchlist)
     
+    # Render के लिए वेब डैशबोर्ड
     from eventlet import wsgi
     def app(env, res):
         res('200 OK', [('Content-Type', 'text/plain')])
