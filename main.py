@@ -31,20 +31,19 @@ is_ws_ready = False
 token_to_fb_keys = {} 
 last_price_cache = {} 
 
-# --- 3. MASTER DATA SYNC (With Progress 0-100%) ---
+# --- 3. MASTER DATA SYNC (With Overwrite Fix) ---
 def refresh_supabase_master():
     print("🔄 [System] Starting Master Data Sync...")
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         
-        # Aapka Diya Hua Naya URL
+        # Latest Working URL
         url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-        
         headers = {'User-Agent': 'Mozilla/5.0'}
         
         print(f"📡 Requesting: {url}")
         
-        # Stream download for 0-100% progress logic
+        # Download with Progress
         response = requests.get(url, headers=headers, stream=True, timeout=None)
         total_size = int(response.headers.get('content-length', 0))
         
@@ -52,22 +51,18 @@ def refresh_supabase_master():
             bytes_io = io.BytesIO()
             downloaded = 0
             
-            print("⏳ Download Progress: 0%")
-            for data in response.iter_content(chunk_size=4096):
+            for data in response.iter_content(chunk_size=8192):
                 downloaded += len(data)
                 bytes_io.write(data)
                 if total_size > 0:
-                    done = int(50 * downloaded / total_size)
-                    # Har 10% par log dikhane ke liye logic (optional filter)
                     percent = int(100 * downloaded / total_size)
-                    if percent % 10 == 0:
-                        print(f"⏳ Download Progress: {percent}%")
+                    if percent % 20 == 0: # Har 20% par log
+                        print(f"⏳ Downloading: {percent}%")
             
-            print("✅ Download Complete! Processing JSON...")
+            print("✅ Download Complete! Converting to DB...")
             json_data = json.loads(bytes_io.getvalue().decode('utf-8'))
-            print(f"📊 Instruments Found: {len(json_data)}")
             
-            # Memory mein SQLite DB build karna
+            # Memory mein DB build karna (As per your structure)
             db_conn = sqlite3.connect(':memory:')
             cursor = db_conn.cursor()
             cursor.execute('''CREATE TABLE IF NOT EXISTS symbols 
@@ -84,24 +79,29 @@ def refresh_supabase_master():
             cursor.executemany("INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?)", data_to_insert)
             db_conn.commit()
             
-            # File buffer taiyar karna
+            # Binary conversion
             db_dump = io.BytesIO()
             for line in db_conn.iterdump():
                 db_dump.write(f'{line}\n'.encode('utf-8'))
             
-            # Supabase par update
-            supabase.storage.from_(BUCKET_NAME).upload(
+            # --- SUPABASE UPLOAD (FIXED) ---
+            print("📤 Uploading to Supabase (Replacing old file)...")
+            res = supabase.storage.from_(BUCKET_NAME).upload(
                 path="angel_master.db", 
                 file=db_dump.getvalue(), 
-                file_options={"x-upsert": "true", "content-type": "application/octet-stream"}
+                file_options={
+                    "x-upsert": "true", # Ye purani file ko delete karke nayi daal dega
+                    "content-type": "application/octet-stream"
+                }
             )
+            
             db_conn.close()
-            print("✅ [Final Success] Supabase DB is 100% updated!")
+            print("✅ [Final Success] angel_master.db is now fresh on Supabase!")
         else:
-            print(f"❌ Fetch failed! HTTP Status: {response.status_code}")
+            print(f"❌ HTTP Error: {response.status_code}")
 
     except Exception as e:
-        print(f"❌ DB Update Error: {str(e)}")
+        print(f"❌ [Critical Error] Master Sync Failed: {str(e)}")
 
 # --- 4. TICK ENGINE ---
 def on_data(wsapp, msg):
@@ -182,19 +182,19 @@ def sync_watchlist():
         except Exception as e:
             eventlet.sleep(10)
 
-# --- 6. RENDER WEB BINDING ---
 def simple_app(environ, start_response):
     start_response('200 OK', [('Content-Type', 'text/plain')])
     return [b"ENGINE_STABLE"]
 
 if __name__ == '__main__':
-    # DB Update (with 0-100% logging)
+    # Step 1: Force Update DB (With Upsert)
     refresh_supabase_master()
     
-    # Engine Start
+    # Step 2: Start Threads
     eventlet.spawn(login_and_connect)
     eventlet.spawn(sync_watchlist)
     
+    # Step 3: Render Port Binding
     from eventlet import wsgi
     port = int(os.environ.get("PORT", 10000))
     wsgi.server(eventlet.listen(('0.0.0.0', port)), simple_app)
