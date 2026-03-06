@@ -31,7 +31,7 @@ is_ws_ready = False
 token_to_fb_keys = {} 
 last_price_cache = {} 
 
-# --- 3. MASTER DATA SYNC ---
+# --- 3. MASTER DATA SYNC (FIXED: BINARY UPLOAD) ---
 def refresh_supabase_master():
     print(f"🔄 [System] Syncing Master Data at {datetime.datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')}")
     try:
@@ -41,13 +41,18 @@ def refresh_supabase_master():
         
         response = requests.get(url, headers=headers, stream=True, timeout=None)
         if response.status_code == 200:
+            # Sara data chunks mein stream karke read karna
             bytes_io = io.BytesIO()
             for data in response.iter_content(chunk_size=8192):
                 bytes_io.write(data)
             
             json_data = json.loads(bytes_io.getvalue().decode('utf-8'))
             
-            db_conn = sqlite3.connect(':memory:')
+            # Temporary binary file disk par banani padegi kyunki iterdump text bana deta hai
+            temp_db = "angel_master.db"
+            if os.path.exists(temp_db): os.remove(temp_db)
+            
+            db_conn = sqlite3.connect(temp_db)
             cursor = db_conn.cursor()
             cursor.execute('''CREATE TABLE IF NOT EXISTS symbols 
                              (token TEXT, symbol TEXT, name TEXT, expiry TEXT, 
@@ -62,19 +67,26 @@ def refresh_supabase_master():
             ]
             cursor.executemany("INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?)", data_to_insert)
             db_conn.commit()
+            db_conn.close() # Close to flush binary data
             
-            db_dump = io.BytesIO()
-            for line in db_conn.iterdump():
-                db_dump.write(f'{line}\n'.encode('utf-8'))
+            # Binary file ko read karke Supabase pe upload karna
+            with open(temp_db, "rb") as f:
+                db_binary_data = f.read()
             
-            # Upsert is important to overwrite old file
+            # Upsert ensures file name stays 'angel_master.db'
             supabase.storage.from_(BUCKET_NAME).upload(
                 path="angel_master.db", 
-                file=db_dump.getvalue(), 
-                file_options={"x-upsert": "true", "content-type": "application/octet-stream"}
+                file=db_binary_data, 
+                file_options={
+                    "x-upsert": "true", 
+                    "content-type": "application/x-sqlite3" # Android needs this type
+                }
             )
-            db_conn.close()
-            print("✅ [Success] Supabase Master DB Updated!")
+            
+            # Local file delete kardo upload ke baad
+            if os.path.exists(temp_db): os.remove(temp_db)
+            
+            print("✅ [Success] Supabase BINARY Master DB Updated!")
         else:
             print(f"❌ Download Failed: {response.status_code}")
     except Exception as e:
