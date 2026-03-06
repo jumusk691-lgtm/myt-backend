@@ -31,27 +31,41 @@ is_ws_ready = False
 token_to_fb_keys = {} 
 last_price_cache = {} 
 
-# --- 3. MASTER DATA SYNC (The "Never Fail" Route) ---
+# --- 3. MASTER DATA SYNC (With Progress 0-100%) ---
 def refresh_supabase_master():
     print("🔄 [System] Starting Master Data Sync...")
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         
-        # Ye hai Angel One ka LATEST working GitHub link
-        # Path: smartapi-python/refs/heads/master/smartapi/OpenAPIScriptMaster.json
-        url = "https://raw.githubusercontent.com/angel-one/smartapi-python/refs/heads/master/smartapi/OpenAPIScriptMaster.json"
+        # Aapka Diya Hua Naya URL
+        url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
         
-        headers = {
-            'User-Agent': 'Mozilla/5.0',
-            'Accept': 'application/json'
-        }
+        headers = {'User-Agent': 'Mozilla/5.0'}
         
-        print(f"📡 Downloading from: {url}")
-        res = requests.get(url, headers=headers, timeout=60)
+        print(f"📡 Requesting: {url}")
         
-        if res.status_code == 200:
-            json_data = res.json()
-            print(f"✅ Downloaded {len(json_data)} instruments.")
+        # Stream download for 0-100% progress logic
+        response = requests.get(url, headers=headers, stream=True, timeout=None)
+        total_size = int(response.headers.get('content-length', 0))
+        
+        if response.status_code == 200:
+            bytes_io = io.BytesIO()
+            downloaded = 0
+            
+            print("⏳ Download Progress: 0%")
+            for data in response.iter_content(chunk_size=4096):
+                downloaded += len(data)
+                bytes_io.write(data)
+                if total_size > 0:
+                    done = int(50 * downloaded / total_size)
+                    # Har 10% par log dikhane ke liye logic (optional filter)
+                    percent = int(100 * downloaded / total_size)
+                    if percent % 10 == 0:
+                        print(f"⏳ Download Progress: {percent}%")
+            
+            print("✅ Download Complete! Processing JSON...")
+            json_data = json.loads(bytes_io.getvalue().decode('utf-8'))
+            print(f"📊 Instruments Found: {len(json_data)}")
             
             # Memory mein SQLite DB build karna
             db_conn = sqlite3.connect(':memory:')
@@ -71,20 +85,20 @@ def refresh_supabase_master():
             db_conn.commit()
             
             # File buffer taiyar karna
-            buffer = io.BytesIO()
+            db_dump = io.BytesIO()
             for line in db_conn.iterdump():
-                buffer.write(f'{line}\n'.encode('utf-8'))
+                db_dump.write(f'{line}\n'.encode('utf-8'))
             
-            # Supabase par update (x-upsert: true purani file ko overwrite kar dega)
+            # Supabase par update
             supabase.storage.from_(BUCKET_NAME).upload(
                 path="angel_master.db", 
-                file=buffer.getvalue(), 
+                file=db_dump.getvalue(), 
                 file_options={"x-upsert": "true", "content-type": "application/octet-stream"}
             )
             db_conn.close()
-            print("✅ [Success] Supabase DB file is now fresh!")
+            print("✅ [Final Success] Supabase DB is 100% updated!")
         else:
-            print(f"❌ Fetch failed! Status Code: {res.status_code}")
+            print(f"❌ Fetch failed! HTTP Status: {response.status_code}")
 
     except Exception as e:
         print(f"❌ DB Update Error: {str(e)}")
@@ -136,7 +150,7 @@ def login_and_connect():
                 eventlet.spawn(sws.connect)
                 break
         except Exception as e:
-            print(f"⚠️ Auth Failed, retrying... {e}")
+            print(f"⚠️ Auth Failed: {e}")
             eventlet.sleep(20)
 
 def sync_watchlist():
@@ -166,24 +180,21 @@ def sync_watchlist():
                                 sws.subscribe("myt_task", 1, [{"exchangeType": etype, "tokens": tokens[i:i+50]}])
             eventlet.sleep(60)
         except Exception as e:
-            print(f"⚠️ Watchlist Sync Error: {e}")
             eventlet.sleep(10)
 
-# --- 6. RENDER WEB BINDING (Fixed Version) ---
+# --- 6. RENDER WEB BINDING ---
 def simple_app(environ, start_response):
     start_response('200 OK', [('Content-Type', 'text/plain')])
     return [b"ENGINE_STABLE"]
 
 if __name__ == '__main__':
-    # Step 1: DB Update pehle karein
+    # DB Update (with 0-100% logging)
     refresh_supabase_master()
     
-    # Step 2: Background tasks shuru karein
+    # Engine Start
     eventlet.spawn(login_and_connect)
     eventlet.spawn(sync_watchlist)
     
-    # Step 3: Server chalu karein (AssertionError se bachne ke liye fixed approach)
     from eventlet import wsgi
     port = int(os.environ.get("PORT", 10000))
-    print(f"🚀 Server starting on port {port}")
     wsgi.server(eventlet.listen(('0.0.0.0', port)), simple_app)
