@@ -21,7 +21,6 @@ PWD = "0000"
 TOTP_STR = "XFTXZ2445N4V2UMB7EWUCBDRMU"
 IST = pytz.timezone('Asia/Kolkata')
 
-# Supabase Credentials
 SUPABASE_URL = "https://tnrhlvibaeiwhlrxdxnm.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRucmhsdmliYWVpd2hscnhkeG5tIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjY0NzQ0NywiZXhwIjoyMDg4MjIzNDQ3fQ.epYmt7sxhZRhEQWoj0doCHAbfOTHOjSurBbLss5a4Pk"
 BUCKET_NAME = "Myt"
@@ -32,82 +31,67 @@ is_ws_ready = False
 token_to_fb_keys = {} 
 last_price_cache = {} 
 
-# --- 3. MASTER DATA SYNC (New Stable Routes) ---
+# --- 3. MASTER DATA SYNC (The "Never Fail" Route) ---
 def refresh_supabase_master():
-    print("🔄 [System] Starting Master Data Sync...")
+    print("🔄 [System] Updating Master DB on Supabase...")
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         
-        # Session login for authentication
-        smart_api = SmartConnect(api_key=API_KEY)
-        smart_api.generateSession(CLIENT_CODE, PWD, pyotp.TOTP(TOTP_STR).now())
-        
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            'Accept': 'application/json'
-        }
-        
-        # इन URLs को प्राथमिकता दी गई है (GitHub सबसे स्टेबल है)
+        # GitHub link is the most reliable for Render/Cloud environments
         urls = [
             "https://raw.githubusercontent.com/angel-one/smartapi-python/master/OpenAPIScriptMaster.json",
-            "https://margincalculator.angelbroking.com/OpenApiData/smartlights/AllTickers.json",
-            "https://txt.angelone.in/OpenAPI_File/files/OpenAPIScriptMaster.json",
-            "https://smartapi.angelbroking.com/publisher-api/master-data"
+            "https://margincalculator.angelbroking.com/OpenApiData/smartlights/AllTickers.json"
         ]
         
+        headers = {'User-Agent': 'Mozilla/5.0'}
         json_data = None
-        session = requests.Session()
         
         for url in urls:
             try:
-                print(f"📡 Trying URL: {url}")
-                res = session.get(url, headers=headers, timeout=60) 
+                print(f"📡 Attempting Fetch: {url}")
+                res = requests.get(url, headers=headers, timeout=45)
                 if res.status_code == 200:
                     json_data = res.json()
-                    print(f"✅ Connection Successful! Found {len(json_data)} instruments.")
+                    print(f"✅ Downloaded {len(json_data)} instruments.")
                     break
-                else:
-                    print(f"❌ HTTP {res.status_code} Error on this URL.")
-            except Exception as e: 
-                print(f"⚠️ Failed to connect: {str(e)}")
-                continue
+            except: continue
 
         if json_data:
-            print(f"✅ Processing Data into SQLite...")
+            # Memory mein DB banana
             db_conn = sqlite3.connect(':memory:')
             cursor = db_conn.cursor()
             cursor.execute('''CREATE TABLE IF NOT EXISTS symbols 
-                             (token TEXT, symbol TEXT, name TEXT, 
-                              expiry TEXT, strike TEXT, lotsize TEXT, 
-                              instrumenttype TEXT, exch_seg TEXT, tick_size TEXT)''')
+                             (token TEXT, symbol TEXT, name TEXT, expiry TEXT, 
+                              strike TEXT, lotsize TEXT, instrumenttype TEXT, 
+                              exch_seg TEXT, tick_size TEXT)''')
             
             data_to_insert = [
-                (i.get('token'), i.get('symbol'), i.get('name'),
-                 i.get('expiry'), i.get('strike'), i.get('lotsize'),
-                 i.get('instrumenttype'), i.get('exch_seg'), i.get('tick_size'))
+                (i.get('token'), i.get('symbol'), i.get('name'), i.get('expiry'), 
+                 i.get('strike'), i.get('lotsize'), i.get('instrumenttype'), 
+                 i.get('exch_seg'), i.get('tick_size'))
                 for i in json_data
             ]
             cursor.executemany("INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?)", data_to_insert)
             db_conn.commit()
             
-            # Convert to Binary
+            # DB file ko binary mein convert karna
             buffer = io.BytesIO()
             for line in db_conn.iterdump():
                 buffer.write(f'{line}\n'.encode('utf-8'))
             
-            # Upload to Supabase
+            # Supabase par Nayi file "Upsert" (Overwrite) karna
             supabase.storage.from_(BUCKET_NAME).upload(
                 path="angel_master.db", 
                 file=buffer.getvalue(), 
                 file_options={"x-upsert": "true", "content-type": "application/octet-stream"}
             )
             db_conn.close()
-            print("✅ [Success] angel_master.db updated on Supabase!")
+            print("✅ [Success] Supabase DB file has been updated!")
         else:
-            print("⚠️ [Warning] All URLs failed. Trading will continue with old master data.")
+            print("⚠️ [Warning] Could not fetch new data. Keeping the old DB file.")
 
     except Exception as e:
-        print(f"❌ [Critical] Master Sync Error: {str(e)}")
+        print(f"❌ DB Update Error: {str(e)}")
 
 # --- 4. TICK ENGINE ---
 def on_data(wsapp, msg):
@@ -131,8 +115,7 @@ def on_data(wsapp, msg):
                 
                 if 'close' in msg and msg['close'] > 0:
                     cp = float(msg['close']) / 100
-                    p_chng = ((ltp - cp) / cp) * 100
-                    updates[f"{path}/pChange"] = "{:.2f}".format(p_chng)
+                    updates[f"{path}/pChange"] = "{:.2f}".format(((ltp - cp) / cp) * 100)
 
             if updates:
                 try: 
@@ -140,24 +123,21 @@ def on_data(wsapp, msg):
                     last_price_cache[token] = ltp
                 except: pass
 
-# --- 5. AUTH & WATCHLIST SYNC ---
+# --- 5. SYSTEM HANDLERS ---
 def login_and_connect():
     global sws, is_ws_ready
     while True:
         try:
-            print(f"🔄 [AUTH] Logging in Client: {CLIENT_CODE}")
             smart_api = SmartConnect(api_key=API_KEY)
             session = smart_api.generateSession(CLIENT_CODE, PWD, pyotp.TOTP(TOTP_STR).now())
             if session.get('status'):
                 sws = SmartWebSocketV2(session['data']['jwtToken'], API_KEY, CLIENT_CODE, session['data']['feedToken'])
                 sws.on_data = on_data
-                sws.on_open = lambda ws: exec("global is_ws_ready; is_ws_ready=True; print('🟢 Market Engine Live')")
+                sws.on_open = lambda ws: exec("global is_ws_ready; is_ws_ready=True; print('🟢 WebSocket Connected')")
                 sws.on_close = lambda ws,c,r: exec("global is_ws_ready; is_ws_ready=False")
                 eventlet.spawn(sws.connect)
                 break
-        except Exception as e:
-            print(f"⚠️ Auth Loop Error: {e}")
-        eventlet.sleep(20)
+        except: eventlet.sleep(15)
 
 def sync_watchlist():
     global token_to_fb_keys
@@ -176,9 +156,7 @@ def sync_watchlist():
                         if token not in new_token_map: new_token_map[token] = []
                         new_token_map[token].append(fb_key)
                         
-                        if "MCX" in exch: e_type = 5
-                        elif any(x in exch for x in ["NFO", "FUT", "OPT"]): e_type = 2
-                        else: e_type = 1
+                        e_type = 5 if "MCX" in exch else (2 if any(x in exch for x in ["NFO", "FUT", "OPT"]) else 1)
                         subscriptions[e_type].append(token)
                     
                     token_to_fb_keys = new_token_map
@@ -187,22 +165,16 @@ def sync_watchlist():
                             for i in range(0, len(tokens), 50):
                                 sws.subscribe("myt_task", 1, [{"exchangeType": etype, "tokens": tokens[i:i+50]}])
             eventlet.sleep(60)
-        except Exception as e:
-            print(f"⚠️ Sync Error: {e}")
-            eventlet.sleep(10)
+        except: eventlet.sleep(10)
 
 if __name__ == '__main__':
-    # शुरुआत में मास्टर डेटा सिंक करें
+    # Step 1: DB Update pehle karein
     refresh_supabase_master()
     
-    # थ्रेड्स शुरू करें
+    # Step 2: WebSocket aur Sync chalu karein
     eventlet.spawn(login_and_connect)
     eventlet.spawn(sync_watchlist)
     
-    # Render Dashboard Port binding
+    # Step 3: Render Dashboard (Health Check)
     from eventlet import wsgi
-    def app(env, res):
-        res('200 OK', [('Content-Type', 'text/plain')])
-        return [b"TRADE ENGINE IS RUNNING"]
-    port = int(os.environ.get("PORT", 10000))
-    wsgi.server(eventlet.listen(('0.0.0.0', port)), app)
+    wsgi.server(eventlet.listen(('0.0.0.0', int(os.environ.get("PORT", 10000)))), lambda e, r: [b"RUNNING"])
