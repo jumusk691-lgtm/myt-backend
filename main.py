@@ -33,31 +33,27 @@ last_price_cache = {}
 
 # --- 3. MASTER DATA SYNC (The "Never Fail" Route) ---
 def refresh_supabase_master():
-    print("🔄 [System] Updating Master DB on Supabase...")
+    print("🔄 [System] Starting Master Data Sync...")
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         
-        # GitHub link is the most reliable for Render/Cloud environments
-        urls = [
-            "https://raw.githubusercontent.com/angel-one/smartapi-python/master/OpenAPIScriptMaster.json",
-            "https://margincalculator.angelbroking.com/OpenApiData/smartlights/AllTickers.json"
-        ]
+        # Ye hai Angel One ka LATEST working GitHub link
+        # Path: smartapi-python/refs/heads/master/smartapi/OpenAPIScriptMaster.json
+        url = "https://raw.githubusercontent.com/angel-one/smartapi-python/refs/heads/master/smartapi/OpenAPIScriptMaster.json"
         
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        json_data = None
+        headers = {
+            'User-Agent': 'Mozilla/5.0',
+            'Accept': 'application/json'
+        }
         
-        for url in urls:
-            try:
-                print(f"📡 Attempting Fetch: {url}")
-                res = requests.get(url, headers=headers, timeout=45)
-                if res.status_code == 200:
-                    json_data = res.json()
-                    print(f"✅ Downloaded {len(json_data)} instruments.")
-                    break
-            except: continue
-
-        if json_data:
-            # Memory mein DB banana
+        print(f"📡 Downloading from: {url}")
+        res = requests.get(url, headers=headers, timeout=60)
+        
+        if res.status_code == 200:
+            json_data = res.json()
+            print(f"✅ Downloaded {len(json_data)} instruments.")
+            
+            # Memory mein SQLite DB build karna
             db_conn = sqlite3.connect(':memory:')
             cursor = db_conn.cursor()
             cursor.execute('''CREATE TABLE IF NOT EXISTS symbols 
@@ -74,21 +70,21 @@ def refresh_supabase_master():
             cursor.executemany("INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?)", data_to_insert)
             db_conn.commit()
             
-            # DB file ko binary mein convert karna
+            # File buffer taiyar karna
             buffer = io.BytesIO()
             for line in db_conn.iterdump():
                 buffer.write(f'{line}\n'.encode('utf-8'))
             
-            # Supabase par Nayi file "Upsert" (Overwrite) karna
+            # Supabase par update (x-upsert: true purani file ko overwrite kar dega)
             supabase.storage.from_(BUCKET_NAME).upload(
                 path="angel_master.db", 
                 file=buffer.getvalue(), 
                 file_options={"x-upsert": "true", "content-type": "application/octet-stream"}
             )
             db_conn.close()
-            print("✅ [Success] Supabase DB file has been updated!")
+            print("✅ [Success] Supabase DB file is now fresh!")
         else:
-            print("⚠️ [Warning] Could not fetch new data. Keeping the old DB file.")
+            print(f"❌ Fetch failed! Status Code: {res.status_code}")
 
     except Exception as e:
         print(f"❌ DB Update Error: {str(e)}")
@@ -115,7 +111,8 @@ def on_data(wsapp, msg):
                 
                 if 'close' in msg and msg['close'] > 0:
                     cp = float(msg['close']) / 100
-                    updates[f"{path}/pChange"] = "{:.2f}".format(((ltp - cp) / cp) * 100)
+                    p_chng = ((ltp - cp) / cp) * 100
+                    updates[f"{path}/pChange"] = "{:.2f}".format(p_chng)
 
             if updates:
                 try: 
@@ -128,16 +125,19 @@ def login_and_connect():
     global sws, is_ws_ready
     while True:
         try:
+            print(f"🔄 [AUTH] Logging in: {CLIENT_CODE}")
             smart_api = SmartConnect(api_key=API_KEY)
             session = smart_api.generateSession(CLIENT_CODE, PWD, pyotp.TOTP(TOTP_STR).now())
             if session.get('status'):
                 sws = SmartWebSocketV2(session['data']['jwtToken'], API_KEY, CLIENT_CODE, session['data']['feedToken'])
                 sws.on_data = on_data
-                sws.on_open = lambda ws: exec("global is_ws_ready; is_ws_ready=True; print('🟢 WebSocket Connected')")
+                sws.on_open = lambda ws: exec("global is_ws_ready; is_ws_ready=True; print('🟢 Market Engine Live')")
                 sws.on_close = lambda ws,c,r: exec("global is_ws_ready; is_ws_ready=False")
                 eventlet.spawn(sws.connect)
                 break
-        except: eventlet.sleep(15)
+        except Exception as e:
+            print(f"⚠️ Auth Failed, retrying... {e}")
+            eventlet.sleep(20)
 
 def sync_watchlist():
     global token_to_fb_keys
@@ -165,16 +165,25 @@ def sync_watchlist():
                             for i in range(0, len(tokens), 50):
                                 sws.subscribe("myt_task", 1, [{"exchangeType": etype, "tokens": tokens[i:i+50]}])
             eventlet.sleep(60)
-        except: eventlet.sleep(10)
+        except Exception as e:
+            print(f"⚠️ Watchlist Sync Error: {e}")
+            eventlet.sleep(10)
+
+# --- 6. RENDER WEB BINDING (Fixed Version) ---
+def simple_app(environ, start_response):
+    start_response('200 OK', [('Content-Type', 'text/plain')])
+    return [b"ENGINE_STABLE"]
 
 if __name__ == '__main__':
     # Step 1: DB Update pehle karein
     refresh_supabase_master()
     
-    # Step 2: WebSocket aur Sync chalu karein
+    # Step 2: Background tasks shuru karein
     eventlet.spawn(login_and_connect)
     eventlet.spawn(sync_watchlist)
     
-    # Step 3: Render Dashboard (Health Check)
+    # Step 3: Server chalu karein (AssertionError se bachne ke liye fixed approach)
     from eventlet import wsgi
-    wsgi.server(eventlet.listen(('0.0.0.0', int(os.environ.get("PORT", 10000)))), lambda e, r: [b"RUNNING"])
+    port = int(os.environ.get("PORT", 10000))
+    print(f"🚀 Server starting on port {port}")
+    wsgi.server(eventlet.listen(('0.0.0.0', port)), simple_app)
