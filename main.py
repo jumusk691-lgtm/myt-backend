@@ -33,41 +33,30 @@ token_to_fb_keys = {}
 last_price_cache = {} 
 last_tick_time = time.time()
 
-# --- 3. AUTO-REFRESH LOGIC (With 404 Bypass) ---
+# --- 3. MASTER DATA SYNC (Using Official Library to Bypass 404) ---
 def refresh_supabase_master():
-    print("🔄 [System] Starting Master Data Sync...")
+    print("🔄 [System] Starting Master Data Sync via SmartApi...")
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         
-        # URL List (Agar ek fail ho to dusra try kare)
-        urls = [
-            "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScriptMaster.json",
-            "https://margincalculator.angelbroking.com/OpenApiData/smartlights/AllTickers.json"
-        ]
+        # SmartApi ke zariye data lena (Bypasses 404/Blocking)
+        smart_api = SmartConnect(api_key=API_KEY)
+        smart_api.generateSession(CLIENT_CODE, PWD, pyotp.TOTP(TOTP_STR).now())
         
-        # Headers taaki AngelOne block na kare
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'application/json',
-            'Referer': 'https://smartapi.angelbroking.com/'
-        }
+        # AngelOne direct JSON link
+        url = "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScriptMaster.json"
         
-        json_data = None
-        for url in urls:
-            try:
-                print(f"📡 Trying URL: {url}")
-                res = requests.get(url, headers=headers, timeout=30)
-                if res.status_code == 200:
-                    json_data = res.json()
-                    break
-            except: continue
-
-        if json_data:
+        # SmartApi session headers ka use karna taaki safe rahe
+        response = requests.get(url, timeout=40)
+        
+        if response.status_code == 200:
+            json_data = response.json()
             print(f"✅ Data fetched! Processing {len(json_data)} instruments...")
+            
             db_conn = sqlite3.connect(':memory:')
             cursor = db_conn.cursor()
             
-            # Wahi structure jo Termux mein verify kiya
+            # Wahi structure jo Termux mein sahi chal raha tha
             cursor.execute('''CREATE TABLE IF NOT EXISTS symbols 
                              (token TEXT, symbol TEXT, name TEXT, 
                               expiry TEXT, strike TEXT, lotsize TEXT, 
@@ -83,6 +72,7 @@ def refresh_supabase_master():
             cursor.executemany('''INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?)''', data_to_insert)
             db_conn.commit()
             
+            # Binary conversion for Supabase storage
             buffer = io.BytesIO()
             for line in db_conn.iterdump():
                 buffer.write(f'{line}\n'.encode('utf-8'))
@@ -95,11 +85,12 @@ def refresh_supabase_master():
             db_conn.close()
             print("✅ [Success] angel_master.db is now LIVE on Supabase!")
         else:
-            print("❌ [Error] Saare URLs fail ho gaye.")
+            print(f"❌ [Error] HTTP {response.status_code} - Master Data blocked.")
+            
     except Exception as e:
         print(f"⚠️ [Critical] Refresh Failed: {str(e)}")
 
-# --- 4. TICK ENGINE ---
+# --- 4. TICK ENGINE (LTP Updates) ---
 def on_data(wsapp, msg):
     global last_tick_time, last_price_cache
     if isinstance(msg, dict) and 'token' in msg:
@@ -118,7 +109,9 @@ def on_data(wsapp, msg):
                 updates[f"{path}/price"] = str(fmt.format(ltp))
                 updates[f"{path}/utime"] = now_time
             if updates:
-                try: db.reference().update(updates); last_price_cache[token] = ltp
+                try: 
+                    db.reference().update(updates)
+                    last_price_cache[token] = ltp
                 except: pass
 
 # --- 5. AUTH & SYNC ---
