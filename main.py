@@ -31,24 +31,15 @@ is_ws_ready = False
 token_to_fb_keys = {} 
 last_price_cache = {} 
 
-# --- 3. MASTER DATA SYNC (FIXED: BINARY UPLOAD) ---
+# --- 3. MASTER DATA SYNC ---
 def refresh_supabase_master():
-    print(f"🔄 [System] Syncing Master Data at {datetime.datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"🔄 [System] Syncing Master Data...")
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        
-        response = requests.get(url, headers=headers, stream=True, timeout=None)
+        response = requests.get(url, timeout=30)
         if response.status_code == 200:
-            # Sara data chunks mein stream karke read karna
-            bytes_io = io.BytesIO()
-            for data in response.iter_content(chunk_size=8192):
-                bytes_io.write(data)
-            
-            json_data = json.loads(bytes_io.getvalue().decode('utf-8'))
-            
-            # Temporary binary file disk par banani padegi kyunki iterdump text bana deta hai
+            json_data = response.json()
             temp_db = "angel_master.db"
             if os.path.exists(temp_db): os.remove(temp_db)
             
@@ -67,67 +58,37 @@ def refresh_supabase_master():
             ]
             cursor.executemany("INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?)", data_to_insert)
             db_conn.commit()
-            db_conn.close() # Close to flush binary data
+            db_conn.close()
             
-            # Binary file ko read karke Supabase pe upload karna
             with open(temp_db, "rb") as f:
-                db_binary_data = f.read()
-            
-            # Upsert ensures file name stays 'angel_master.db'
-            supabase.storage.from_(BUCKET_NAME).upload(
-                path="angel_master.db", 
-                file=db_binary_data, 
-                file_options={
-                    "x-upsert": "true", 
-                    "content-type": "application/x-sqlite3" # Android needs this type
-                }
-            )
-            
-            # Local file delete kardo upload ke baad
+                supabase.storage.from_(BUCKET_NAME).upload(
+                    path="angel_master.db", file=f.read(), 
+                    file_options={"x-upsert": "true", "content-type": "application/x-sqlite3"}
+                )
             if os.path.exists(temp_db): os.remove(temp_db)
-            
-            print("✅ [Success] Supabase BINARY Master DB Updated!")
-        else:
-            print(f"❌ Download Failed: {response.status_code}")
+            print("✅ [Success] Master DB Updated!")
     except Exception as e:
-        print(f"❌ Sync Error: {str(e)}")
-
-# --- 3.1 DAILY SCHEDULER ---
-def daily_auto_update():
-    """Rozana subah 8:30 baje data refresh karne ke liye"""
-    while True:
-        now = datetime.datetime.now(IST)
-        # 08:30 AM check
-        if now.hour == 8 and now.minute == 30:
-            print("⏰ [Scheduled] Running daily morning sync...")
-            refresh_supabase_master()
-            time.sleep(70) # Skip this minute to avoid double trigger
-        eventlet.sleep(30) # Check every 30 seconds
+        print(f"❌ Sync Error: {e}")
 
 # --- 4. TICK ENGINE ---
 def on_data(wsapp, msg):
     global last_price_cache
     if isinstance(msg, dict) and 'token' in msg:
         token = msg.get('token')
-        ltp_raw = msg.get('last_traded_price') or msg.get('ltp', 0)
-        ltp = float(ltp_raw) / 100
+        ltp = float(msg.get('last_traded_price', 0)) / 100
         
         if ltp > 0 and token in token_to_fb_keys:
+            # Sirf tab update karein jab price badle (Bandwidth saving)
             if last_price_cache.get(token) == ltp: return
             
             now_time = datetime.datetime.now(IST).strftime("%H:%M:%S")
             updates = {}
             for fb_key in token_to_fb_keys[token]:
                 path = f"central_watchlist/{fb_key}"
-                is_mcx = any(x in fb_key.upper() for x in ["MCX", "GOLD", "SILVER"])
+                is_mcx = "MCX" in fb_key.upper()
                 fmt = "{:.4f}" if is_mcx else "{:.2f}"
                 updates[f"{path}/price"] = str(fmt.format(ltp))
                 updates[f"{path}/utime"] = now_time
-                
-                if 'close' in msg and msg['close'] > 0:
-                    cp = float(msg['close']) / 100
-                    p_chng = ((ltp - cp) / cp) * 100
-                    updates[f"{path}/pChange"] = "{:.2f}".format(p_chng)
 
             if updates:
                 try: 
@@ -135,69 +96,85 @@ def on_data(wsapp, msg):
                     last_price_cache[token] = ltp
                 except: pass
 
-# --- 5. SYSTEM HANDLERS ---
+# --- 5. REAL-TIME WATCHLIST LISTENER (NO DELAY) ---
+def start_watchlist_listener():
+    """Ye function Firebase mein hone wale har change ko turant pakadta hai"""
+    def listener_callback(event):
+        global token_to_fb_keys
+        if not is_ws_ready: return
+
+        # Jab poora data pehli baar load ho ya koi naya node add ho
+        if event.event_type in ['put', 'patch']:
+            if event.path == "/":
+                data = event.data
+            else:
+                # Jab sirf ek single stock add ho
+                key = event.path.strip("/")
+                data = {key: event.data}
+
+            if not data: return
+
+            for fb_key, val in data.items():
+                if not isinstance(val, dict): continue
+                token = str(val.get('token', ''))
+                exch = str(val.get('exch_seg', 'NSE')).upper()
+                
+                if token and token != "None":
+                    # Global map update karein
+                    if token not in token_to_fb_keys:
+                        token_to_fb_keys[token] = []
+                    if fb_key not in token_to_fb_keys[token]:
+                        token_to_fb_keys[token].append(fb_key)
+                    
+                    # Smart Subscribe
+                    e_type = 5 if "MCX" in exch else (2 if any(x in exch for x in ["NFO", "FUT", "OPT"]) else 1)
+                    sws.subscribe("myt_task", 1, [{"exchangeType": e_type, "tokens": [token]}])
+                    print(f"⚡ Instant Subscribed: {fb_key} ({token})")
+
+    print("📡 Monitoring Watchlist for changes...")
+    db.reference('central_watchlist').listen(listener_callback)
+
+# --- 6. AUTH & CONNECTION ---
 def login_and_connect():
     global sws, is_ws_ready
     while True:
         try:
-            print(f"🔄 [AUTH] Logging in: {CLIENT_CODE}")
             smart_api = SmartConnect(api_key=API_KEY)
             session = smart_api.generateSession(CLIENT_CODE, PWD, pyotp.TOTP(TOTP_STR).now())
             if session.get('status'):
                 sws = SmartWebSocketV2(session['data']['jwtToken'], API_KEY, CLIENT_CODE, session['data']['feedToken'])
                 sws.on_data = on_data
-                sws.on_open = lambda ws: exec("global is_ws_ready; is_ws_ready=True; print('🟢 Market Engine Live')")
+                def on_open(ws):
+                    global is_ws_ready
+                    is_ws_ready = True
+                    print('🟢 Market Engine Live')
+                sws.on_open = on_open
                 sws.on_close = lambda ws,c,r: exec("global is_ws_ready; is_ws_ready=False")
-                eventlet.spawn(sws.connect)
+                sws.connect()
                 break
         except Exception as e:
-            print(f"⚠️ Auth Failed: {e}")
-            eventlet.sleep(20)
-
-def sync_watchlist():
-    global token_to_fb_keys
-    while True:
-        try:
-            if is_ws_ready:
-                full_data = db.reference('central_watchlist').get()
-                if full_data:
-                    new_token_map = {}
-                    subscriptions = {1: [], 2: [], 5: []} 
-                    for fb_key, val in full_data.items():
-                        token = str(val.get('token', ''))
-                        exch = str(val.get('exch_seg', 'NSE')).upper()
-                        if not token or token == "None": continue
-                        
-                        if token not in new_token_map: new_token_map[token] = []
-                        new_token_map[token].append(fb_key)
-                        
-                        e_type = 5 if "MCX" in exch else (2 if any(x in exch for x in ["NFO", "FUT", "OPT"]) else 1)
-                        subscriptions[e_type].append(token)
-                    
-                    token_to_fb_keys = new_token_map
-                    for etype, tokens in subscriptions.items():
-                        if tokens:
-                            for i in range(0, len(tokens), 50):
-                                sws.subscribe("myt_task", 1, [{"exchangeType": etype, "tokens": tokens[i:i+50]}])
-            eventlet.sleep(60)
-        except Exception as e:
+            print(f"⚠️ Auth/WS Error: {e}")
             eventlet.sleep(10)
 
 def simple_app(environ, start_response):
     start_response('200 OK', [('Content-Type', 'text/plain')])
     return [b"ENGINE_STABLE"]
 
-# --- 6. MAIN EXECUTION ---
+# --- 7. MAIN ---
 if __name__ == '__main__':
-    # Ek baar startup par update karega
+    # Startup Sync
     refresh_supabase_master()
     
-    # Background threads chalu karein
-    eventlet.spawn(daily_auto_update) # Scheduler chalu
+    # Background Processes
     eventlet.spawn(login_and_connect)
-    eventlet.spawn(sync_watchlist)
     
-    # Render binding
+    # Wait for WebSocket to be ready before starting listener
+    while not is_ws_ready:
+        eventlet.sleep(1)
+        
+    eventlet.spawn(start_watchlist_listener)
+    
+    # Render Port Binding
     from eventlet import wsgi
     port = int(os.environ.get("PORT", 10000))
     wsgi.server(eventlet.listen(('0.0.0.0', port)), simple_app)
