@@ -1,0 +1,14 @@
+‎python-socketio>=5.11.0
+‎python-engineio>=4.8.0
+‎eventlet==0.33.3
+‎gunicorn==20.1.0
+‎Smartapi-python
+‎setuptools
+‎pyotp
+‎requests
+‎pandas
+‎websocket-client
+‎logzero
+‎firebase-admin
+‎pytz
+‎supabase
