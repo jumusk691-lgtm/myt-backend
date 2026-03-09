@@ -30,6 +30,7 @@ sws = None
 is_ws_ready = False
 token_to_fb_keys = {} 
 last_price_cache = {} 
+subscribed_tokens_set = set() # Track unique subscriptions
 
 # --- 3. MASTER DATA SYNC ---
 def refresh_supabase_master():
@@ -38,59 +39,20 @@ def refresh_supabase_master():
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
         headers = {'User-Agent': 'Mozilla/5.0'}
-        
-        response = requests.get(url, headers=headers, stream=True, timeout=None)
+        response = requests.get(url, headers=headers, timeout=30)
         if response.status_code == 200:
-            bytes_io = io.BytesIO()
-            for data in response.iter_content(chunk_size=8192):
-                bytes_io.write(data)
-            
-            json_data = json.loads(bytes_io.getvalue().decode('utf-8'))
-            
+            json_data = response.json()
             db_conn = sqlite3.connect(':memory:')
             cursor = db_conn.cursor()
-            cursor.execute('''CREATE TABLE IF NOT EXISTS symbols 
-                             (token TEXT, symbol TEXT, name TEXT, expiry TEXT, 
-                              strike TEXT, lotsize TEXT, instrumenttype TEXT, 
-                              exch_seg TEXT, tick_size TEXT)''')
-            
-            data_to_insert = [
-                (i.get('token'), i.get('symbol'), i.get('name'), i.get('expiry'), 
-                 i.get('strike'), i.get('lotsize'), i.get('instrumenttype'), 
-                 i.get('exch_seg'), i.get('tick_size'))
-                for i in json_data
-            ]
+            cursor.execute('''CREATE TABLE IF NOT EXISTS symbols (token TEXT, symbol TEXT, name TEXT, expiry TEXT, strike TEXT, lotsize TEXT, instrumenttype TEXT, exch_seg TEXT, tick_size TEXT)''')
+            data_to_insert = [(i.get('token'), i.get('symbol'), i.get('name'), i.get('expiry'), i.get('strike'), i.get('lotsize'), i.get('instrumenttype'), i.get('exch_seg'), i.get('tick_size')) for i in json_data]
             cursor.executemany("INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?)", data_to_insert)
-            db_conn.commit()
-            
             db_dump = io.BytesIO()
-            for line in db_conn.iterdump():
-                db_dump.write(f'{line}\n'.encode('utf-8'))
-            
-            # Upsert is important to overwrite old file
-            supabase.storage.from_(BUCKET_NAME).upload(
-                path="angel_master.db", 
-                file=db_dump.getvalue(), 
-                file_options={"x-upsert": "true", "content-type": "application/octet-stream"}
-            )
+            for line in db_conn.iterdump(): db_dump.write(f'{line}\n'.encode('utf-8'))
+            supabase.storage.from_(BUCKET_NAME).upload(path="angel_master.db", file=db_dump.getvalue(), file_options={"x-upsert": "true", "content-type": "application/octet-stream"})
             db_conn.close()
             print("✅ [Success] Supabase Master DB Updated!")
-        else:
-            print(f"❌ Download Failed: {response.status_code}")
-    except Exception as e:
-        print(f"❌ Sync Error: {str(e)}")
-
-# --- 3.1 DAILY SCHEDULER ---
-def daily_auto_update():
-    """Rozana subah 8:30 baje data refresh karne ke liye"""
-    while True:
-        now = datetime.datetime.now(IST)
-        # 08:30 AM check
-        if now.hour == 8 and now.minute == 30:
-            print("⏰ [Scheduled] Running daily morning sync...")
-            refresh_supabase_master()
-            time.sleep(70) # Skip this minute to avoid double trigger
-        eventlet.sleep(30) # Check every 30 seconds
+    except Exception as e: print(f"❌ Sync Error: {str(e)}")
 
 # --- 4. TICK ENGINE ---
 def on_data(wsapp, msg):
@@ -101,6 +63,7 @@ def on_data(wsapp, msg):
         ltp = float(ltp_raw) / 100
         
         if ltp > 0 and token in token_to_fb_keys:
+            # Overwrite only if price changes
             if last_price_cache.get(token) == ltp: return
             
             now_time = datetime.datetime.now(IST).strftime("%H:%M:%S")
@@ -124,33 +87,47 @@ def on_data(wsapp, msg):
                 except: pass
 
 # --- 5. SYSTEM HANDLERS ---
-def login_and_connect():
-    global sws, is_ws_ready
+def manage_connection():
+    global sws, is_ws_ready, subscribed_tokens_set
     while True:
-        try:
-            print(f"🔄 [AUTH] Logging in: {CLIENT_CODE}")
-            smart_api = SmartConnect(api_key=API_KEY)
-            session = smart_api.generateSession(CLIENT_CODE, PWD, pyotp.TOTP(TOTP_STR).now())
-            if session.get('status'):
-                sws = SmartWebSocketV2(session['data']['jwtToken'], API_KEY, CLIENT_CODE, session['data']['feedToken'])
-                sws.on_data = on_data
-                sws.on_open = lambda ws: exec("global is_ws_ready; is_ws_ready=True; print('🟢 Market Engine Live')")
-                sws.on_close = lambda ws,c,r: exec("global is_ws_ready; is_ws_ready=False")
-                eventlet.spawn(sws.connect)
-                break
-        except Exception as e:
-            print(f"⚠️ Auth Failed: {e}")
-            eventlet.sleep(20)
+        now = datetime.datetime.now(IST)
+        start_time = now.replace(hour=8, minute=30, second=0, microsecond=0)
+        end_time = now.replace(hour=23, minute=59, second=59, microsecond=0)
+
+        # Market Hours: 08:30 AM to 11:59 PM
+        if start_time <= now <= end_time:
+            if not is_ws_ready:
+                try:
+                    print(f"🔄 [AUTH] Starting Market Engine: {CLIENT_CODE}")
+                    smart_api = SmartConnect(api_key=API_KEY)
+                    session = smart_api.generateSession(CLIENT_CODE, PWD, pyotp.TOTP(TOTP_STR).now())
+                    if session.get('status'):
+                        sws = SmartWebSocketV2(session['data']['jwtToken'], API_KEY, CLIENT_CODE, session['data']['feedToken'])
+                        sws.on_data = on_data
+                        sws.on_open = lambda ws: exec("global is_ws_ready; is_ws_ready=True; print('🟢 Market Engine Live')")
+                        sws.on_close = lambda ws,c,r: exec("global is_ws_ready; is_ws_ready=False")
+                        eventlet.spawn(sws.connect)
+                        refresh_supabase_master() # Sync master on start
+                except Exception as e: print(f"⚠️ Auth Failed: {e}")
+        else:
+            if is_ws_ready and sws:
+                print("🌙 [System] Closing Market Engine for the night...")
+                sws.close()
+                is_ws_ready = False
+                subscribed_tokens_set.clear() # Reset for next morning
+
+        eventlet.sleep(30)
 
 def sync_watchlist():
-    global token_to_fb_keys
+    global token_to_fb_keys, subscribed_tokens_set
     while True:
         try:
             if is_ws_ready:
                 full_data = db.reference('central_watchlist').get()
                 if full_data:
                     new_token_map = {}
-                    subscriptions = {1: [], 2: [], 5: []} 
+                    to_subscribe = {1: [], 2: [], 5: []} 
+                    
                     for fb_key, val in full_data.items():
                         token = str(val.get('token', ''))
                         exch = str(val.get('exch_seg', 'NSE')).upper()
@@ -159,17 +136,24 @@ def sync_watchlist():
                         if token not in new_token_map: new_token_map[token] = []
                         new_token_map[token].append(fb_key)
                         
-                        e_type = 5 if "MCX" in exch else (2 if any(x in exch for x in ["NFO", "FUT", "OPT"]) else 1)
-                        subscriptions[e_type].append(token)
+                        # Subscribe only if not already subscribed
+                        if token not in subscribed_tokens_set:
+                            e_type = 5 if "MCX" in exch else (2 if any(x in exch for x in ["NFO", "FUT", "OPT"]) else 1)
+                            to_subscribe[e_type].append(token)
                     
                     token_to_fb_keys = new_token_map
-                    for etype, tokens in subscriptions.items():
+                    
+                    # Execute subscriptions for new tokens
+                    for etype, tokens in to_subscribe.items():
                         if tokens:
                             for i in range(0, len(tokens), 50):
-                                sws.subscribe("myt_task", 1, [{"exchangeType": etype, "tokens": tokens[i:i+50]}])
-            eventlet.sleep(2)
-        except Exception as e:
-            eventlet.sleep(10)
+                                batch = tokens[i:i+50]
+                                sws.subscribe("myt_task", 1, [{"exchangeType": etype, "tokens": batch}])
+                                for t in batch: subscribed_tokens_set.add(t)
+                                print(f"📡 Subscribed to {len(batch)} new tokens in {etype}")
+            
+            eventlet.sleep(1) # 1 sec delay for new tokens
+        except Exception as e: eventlet.sleep(5)
 
 def simple_app(environ, start_response):
     start_response('200 OK', [('Content-Type', 'text/plain')])
@@ -177,15 +161,9 @@ def simple_app(environ, start_response):
 
 # --- 6. MAIN EXECUTION ---
 if __name__ == '__main__':
-    # Ek baar startup par update karega
-    refresh_supabase_master()
-    
-    # Background threads chalu karein
-    eventlet.spawn(daily_auto_update) # Scheduler chalu
-    eventlet.spawn(login_and_connect)
+    eventlet.spawn(manage_connection)
     eventlet.spawn(sync_watchlist)
     
-    # Render binding
     from eventlet import wsgi
     port = int(os.environ.get("PORT", 10000))
     wsgi.server(eventlet.listen(('0.0.0.0', port)), simple_app)
