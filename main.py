@@ -17,6 +17,7 @@ SUPABASE_URL = "https://tnrhlvibaeiwhlrxdxnm.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRucmhsdmliYWVpd2hscnhkeG5tIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjY0NzQ0NywiZXhwIjoyMDg4MjIzNDQ3fQ.epYmt7sxhZRhEQWoj0doCHAbfOTHOjSurBbLss5a4Pk"
 BUCKET_NAME = "Myt"
 
+# Redis Config with Keep-Alive parameters
 REDIS_URL = "rediss://default:ATjsAAIncDFiOTVlY2RlNDI1ODk0MDI4YmRiMmE2Yzg0Y2RkM2RkZHAxMTQ1NzI@quick-narwhal-14572.upstash.io:6379"
 
 # Global State
@@ -26,7 +27,7 @@ is_ws_ready = False
 last_master_update_date = None
 loop = None
 
-# --- 2. MASTER DATA SYNC (SUPABASE) ---
+# --- 2. MASTER DATA SYNC ---
 def refresh_supabase_master():
     print(f"🔄 [System] Overwriting Master Data on Supabase...")
     try:
@@ -41,6 +42,7 @@ def refresh_supabase_master():
             conn = sqlite3.connect(temp_path)
             cursor = conn.cursor()
             cursor.execute("DROP TABLE IF EXISTS symbols")
+            # Matches your DatabaseHelper.kt columns [cite: 2026-03-06]
             cursor.execute('''CREATE TABLE symbols (token TEXT, symbol TEXT, name TEXT, expiry TEXT, 
                              strike TEXT, lotsize TEXT, instrumenttype TEXT, exch_seg TEXT, tick_size TEXT)''')
             
@@ -59,13 +61,13 @@ def refresh_supabase_master():
                     file_options={"x-upsert": "true", "content-type": "application/octet-stream"}
                 )
             os.remove(temp_path)
-            print("✅ [Success] Master DB Overwritten on Supabase.")
+            print("✅ [Success] Master DB Overwritten.")
             return True
     except Exception as e:
         print(f"❌ Master Error: {e}")
         return False
 
-# --- 3. TICK ENGINE (ANGEL CALLBACK) ---
+# --- 3. TICK ENGINE ---
 def on_data(wsapp, msg):
     if isinstance(msg, dict) and 'token' in msg:
         token = str(msg.get('token'))
@@ -82,7 +84,14 @@ def on_data(wsapp, msg):
 async def lifespan(app: FastAPI):
     global redis_client, loop
     loop = asyncio.get_running_loop()
-    redis_client = aioredis.from_url(REDIS_URL, decode_responses=True, socket_timeout=10, retry_on_timeout=True)
+    # Improved Redis connection with health checks
+    redis_client = aioredis.from_url(
+        REDIS_URL, 
+        decode_responses=True, 
+        socket_timeout=15, 
+        socket_keepalive=True,
+        retry_on_timeout=True
+    )
     asyncio.create_task(manage_connection_loop())
     yield
     if sws: sws.close()
@@ -93,34 +102,35 @@ app = FastAPI(lifespan=lifespan)
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    print("📱 Android Connected")
-    pubsub = redis_client.pubsub()
-    await pubsub.subscribe("live_ticks")
+    print("📱 Android Client Connected")
     
-    # Task to handle incoming messages from Android (Subscription requests)
-    async def receive_from_android():
-        global sws
+    # Use a dedicated pubsub connection to prevent timeout interference
+    async with redis_client.pubsub() as pubsub:
+        await pubsub.subscribe("live_ticks")
+        
+        async def receive_from_android():
+            global sws
+            try:
+                while True:
+                    data = await websocket.receive_text()
+                    msg = json.loads(data)
+                    if msg.get("action") == "subscribe" and sws:
+                        tokens_list = [{"exchangeType": msg["exch"], "tokens": msg["tokens"]}]
+                        sws.subscribe(str(int(time.time())), 1, tokens_list)
+            except: pass
+
+        asyncio.create_task(receive_from_android())
+
         try:
-            while True:
-                data = await websocket.receive_text()
-                msg = json.loads(data)
-                if msg.get("action") == "subscribe" and sws:
-                    # Expecting format: {"action": "subscribe", "exch": 1, "tokens": ["26000"]}
-                    tokens_list = [{"exchangeType": msg["exch"], "tokens": msg["tokens"]}]
-                    sws.subscribe(str(int(time.time())), 1, tokens_list)
-                    print(f"📥 Dynamic Sub: {msg['tokens']}")
-        except: pass
-
-    asyncio.create_task(receive_from_android())
-
-    try:
-        async for message in pubsub.listen():
-            if message["type"] == "message":
-                await websocket.send_text(message["data"])
-    except WebSocketDisconnect:
-        print("📱 Android Disconnected")
-    finally:
-        await pubsub.unsubscribe("live_ticks")
+            async for message in pubsub.listen():
+                if message["type"] == "message":
+                    await websocket.send_text(message["data"])
+        except WebSocketDisconnect:
+            print("📱 Android Disconnected")
+        except Exception as e:
+            print(f"⚠️ WS Stream Error: {e}")
+        finally:
+            await pubsub.unsubscribe("live_ticks")
 
 # --- 5. CONNECTION MANAGER ---
 async def manage_connection_loop():
@@ -128,9 +138,11 @@ async def manage_connection_loop():
     while True:
         now = datetime.datetime.now(IST)
         
+        # 8:30 AM Master Update
         if now.hour == 8 and 30 <= now.minute <= 50 and last_master_update_date != now.date():
             if refresh_supabase_master(): last_master_update_date = now.date()
 
+        # Angel SmartAPI Session Management
         if 8 <= now.hour < 24:
             if not is_ws_ready:
                 try:
@@ -146,9 +158,9 @@ async def manage_connection_loop():
                         is_ws_ready = True
                         
                         await asyncio.sleep(5)
-                        # Default startup tokens
+                        # Default startup: Nifty & BankNifty
                         sws.subscribe("startup", 1, [{"exchangeType": 1, "tokens": ["26000", "26009"]}])
-                except Exception as e: print(f"Conn Error: {e}")
+                except Exception as e: print(f"❌ Conn Error: {e}")
         else:
             if is_ws_ready:
                 if sws: sws.close()
@@ -158,4 +170,5 @@ async def manage_connection_loop():
 
 if __name__ == '__main__':
     import uvicorn
+    # Render binds to port 10000 by default
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
