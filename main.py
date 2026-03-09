@@ -167,7 +167,7 @@ def sync_watchlist():
                         if tokens:
                             for i in range(0, len(tokens), 50):
                                 sws.subscribe("myt_task", 1, [{"exchangeType": etype, "tokens": tokens[i:i+50]}])
-            eventlet.sleep(60)
+            eventlet.sleep(2)
         except Exception as e:
             eventlet.sleep(10)
 
