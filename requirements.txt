@@ -11,6 +11,6 @@ pandas
 websocket-client
 logzero
 pytz
+redis>=5.0.0
 supabase
-redis
 fastapi
