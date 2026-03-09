@@ -13,3 +13,4 @@ logzero
 pytz
 supabase
 redis
+fastapi
