@@ -14,3 +14,4 @@ pytz
 redis>=5.0.0
 supabase
 fastapi
+firebase_admin
