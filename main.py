@@ -1,10 +1,9 @@
-import eventlet
-eventlet.monkey_patch(all=True)
 import os, pyotp, time, datetime, pytz, requests, sqlite3, tempfile, json, redis, asyncio
 from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 from supabase import create_client
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from contextlib import asynccontextmanager
 
 # --- 1. CONFIG & CONNECTIONS ---
 API_KEY = "85HE4VA1"
@@ -18,18 +17,22 @@ SUPABASE_URL = "https://tnrhlvibaeiwhlrxdxnm.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRucmhsdmliYWVpd2hscnhkeG5tIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjY0NzQ0NywiZXhwIjoyMDg4MjIzNDQ3fQ.epYmt7sxhZRhEQWoj0doCHAbfOTHOjSurBbLss5a4Pk"
 BUCKET_NAME = "Myt"
 
-# Redis Connection (Direct Mixed URL)
+# Redis Connection with Timeout Fixes
 REDIS_URL = "rediss://default:ATjsAAIncDFiOTVlY2RlNDI1ODk0MDI4YmRiMmE2Yzg0Y2RkM2RkZHAxMTQ1NzI@quick-narwhal-14572.upstash.io:6379"
-r = redis.from_url(REDIS_URL, decode_responses=True)
-
-app = FastAPI()
+r = redis.from_url(
+    REDIS_URL, 
+    decode_responses=True, 
+    socket_timeout=10,        #
+    retry_on_timeout=True,    #
+    health_check_interval=30
+)
 
 # --- GLOBAL STATE ---
 sws = None
 is_ws_ready = False
 last_master_update_date = None
 
-# --- 2. MASTER DATA SYNC (SUPABASE) ---
+# --- 2. MASTER DATA SYNC ---
 def refresh_supabase_master():
     print(f"🔄 [System] Overwriting Master Data on Supabase...")
     try:
@@ -69,39 +72,58 @@ def on_data(wsapp, msg):
         ltp = float(ltp_raw) / 100
         
         if ltp > 0:
-            # Data Packet for Android
             tick_data = {
                 "t": token,
                 "p": "{:.2f}".format(ltp),
                 "c": "{:.2f}".format(float(msg.get('close', 0)) / 100) if 'close' in msg else "0.00"
             }
-            # Redis Channel mein phenk do
-            r.publish("live_ticks", json.dumps(tick_data))
+            try:
+                r.publish("live_ticks", json.dumps(tick_data))
+            except Exception as e:
+                print(f"Redis Publish Error: {e}")
 
 # --- 4. WEBSOCKET GATEWAY ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: Run background tasks
+    asyncio.create_task(manage_connection_async())
+    yield
+    # Shutdown
+    if sws:
+        sws.close()
+
+app = FastAPI(lifespan=lifespan)
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
+    print("📱 Android Client Connected to WS")
     pubsub = r.pubsub()
     pubsub.subscribe("live_ticks")
     try:
         while True:
-            message = pubsub.get_message()
+            # Check for messages without blocking
+            message = pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
             if message and message['type'] == 'message':
                 await websocket.send_text(message['data'])
             await asyncio.sleep(0.01) 
-    except WebSocketDisconnect:
+    except Exception as e:
+        print(f"Client Disconnected: {e}")
+    finally:
         pubsub.unsubscribe("live_ticks")
 
-# --- 5. CONNECTION MANAGER ---
-def manage_connection():
+# --- 5. ASYNC CONNECTION MANAGER ---
+async def manage_connection_async():
     global sws, is_ws_ready, last_master_update_date
     while True:
         now = datetime.datetime.now(IST)
+        
         # 8:30 AM Master Data Sync
-        if now.hour == 8 and 30 <= now.minute <= 59 and last_master_update_date != now.date():
-            if refresh_supabase_master(): last_master_update_date = now.date()
-            
+        if now.hour == 8 and 30 <= now.minute <= 45 and last_master_update_date != now.date():
+            if refresh_supabase_master():
+                last_master_update_date = now.date()
+
+        # Market Hours Connection (9:00 AM to 11:55 PM for MCX/NSE)
         if 8 <= now.hour < 24:
             if not is_ws_ready:
                 try:
@@ -110,29 +132,38 @@ def manage_connection():
                     if session.get('status'):
                         sws = SmartWebSocketV2(session['data']['jwtToken'], API_KEY, CLIENT_CODE, session['data']['feedToken'])
                         sws.on_data = on_data
-                        sws.on_open = lambda ws: exec("global is_ws_ready; is_ws_ready=True; print('🟢 Angel WebSocket Live')")
-                        sws.on_close = lambda ws,c,r: exec("global is_ws_ready; is_ws_ready=False")
-                        eventlet.spawn(sws.connect)
-                except: pass
+                        sws.on_open = lambda ws: on_ws_open()
+                        sws.on_close = lambda ws,c,r: on_ws_close()
+                        # Run websocket in a separate thread to not block asyncio
+                        import threading
+                        threading.Thread(target=sws.connect, daemon=True).start()
+                except Exception as e:
+                    print(f"Connection Attempt Failed: {e}")
         else:
-            if is_ws_ready:
-                if sws: sws.close()
+            if is_ws_ready and sws:
+                sws.close()
                 is_ws_ready = False
-        eventlet.sleep(60)
+        
+        await asyncio.sleep(60)
 
-# Yahan aap permanent tokens subscribe kar sakte hain
-def auto_subscribe():
-    global is_ws_ready, sws
-    while True:
-        if is_ws_ready and sws:
-            # Aap yahan Nifty/BankNifty ke tokens dal sakte hain jo hamesha chalu rahein
-            # sws.subscribe("myt", 1, [{"exchangeType": 1, "tokens": ["26000", "26009"]}])
-            pass
-        eventlet.sleep(30)
+def on_ws_open():
+    global is_ws_ready
+    is_ws_ready = True
+    print("🟢 Angel WebSocket Live")
+    # Subscribe to common tokens on start
+    if sws:
+        correlation_id = "initial_sub"
+        action = 1 # Subscribe
+        mode = 1   # LTP
+        tokens = [{"exchangeType": 1, "tokens": ["26000", "26009"]}, {"exchangeType": 5, "tokens": ["234316", "234313"]}]
+        sws.subscribe(correlation_id, action, tokens)
+
+def on_ws_close():
+    global is_ws_ready
+    is_ws_ready = False
+    print("🔴 Angel WebSocket Closed")
 
 if __name__ == '__main__':
-    eventlet.spawn(manage_connection)
-    eventlet.spawn(auto_subscribe)
     import uvicorn
-    # Render automatically sets the PORT environment variable
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
