@@ -130,7 +130,7 @@ def sync_watchlist():
                             if "MCX" in exch: etype = 5
                             elif any(x in symbol for x in ["CE", "PE", "FUT"]) or "NFO" in exch:
                                 etype = 4 if "SENSEX" in symbol or "BFO" in exch else 2
-                            elif "BSE" in exch: etype = 3
+                            elif "BSE" in exch: etype = 1
                             batches[etype].append(token)
                     token_to_fb_items = temp_map
                     for etype, tokens in batches.items():
