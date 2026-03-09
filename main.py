@@ -14,13 +14,12 @@ if not firebase_admin._apps:
         'databaseURL': 'https://trade-f600a-default-rtdb.firebaseio.com/'
     })
 
-# --- 2. CONFIGURATION ---
+# --- CONFIG ---
 API_KEY = "85HE4VA1"
 CLIENT_CODE = "S52638556"
 PWD = "0000"
 TOTP_STR = "XFTXZ2445N4V2UMB7EWUCBDRMU"
 IST = pytz.timezone('Asia/Kolkata')
-
 SUPABASE_URL = "https://tnrhlvibaeiwhlrxdxnm.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRucmhsdmliYWVpd2hscnhkeG5tIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjY0NzQ0NywiZXhwIjoyMDg4MjIzNDQ3fQ.epYmt7sxhZRhEQWoj0doCHAbfOTHOjSurBbLss5a4Pk"
 BUCKET_NAME = "Myt"
@@ -30,25 +29,22 @@ sws = None
 is_ws_ready = False
 token_to_fb_keys = {} 
 last_price_cache = {} 
+subscribed_tokens_set = set()
 
-# --- 3. MASTER DATA SYNC ---
+# --- 2. MASTER DATA SYNC (Sahi wala Supabase Upload) ---
 def refresh_supabase_master():
-    print(f"🔄 [System] Syncing Master Data at {datetime.datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"🔄 [System] Syncing Master Data for Android & F&O...")
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(url, timeout=60)
         
-        response = requests.get(url, headers=headers, stream=True, timeout=None)
         if response.status_code == 200:
-            bytes_io = io.BytesIO()
-            for data in response.iter_content(chunk_size=8192):
-                bytes_io.write(data)
-            
-            json_data = json.loads(bytes_io.getvalue().decode('utf-8'))
-            
+            json_data = response.json()
             db_conn = sqlite3.connect(':memory:')
             cursor = db_conn.cursor()
+            
+            # Wahi table structure jo DatabaseHelper.kt ko chahiye
             cursor.execute('''CREATE TABLE IF NOT EXISTS symbols 
                              (token TEXT, symbol TEXT, name TEXT, expiry TEXT, 
                               strike TEXT, lotsize TEXT, instrumenttype TEXT, 
@@ -60,6 +56,7 @@ def refresh_supabase_master():
                  i.get('exch_seg'), i.get('tick_size'))
                 for i in json_data
             ]
+            
             cursor.executemany("INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?)", data_to_insert)
             db_conn.commit()
             
@@ -67,32 +64,26 @@ def refresh_supabase_master():
             for line in db_conn.iterdump():
                 db_dump.write(f'{line}\n'.encode('utf-8'))
             
-            # Upsert is important to overwrite old file
-            supabase.storage.from_(BUCKET_NAME).upload(
+            raw_data = db_dump.getvalue()
+            
+            # --- SUPABASE UPLOAD FIX ---
+            # Pehle delete karne ki koshish karenge ya upsert use karenge
+            try:
+                supabase.storage.from_(BUCKET_NAME).remove(["angel_master.db"])
+            except: pass
+            
+            res = supabase.storage.from_(BUCKET_NAME).upload(
                 path="angel_master.db", 
-                file=db_dump.getvalue(), 
+                file=raw_data, 
                 file_options={"x-upsert": "true", "content-type": "application/octet-stream"}
             )
+            
             db_conn.close()
-            print("✅ [Success] Supabase Master DB Updated!")
-        else:
-            print(f"❌ Download Failed: {response.status_code}")
+            print("✅ [Success] Supabase Master DB Re-Uploaded!")
     except Exception as e:
-        print(f"❌ Sync Error: {str(e)}")
+        print(f"❌ Supabase Sync Error: {str(e)}")
 
-# --- 3.1 DAILY SCHEDULER ---
-def daily_auto_update():
-    """Rozana subah 8:30 baje data refresh karne ke liye"""
-    while True:
-        now = datetime.datetime.now(IST)
-        # 08:30 AM check
-        if now.hour == 8 and now.minute == 30:
-            print("⏰ [Scheduled] Running daily morning sync...")
-            refresh_supabase_master()
-            time.sleep(70) # Skip this minute to avoid double trigger
-        eventlet.sleep(30) # Check every 30 seconds
-
-# --- 4. TICK ENGINE ---
+# --- 3. TICK ENGINE ---
 def on_data(wsapp, msg):
     global last_price_cache
     if isinstance(msg, dict) and 'token' in msg:
@@ -103,19 +94,18 @@ def on_data(wsapp, msg):
         if ltp > 0 and token in token_to_fb_keys:
             if last_price_cache.get(token) == ltp: return
             
-            now_time = datetime.datetime.now(IST).strftime("%H:%M:%S")
             updates = {}
+            now_time = datetime.datetime.now(IST).strftime("%H:%M:%S")
             for fb_key in token_to_fb_keys[token]:
                 path = f"central_watchlist/{fb_key}"
-                is_mcx = any(x in fb_key.upper() for x in ["MCX", "GOLD", "SILVER"])
-                fmt = "{:.4f}" if is_mcx else "{:.2f}"
-                updates[f"{path}/price"] = str(fmt.format(ltp))
+                # MCX aur Currency ke liye 4 decimal, baki 2
+                is_4_decimal = any(x in fb_key.upper() for x in ["MCX", "GOLD", "SILVER", "USDINR"])
+                updates[f"{path}/price"] = "{:.4f}".format(ltp) if is_4_decimal else "{:.2f}".format(ltp)
                 updates[f"{path}/utime"] = now_time
                 
-                if 'close' in msg and msg['close'] > 0:
+                if 'close' in msg and float(msg['close']) > 0:
                     cp = float(msg['close']) / 100
-                    p_chng = ((ltp - cp) / cp) * 100
-                    updates[f"{path}/pChange"] = "{:.2f}".format(p_chng)
+                    updates[f"{path}/pChange"] = "{:.2f}".format(((ltp - cp) / cp) * 100)
 
             if updates:
                 try: 
@@ -123,34 +113,51 @@ def on_data(wsapp, msg):
                     last_price_cache[token] = ltp
                 except: pass
 
-# --- 5. SYSTEM HANDLERS ---
-def login_and_connect():
-    global sws, is_ws_ready
+# --- 4. AUTO-SCHEDULE (8:30 AM - 12:00 AM) ---
+def manage_connection():
+    global sws, is_ws_ready, subscribed_tokens_set
     while True:
-        try:
-            print(f"🔄 [AUTH] Logging in: {CLIENT_CODE}")
-            smart_api = SmartConnect(api_key=API_KEY)
-            session = smart_api.generateSession(CLIENT_CODE, PWD, pyotp.TOTP(TOTP_STR).now())
-            if session.get('status'):
-                sws = SmartWebSocketV2(session['data']['jwtToken'], API_KEY, CLIENT_CODE, session['data']['feedToken'])
-                sws.on_data = on_data
-                sws.on_open = lambda ws: exec("global is_ws_ready; is_ws_ready=True; print('🟢 Market Engine Live')")
-                sws.on_close = lambda ws,c,r: exec("global is_ws_ready; is_ws_ready=False")
-                eventlet.spawn(sws.connect)
-                break
-        except Exception as e:
-            print(f"⚠️ Auth Failed: {e}")
-            eventlet.sleep(20)
+        now = datetime.datetime.now(IST)
+        # Market Time: 8:30 se 23:59 tak
+        is_market_hours = (now.hour > 8 or (now.hour == 8 and now.minute >= 30)) and (now.hour < 24)
+        
+        if is_market_hours:
+            if not is_ws_ready:
+                try:
+                    smart_api = SmartConnect(api_key=API_KEY)
+                    session = smart_api.generateSession(CLIENT_CODE, PWD, pyotp.TOTP(TOTP_STR).now())
+                    if session.get('status'):
+                        sws = SmartWebSocketV2(session['data']['jwtToken'], API_KEY, CLIENT_CODE, session['data']['feedToken'])
+                        sws.on_data = on_data
+                        sws.on_open = lambda ws: exec("global is_ws_ready; is_ws_ready=True; print('🟢 Market Live')")
+                        sws.on_close = lambda ws,c,r: exec("global is_ws_ready; is_ws_ready=False")
+                        eventlet.spawn(sws.connect)
+                        refresh_supabase_master() # Roz subah refresh
+                except Exception as e: print(f"⚠️ Login Failed: {e}")
+        else:
+            if is_ws_ready:
+                if sws: sws.close()
+                is_ws_ready = False
+                subscribed_tokens_set.clear()
+        eventlet.sleep(30)
 
+# --- 5. FNO & STOCKS WATCHLIST SYNC ---
 def sync_watchlist():
-    global token_to_fb_keys
+    global token_to_fb_keys, subscribed_tokens_set
+    last_refresh = time.time()
     while True:
         try:
             if is_ws_ready:
+                # Har 60 sec mein clear karke re-subscribe (Force Refresh)
+                if time.time() - last_refresh > 60:
+                    subscribed_tokens_set.clear()
+                    last_refresh = time.time()
+
                 full_data = db.reference('central_watchlist').get()
                 if full_data:
                     new_token_map = {}
-                    subscriptions = {1: [], 2: [], 5: []} 
+                    to_sub = {1: [], 2: [], 5: []} # 1:NSE, 2:FNO, 5:MCX
+                    
                     for fb_key, val in full_data.items():
                         token = str(val.get('token', ''))
                         exch = str(val.get('exch_seg', 'NSE')).upper()
@@ -159,33 +166,28 @@ def sync_watchlist():
                         if token not in new_token_map: new_token_map[token] = []
                         new_token_map[token].append(fb_key)
                         
-                        e_type = 5 if "MCX" in exch else (2 if any(x in exch for x in ["NFO", "FUT", "OPT"]) else 1)
-                        subscriptions[e_type].append(token)
+                        if token not in subscribed_tokens_set:
+                            # FNO (NFO/BFO) logic
+                            if any(x in exch for x in ["NFO", "BFO"]):
+                                etype = 2
+                            elif "MCX" in exch:
+                                etype = 5
+                            else:
+                                etype = 1
+                            to_sub[etype].append(token)
                     
                     token_to_fb_keys = new_token_map
-                    for etype, tokens in subscriptions.items():
+                    for etype, tokens in to_sub.items():
                         if tokens:
                             for i in range(0, len(tokens), 50):
-                                sws.subscribe("myt_task", 1, [{"exchangeType": etype, "tokens": tokens[i:i+50]}])
-            eventlet.sleep(60)
-        except Exception as e:
-            eventlet.sleep(10)
+                                batch = tokens[i:i+50]
+                                sws.subscribe("myt_task", 1, [{"exchangeType": etype, "tokens": batch}])
+                                for t in batch: subscribed_tokens_set.add(t)
+            eventlet.sleep(1)
+        except: eventlet.sleep(5)
 
-def simple_app(environ, start_response):
-    start_response('200 OK', [('Content-Type', 'text/plain')])
-    return [b"ENGINE_STABLE"]
-
-# --- 6. MAIN EXECUTION ---
 if __name__ == '__main__':
-    # Ek baar startup par update karega
-    refresh_supabase_master()
-    
-    # Background threads chalu karein
-    eventlet.spawn(daily_auto_update) # Scheduler chalu
-    eventlet.spawn(login_and_connect)
+    eventlet.spawn(manage_connection)
     eventlet.spawn(sync_watchlist)
-    
-    # Render binding
     from eventlet import wsgi
-    port = int(os.environ.get("PORT", 10000))
-    wsgi.server(eventlet.listen(('0.0.0.0', port)), simple_app)
+    wsgi.server(eventlet.listen(('0.0.0.0', int(os.environ.get("PORT", 10000)))), lambda e,s: [b"ENGINE_STABLE"])
