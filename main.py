@@ -16,8 +16,6 @@ IST = pytz.timezone('Asia/Kolkata')
 SUPABASE_URL = "https://tnrhlvibaeiwhlrxdxnm.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRucmhsdmliYWVpd2hscnhkeG5tIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjY0NzQ0NywiZXhwIjoyMDg4MjIzNDQ3fQ.epYmt7sxhZRhEQWoj0doCHAbfOTHOjSurBbLss5a4Pk"
 BUCKET_NAME = "Myt"
-
-# Redis Config with Keep-Alive parameters
 REDIS_URL = "rediss://default:ATjsAAIncDFiOTVlY2RlNDI1ODk0MDI4YmRiMmE2Yzg0Y2RkM2RkZHAxMTQ1NzI@quick-narwhal-14572.upstash.io:6379"
 
 # Global State
@@ -27,9 +25,20 @@ is_ws_ready = False
 last_master_update_date = None
 loop = None
 
+# Segment Mapping for Angel One
+# 1: NSE, 2: NSEFO, 3: BSE, 4: BSEFO, 5: MCX, 7: NCDEX
+EXCHANGE_MAP = {
+    "NSE": 1,
+    "NFO": 2,
+    "BSE": 3,
+    "BFO": 4,
+    "MCX": 5,
+    "NCDEX": 7
+}
+
 # --- 2. MASTER DATA SYNC ---
 def refresh_supabase_master():
-    print(f"🔄 [System] Overwriting Master Data on Supabase...")
+    print(f"🔄 [System] Syncing Multi-Segment Master Data...")
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
@@ -42,7 +51,6 @@ def refresh_supabase_master():
             conn = sqlite3.connect(temp_path)
             cursor = conn.cursor()
             cursor.execute("DROP TABLE IF EXISTS symbols")
-            # Matches your DatabaseHelper.kt columns [cite: 2026-03-06]
             cursor.execute('''CREATE TABLE symbols (token TEXT, symbol TEXT, name TEXT, expiry TEXT, 
                              strike TEXT, lotsize TEXT, instrumenttype TEXT, exch_seg TEXT, tick_size TEXT)''')
             
@@ -55,16 +63,13 @@ def refresh_supabase_master():
             conn.close()
             
             with open(temp_path, "rb") as f:
-                supabase.storage.from_(BUCKET_NAME).upload(
-                    path="angel_master.db", 
-                    file=f.read(), 
-                    file_options={"x-upsert": "true", "content-type": "application/octet-stream"}
-                )
+                supabase.storage.from_(BUCKET_NAME).upload(path="angel_master.db", file=f.read(), 
+                                                         file_options={"x-upsert": "true", "content-type": "application/octet-stream"})
             os.remove(temp_path)
-            print("✅ [Success] Master DB Overwritten.")
+            print("✅ [Success] All Segments Synced to Supabase.")
             return True
     except Exception as e:
-        print(f"❌ Master Error: {e}")
+        print(f"❌ Master Sync Error: {e}")
         return False
 
 # --- 3. TICK ENGINE ---
@@ -72,10 +77,15 @@ def on_data(wsapp, msg):
     if isinstance(msg, dict) and 'token' in msg:
         token = str(msg.get('token'))
         ltp_raw = msg.get('last_traded_price') or msg.get('ltp', 0)
+        # Note: MCX/NFO LTP are usually already in correct units but closed prices might need /100
         ltp = float(ltp_raw) / 100
         
         if ltp > 0:
-            tick_data = {"t": token, "p": "{:.2f}".format(ltp), "c": "{:.2f}".format(float(msg.get('close', 0)) / 100) if 'close' in msg else "0.00"}
+            tick_data = {
+                "t": token,
+                "p": "{:.2f}".format(ltp),
+                "c": "{:.2f}".format(float(msg.get('close', 0)) / 100) if 'close' in msg else "0.00"
+            }
             if redis_client and loop:
                 asyncio.run_coroutine_threadsafe(redis_client.publish("live_ticks", json.dumps(tick_data)), loop)
 
@@ -84,14 +94,7 @@ def on_data(wsapp, msg):
 async def lifespan(app: FastAPI):
     global redis_client, loop
     loop = asyncio.get_running_loop()
-    # Improved Redis connection with health checks
-    redis_client = aioredis.from_url(
-        REDIS_URL, 
-        decode_responses=True, 
-        socket_timeout=15, 
-        socket_keepalive=True,
-        retry_on_timeout=True
-    )
+    redis_client = aioredis.from_url(REDIS_URL, decode_responses=True, socket_timeout=15, socket_keepalive=True, retry_on_timeout=True)
     asyncio.create_task(manage_connection_loop())
     yield
     if sws: sws.close()
@@ -102,9 +105,8 @@ app = FastAPI(lifespan=lifespan)
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    print("📱 Android Client Connected")
+    print("📱 Android Connected")
     
-    # Use a dedicated pubsub connection to prevent timeout interference
     async with redis_client.pubsub() as pubsub:
         await pubsub.subscribe("live_ticks")
         
@@ -114,10 +116,19 @@ async def websocket_endpoint(websocket: WebSocket):
                 while True:
                     data = await websocket.receive_text()
                     msg = json.loads(data)
+                    # Android should send: {"action": "subscribe", "seg": "NSE", "tokens": ["10634"]}
+                    # Valid seg: NSE, NFO, BSE, BFO, MCX
                     if msg.get("action") == "subscribe" and sws:
-                        tokens_list = [{"exchangeType": msg["exch"], "tokens": msg["tokens"]}]
-                        sws.subscribe(str(int(time.time())), 1, tokens_list)
-            except: pass
+                        seg_name = msg.get("seg", "NSE")
+                        exch_type = EXCHANGE_MAP.get(seg_name, 1)
+                        tokens = msg.get("tokens", [])
+                        
+                        if tokens:
+                            correlation_id = f"sub_{int(time.time())}"
+                            sws.subscribe(correlation_id, 1, [{"exchangeType": exch_type, "tokens": tokens}])
+                            print(f"📥 Subscribed {seg_name} (Type {exch_type}): {tokens}")
+            except Exception as e:
+                print(f"WS Receiver Error: {e}")
 
         asyncio.create_task(receive_from_android())
 
@@ -127,8 +138,6 @@ async def websocket_endpoint(websocket: WebSocket):
                     await websocket.send_text(message["data"])
         except WebSocketDisconnect:
             print("📱 Android Disconnected")
-        except Exception as e:
-            print(f"⚠️ WS Stream Error: {e}")
         finally:
             await pubsub.unsubscribe("live_ticks")
 
@@ -142,7 +151,6 @@ async def manage_connection_loop():
         if now.hour == 8 and 30 <= now.minute <= 50 and last_master_update_date != now.date():
             if refresh_supabase_master(): last_master_update_date = now.date()
 
-        # Angel SmartAPI Session Management
         if 8 <= now.hour < 24:
             if not is_ws_ready:
                 try:
@@ -151,15 +159,16 @@ async def manage_connection_loop():
                     if session.get('status'):
                         sws = SmartWebSocketV2(session['data']['jwtToken'], API_KEY, CLIENT_CODE, session['data']['feedToken'])
                         sws.on_data = on_data
-                        sws.on_open = lambda ws: print("🟢 Angel WebSocket Live")
-                        sws.on_close = lambda ws,c,r: print("🔴 Angel WebSocket Closed")
+                        sws.on_open = lambda ws: print("🟢 Angel Multi-Segment Live")
+                        sws.on_close = lambda ws,c,r: print("🔴 Angel Connection Closed")
                         
                         threading.Thread(target=sws.connect, daemon=True).start()
                         is_ws_ready = True
                         
                         await asyncio.sleep(5)
-                        # Default startup: Nifty & BankNifty
-                        sws.subscribe("startup", 1, [{"exchangeType": 1, "tokens": ["26000", "26009"]}])
+                        # Startup Subscriptions for different segments
+                        sws.subscribe("start_nse", 1, [{"exchangeType": 1, "tokens": ["26000", "26009"]}]) # Nifty/BankNifty
+                        sws.subscribe("start_mcx", 1, [{"exchangeType": 5, "tokens": ["234316"]}]) # Gold
                 except Exception as e: print(f"❌ Conn Error: {e}")
         else:
             if is_ws_ready:
@@ -170,5 +179,4 @@ async def manage_connection_loop():
 
 if __name__ == '__main__':
     import uvicorn
-    # Render binds to port 10000 by default
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
