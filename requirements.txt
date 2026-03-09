@@ -12,3 +12,4 @@ logzero
 firebase-admin
 pytz
 supabase
+redis
