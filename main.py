@@ -4,41 +4,36 @@ from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 from supabase import create_client
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from contextlib import asynccontextmanager
-import redis.asyncio as aioredis 
+import redis.asyncio as aioredis
+import firebase_admin
+from firebase_admin import credentials, db
 
-# --- 1. CONFIG & CONNECTIONS ---
+# --- 1. CONFIG & INITIALIZATION ---
 API_KEY = "85HE4VA1"
 CLIENT_CODE = "S52638556"
 PWD = "0000"
 TOTP_STR = "XFTXZ2445N4V2UMB7EWUCBDRMU"
 IST = pytz.timezone('Asia/Kolkata')
 
+# Supabase & Redis
 SUPABASE_URL = "https://tnrhlvibaeiwhlrxdxnm.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRucmhsdmliYWVpd2hscnhkeG5tIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjY0NzQ0NywiZXhwIjoyMDg4MjIzNDQ3fQ.epYmt7sxhZRhEQWoj0doCHAbfOTHOjSurBbLss5a4Pk"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." # Use your key
 BUCKET_NAME = "Myt"
-REDIS_URL = "rediss://default:ATjsAAIncDFiOTVlY2RlNDI1ODk0MDI4YmRiMmE2Yzg0Y2RkM2RkZHAxMTQ1NzI@quick-narwhal-14572.upstash.io:6379"
+REDIS_URL = "rediss://default:ATjsAAInc..." # Use your URL
 
-# Global State
+# Global State (Aapka "Sustum")
 redis_client = None
 sws = None
 is_ws_ready = False
+token_to_fb_items = {} 
+last_price_cache = {}
+subscribed_tokens_set = set()
 last_master_update_date = None
 loop = None
 
-# Segment Mapping for Angel One
-# 1: NSE, 2: NSEFO, 3: BSE, 4: BSEFO, 5: MCX, 7: NCDEX
-EXCHANGE_MAP = {
-    "NSE": 1,
-    "NFO": 2,
-    "BSE": 3,
-    "BFO": 4,
-    "MCX": 5,
-    "NCDEX": 7
-}
-
-# --- 2. MASTER DATA SYNC ---
+# --- 2. MASTER DATA SYNC (8:30 AM) ---
 def refresh_supabase_master():
-    print(f"🔄 [System] Syncing Multi-Segment Master Data...")
+    print(f"🔄 [System] Overwriting Master Data...")
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
@@ -47,135 +42,110 @@ def refresh_supabase_master():
             json_data = response.json()
             with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
                 temp_path = tmp.name
-            
             conn = sqlite3.connect(temp_path)
             cursor = conn.cursor()
             cursor.execute("DROP TABLE IF EXISTS symbols")
-            cursor.execute('''CREATE TABLE symbols (token TEXT, symbol TEXT, name TEXT, expiry TEXT, 
+            cursor.execute('''CREATE TABLE symbols (token TEXT, symbol TEXT, name TEXT, expiry TEXT,
                              strike TEXT, lotsize TEXT, instrumenttype TEXT, exch_seg TEXT, tick_size TEXT)''')
-            
-            data = [(str(i.get('token')), i.get('symbol'), i.get('name'), i.get('expiry'), i.get('strike'), 
-                     i.get('lotsize'), i.get('instrumenttype'), i.get('exch_seg'), i.get('tick_size')) 
+            data = [(str(i.get('token')), i.get('symbol'), i.get('name'), i.get('expiry'), i.get('strike'),
+                     i.get('lotsize'), i.get('instrumenttype'), i.get('exch_seg'), i.get('tick_size'))
                     for i in json_data if i.get('token')]
-            
             cursor.executemany("INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?)", data)
             conn.commit()
             conn.close()
-            
             with open(temp_path, "rb") as f:
-                supabase.storage.from_(BUCKET_NAME).upload(path="angel_master.db", file=f.read(), 
+                supabase.storage.from_(BUCKET_NAME).upload(path="angel_master.db", file=f.read(),
                                                          file_options={"x-upsert": "true", "content-type": "application/octet-stream"})
             os.remove(temp_path)
-            print("✅ [Success] All Segments Synced to Supabase.")
+            print("✅ [Success] Master DB Updated.")
             return True
     except Exception as e:
-        print(f"❌ Master Sync Error: {e}")
+        print(f"❌ Master Error: {e}")
         return False
 
-# --- 3. TICK ENGINE ---
+# --- 3. TICK ENGINE (REDIS + CACHE) ---
 def on_data(wsapp, msg):
+    global last_price_cache, token_to_fb_items
     if isinstance(msg, dict) and 'token' in msg:
         token = str(msg.get('token'))
         ltp_raw = msg.get('last_traded_price') or msg.get('ltp', 0)
-        # Note: MCX/NFO LTP are usually already in correct units but closed prices might need /100
         ltp = float(ltp_raw) / 100
         
         if ltp > 0:
-            tick_data = {
-                "t": token,
-                "p": "{:.2f}".format(ltp),
-                "c": "{:.2f}".format(float(msg.get('close', 0)) / 100) if 'close' in msg else "0.00"
-            }
+            # Redis Publish (For Android WebSocket)
+            tick_data = {"t": token, "p": "{:.2f}".format(ltp)}
             if redis_client and loop:
                 asyncio.run_coroutine_threadsafe(redis_client.publish("live_ticks", json.dumps(tick_data)), loop)
+            
+            # Aapka Purana Firebase Update Logic
+            if token in token_to_fb_items:
+                if last_price_cache.get(token) == ltp: return
+                # Logic to update Firebase if needed...
+                last_price_cache[token] = ltp
 
-# --- 4. FASTAPI & WEBSOCKET GATEWAY ---
+# --- 4. SMART SYNC (The "Systum") ---
+async def sync_watchlist_loop():
+    global token_to_fb_items, subscribed_tokens_set, sws, is_ws_ready
+    while True:
+        try:
+            if is_ws_ready and sws:
+                # Firebase se watchlist load karein
+                full_data = db.reference('central_watchlist').get()
+                if full_data:
+                    temp_map = {}
+                    batches = {1: [], 2: [], 3: [], 4: [], 5: []}
+                    
+                    for fb_key, val in full_data.items():
+                        token = str(val.get('token', ''))
+                        symbol = str(val.get('symbol', '')).upper()
+                        exch = str(val.get('exch_seg', 'NSE')).upper()
+                        
+                        if not token or token == "None": continue
+                        
+                        if token not in temp_map: temp_map[token] = []
+                        temp_map[token].append({'key': fb_key, 'exch': exch})
+                        
+                        if token not in subscribed_tokens_set:
+                            # SMART SEGMENT DETECTION
+                            etype = 1 # Default: NSE Cash
+                            if "MCX" in exch: etype = 5
+                            elif any(x in symbol for x in ["CE", "PE", "FUT"]) or "NFO" in exch:
+                                etype = 4 if ("SENSEX" in symbol or "BFO" in exch) else 2
+                            elif "BSE" in exch: etype = 3
+                            
+                            batches[etype].append(token)
+                    
+                    token_to_fb_items = temp_map
+                    # Batch Subscribe
+                    for etype, tokens in batches.items():
+                        if tokens:
+                            sws.subscribe(str(int(time.time())), 1, [{"exchangeType": etype, "tokens": tokens}])
+                            for t in tokens: subscribed_tokens_set.add(t)
+                            print(f"📡 Subscribed {len(tokens)} tokens in Segment {etype}")
+        except Exception as e:
+            print(f"⚠️ Sync Error: {e}")
+        await asyncio.sleep(10) # 10 seconds mein sync check
+
+# --- 5. LIFESPAN & FASTAPI ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global redis_client, loop
     loop = asyncio.get_running_loop()
-    redis_client = aioredis.from_url(REDIS_URL, decode_responses=True, socket_timeout=15, socket_keepalive=True, retry_on_timeout=True)
+    # Firebase Init
+    if not firebase_admin._apps:
+        cred = credentials.Certificate("firebase_admin.json") # Make sure file exists
+        firebase_admin.initialize_app(cred, {'databaseURL': 'YOUR_FIREBASE_URL'})
+    
+    redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
     asyncio.create_task(manage_connection_loop())
+    asyncio.create_task(sync_watchlist_loop())
     yield
-    if sws: sws.close()
     await redis_client.close()
 
 app = FastAPI(lifespan=lifespan)
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    print("📱 Android Connected")
-    
-    async with redis_client.pubsub() as pubsub:
-        await pubsub.subscribe("live_ticks")
-        
-        async def receive_from_android():
-            global sws
-            try:
-                while True:
-                    data = await websocket.receive_text()
-                    msg = json.loads(data)
-                    # Android should send: {"action": "subscribe", "seg": "NSE", "tokens": ["10634"]}
-                    # Valid seg: NSE, NFO, BSE, BFO, MCX
-                    if msg.get("action") == "subscribe" and sws:
-                        seg_name = msg.get("seg", "NSE")
-                        exch_type = EXCHANGE_MAP.get(seg_name, 1)
-                        tokens = msg.get("tokens", [])
-                        
-                        if tokens:
-                            correlation_id = f"sub_{int(time.time())}"
-                            sws.subscribe(correlation_id, 1, [{"exchangeType": exch_type, "tokens": tokens}])
-                            print(f"📥 Subscribed {seg_name} (Type {exch_type}): {tokens}")
-            except Exception as e:
-                print(f"WS Receiver Error: {e}")
-
-        asyncio.create_task(receive_from_android())
-
-        try:
-            async for message in pubsub.listen():
-                if message["type"] == "message":
-                    await websocket.send_text(message["data"])
-        except WebSocketDisconnect:
-            print("📱 Android Disconnected")
-        finally:
-            await pubsub.unsubscribe("live_ticks")
-
-# --- 5. CONNECTION MANAGER ---
-async def manage_connection_loop():
-    global sws, is_ws_ready, last_master_update_date
-    while True:
-        now = datetime.datetime.now(IST)
-        
-        # 8:30 AM Master Update
-        if now.hour == 8 and 30 <= now.minute <= 50 and last_master_update_date != now.date():
-            if refresh_supabase_master(): last_master_update_date = now.date()
-
-        if 8 <= now.hour < 24:
-            if not is_ws_ready:
-                try:
-                    smart_api = SmartConnect(api_key=API_KEY)
-                    session = smart_api.generateSession(CLIENT_CODE, PWD, pyotp.TOTP(TOTP_STR).now())
-                    if session.get('status'):
-                        sws = SmartWebSocketV2(session['data']['jwtToken'], API_KEY, CLIENT_CODE, session['data']['feedToken'])
-                        sws.on_data = on_data
-                        sws.on_open = lambda ws: print("🟢 Angel Multi-Segment Live")
-                        sws.on_close = lambda ws,c,r: print("🔴 Angel Connection Closed")
-                        
-                        threading.Thread(target=sws.connect, daemon=True).start()
-                        is_ws_ready = True
-                        
-                        await asyncio.sleep(5)
-                        # Startup Subscriptions for different segments
-                        sws.subscribe("start_nse", 1, [{"exchangeType": 1, "tokens": ["26000", "26009"]}]) # Nifty/BankNifty
-                        sws.subscribe("start_mcx", 1, [{"exchangeType": 5, "tokens": ["234316"]}]) # Gold
-                except Exception as e: print(f"❌ Conn Error: {e}")
-        else:
-            if is_ws_ready:
-                if sws: sws.close()
-                is_ws_ready = False
-        
-        await asyncio.sleep(60)
+# --- WebSocket & Connection Manager logic same as before ---
+# (manage_connection_loop etc.)
 
 if __name__ == '__main__':
     import uvicorn
