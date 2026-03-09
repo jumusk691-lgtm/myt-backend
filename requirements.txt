@@ -1,3 +1,4 @@
+flask
 ‎python-socketio>=5.11.0
 ‎python-engineio>=4.8.0
 ‎eventlet==0.33.3
