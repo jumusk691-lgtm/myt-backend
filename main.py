@@ -27,64 +27,50 @@ BUCKET_NAME = "Myt"
 # --- GLOBAL STATE ---
 sws = None
 is_ws_ready = False
-token_to_fb_keys = {} 
+token_to_fb_items = {} # Store both key and exch_seg
 last_price_cache = {} 
 subscribed_tokens_set = set()
 
-# --- 2. MASTER DATA SYNC (FIXED TABLE & UPLOAD) ---
+# --- 2. MASTER DATA SYNC (UNCHANGED) ---
 def refresh_supabase_master():
     print(f"🔄 [System] Syncing Master Data...")
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
         response = requests.get(url, timeout=60)
-        
         if response.status_code == 200:
             json_data = response.json()
-            
-            # Temporary file banana corruption se bachne ke liye
             with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
                 temp_path = tmp.name
-            
             db_conn = sqlite3.connect(temp_path)
             cursor = db_conn.cursor()
-            
-            # Match with DatabaseHelper.kt
             cursor.execute("DROP TABLE IF EXISTS symbols")
             cursor.execute('''CREATE TABLE symbols 
                              (token TEXT, symbol TEXT, name TEXT, expiry TEXT, 
                               strike TEXT, lotsize TEXT, instrumenttype TEXT, 
                               exch_seg TEXT, tick_size TEXT)''')
-            
             data_to_insert = [
                 (str(i.get('token')), i.get('symbol'), i.get('name'), i.get('expiry'), 
                  i.get('strike'), i.get('lotsize'), i.get('instrumenttype'), 
                  i.get('exch_seg'), i.get('tick_size'))
                 for i in json_data if i.get('token')
             ]
-            
             cursor.executemany("INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?)", data_to_insert)
             db_conn.commit()
             db_conn.close()
-            
-            # Supabase Upload
             with open(temp_path, "rb") as f:
                 raw_data = f.read()
-                try:
-                    supabase.storage.from_(BUCKET_NAME).remove(["angel_master.db"])
+                try: supabase.storage.from_(BUCKET_NAME).remove(["angel_master.db"])
                 except: pass
                 supabase.storage.from_(BUCKET_NAME).upload(
-                    path="angel_master.db", 
-                    file=raw_data, 
+                    path="angel_master.db", file=raw_data, 
                     file_options={"x-upsert": "true", "content-type": "application/octet-stream"}
                 )
-            
             os.remove(temp_path)
-            print("✅ [Success] Master DB is now VALID and Uploaded!")
-    except Exception as e:
-        print(f"❌ Master Sync Error: {str(e)}")
+            print("✅ [Success] Master DB Updated!")
+    except Exception as e: print(f"❌ Master Sync Error: {e}")
 
-# --- 3. TICK ENGINE (Price Update Fix) ---
+# --- 3. TICK ENGINE (Fixed for New Unique Keys) ---
 def on_data(wsapp, msg):
     global last_price_cache
     if isinstance(msg, dict) and 'token' in msg:
@@ -92,22 +78,28 @@ def on_data(wsapp, msg):
         ltp_raw = msg.get('last_traded_price') or msg.get('ltp', 0)
         ltp = float(ltp_raw) / 100
         
-        if ltp > 0 and token in token_to_fb_keys:
+        if ltp > 0 and token in token_to_fb_items:
             if last_price_cache.get(token) == ltp: return
             
             updates = {}
             now_time = datetime.datetime.now(IST).strftime("%H:%M:%S")
-            for fb_key in token_to_fb_keys[token]:
+            
+            # Har user ki watchlist item ke liye update prepare karein
+            for item in token_to_fb_items[token]:
+                fb_key = item['key']
+                exch = item['exch']
                 path = f"central_watchlist/{fb_key}"
                 
-                # Format: MCX/Currency 4 decimal, Others 2 decimal
-                is_4_decimal = any(x in fb_key.upper() for x in ["MCX", "GOLD", "SILVER", "USDINR"])
-                updates[f"{path}/price"] = "{:.4f}".format(ltp) if is_4_decimal else "{:.2f}".format(ltp)
+                # Check 4 decimal segments (MCX, Currency, etc.)
+                is_4_dec = any(x in exch.upper() for x in ["MCX", "CDS", "FOREX", "BINANCE", "CRYPTO"])
+                
+                updates[f"{path}/price"] = "{:.4f}".format(ltp) if is_4_dec else "{:.2f}".format(ltp)
                 updates[f"{path}/utime"] = now_time
                 
                 if 'close' in msg and float(msg['close']) > 0:
                     cp = float(msg['close']) / 100
-                    updates[f"{path}/pChange"] = "{:.2f}".format(((ltp - cp) / cp) * 100)
+                    p_chg = ((ltp - cp) / cp) * 100
+                    updates[f"{path}/pChange"] = "{:.2f}".format(p_chg)
 
             if updates:
                 try: 
@@ -120,13 +112,15 @@ def manage_connection():
     global sws, is_ws_ready
     while True:
         now = datetime.datetime.now(IST)
+        # Full day tracking for MCX/Forex
         is_market_hours = (now.hour >= 8 and now.hour < 24)
         
         if is_market_hours:
             if not is_ws_ready:
                 try:
                     smart_api = SmartConnect(api_key=API_KEY)
-                    session = smart_api.generateSession(CLIENT_CODE, PWD, pyotp.TOTP(TOTP_STR).now())
+                    otp = pyotp.TOTP(TOTP_STR).now()
+                    session = smart_api.generateSession(CLIENT_CODE, PWD, otp)
                     if session.get('status'):
                         sws = SmartWebSocketV2(session['data']['jwtToken'], API_KEY, CLIENT_CODE, session['data']['feedToken'])
                         sws.on_data = on_data
@@ -141,9 +135,9 @@ def manage_connection():
                 is_ws_ready = False
         eventlet.sleep(60)
 
-# --- 5. SYNC WATCHLIST ---
+# --- 5. SYNC WATCHLIST (Fixed for Multi-User & Batch) ---
 def sync_watchlist():
-    global token_to_fb_keys, subscribed_tokens_set
+    global token_to_fb_items, subscribed_tokens_set
     while True:
         try:
             if is_ws_ready:
@@ -157,20 +151,29 @@ def sync_watchlist():
                         exch = str(val.get('exch_seg', 'NSE')).upper()
                         if not token or token == "None": continue
                         
+                        # Store as list because same token can have multiple keys (for different users)
                         if token not in new_token_map: new_token_map[token] = []
-                        new_token_map[token].append(fb_key)
+                        new_token_map[token].append({'key': fb_key, 'exch': exch})
                         
                         if token not in subscribed_tokens_set:
+                            # Exchange Type logic: NFO/BFO=2, MCX=5, NSE/BSE=1
                             etype = 2 if any(x in exch for x in ["NFO", "BFO"]) else (5 if "MCX" in exch else 1)
                             to_sub[etype].append(token)
                     
-                    token_to_fb_keys = new_token_map
+                    token_to_fb_items = new_token_map
+                    
+                    # Batch subscribe (max 50 per call to avoid API errors)
                     for etype, tokens in to_sub.items():
                         if tokens:
-                            sws.subscribe("myt_task", 1, [{"exchangeType": etype, "tokens": tokens[:50]}])
-                            for t in tokens: subscribed_tokens_set.add(t)
-            eventlet.sleep(5)
-        except: eventlet.sleep(10)
+                            for i in range(0, len(tokens), 50):
+                                batch = tokens[i:i+50]
+                                sws.subscribe("myt_task", 1, [{"exchangeType": etype, "tokens": batch}])
+                                for t in batch: subscribed_tokens_set.add(t)
+                                print(f"📡 Subscribed {len(batch)} tokens in Etype {etype}")
+            eventlet.sleep(7)
+        except Exception as e:
+            print(f"Sync Watchlist Error: {e}")
+            eventlet.sleep(10)
 
 if __name__ == '__main__':
     eventlet.spawn(manage_connection)
