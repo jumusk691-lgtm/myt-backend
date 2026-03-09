@@ -1,36 +1,37 @@
 import eventlet
 eventlet.monkey_patch(all=True)
-import os, pyotp, time, datetime, firebase_admin, pytz, requests, sqlite3, tempfile
-from firebase_admin import credentials, db
+import os, pyotp, time, datetime, pytz, requests, sqlite3, tempfile, json, redis, asyncio
 from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 from supabase import create_client
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
-# --- 1. CONFIG & FIREBASE SETUP ---
+# --- 1. CONFIG & CONNECTIONS ---
 API_KEY = "85HE4VA1"
 CLIENT_CODE = "S52638556"
 PWD = "0000"
 TOTP_STR = "XFTXZ2445N4V2UMB7EWUCBDRMU"
 IST = pytz.timezone('Asia/Kolkata')
+
+# Supabase Config
 SUPABASE_URL = "https://tnrhlvibaeiwhlrxdxnm.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRucmhsdmliYWVpd2hscnhkeG5tIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjY0NzQ0NywiZXhwIjoyMDg4MjIzNDQ3fQ.epYmt7sxhZRhEQWoj0doCHAbfOTHOjSurBbLss5a4Pk"
 BUCKET_NAME = "Myt"
 
-if not firebase_admin._apps:
-    cred = credentials.Certificate("trade-f600a-firebase-adminsdk-fbsvc-269ab50c0c.json")
-    firebase_admin.initialize_app(cred, {'databaseURL': 'https://trade-f600a-default-rtdb.firebaseio.com/'})
+# Redis Connection (Direct Mixed URL)
+REDIS_URL = "rediss://default:ATjsAAIncDFiOTVlY2RlNDI1ODk0MDI4YmRiMmE2Yzg0Y2RkM2RkZHAxMTQ1NzI@quick-narwhal-14572.upstash.io:6379"
+r = redis.from_url(REDIS_URL, decode_responses=True)
+
+app = FastAPI()
 
 # --- GLOBAL STATE ---
 sws = None
 is_ws_ready = False
-token_to_fb_items = {} 
-last_price_cache = {} 
-subscribed_tokens_set = set() 
-last_master_update_date = None 
+last_master_update_date = None
 
-# --- 2. MASTER DATA SYNC (AUTO-OVERWRITE AT 8:30 AM) ---
+# --- 2. MASTER DATA SYNC (SUPABASE) ---
 def refresh_supabase_master():
-    print(f"🔄 [System] Overwriting Master Data...")
+    print(f"🔄 [System] Overwriting Master Data on Supabase...")
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
@@ -54,42 +55,53 @@ def refresh_supabase_master():
                 supabase.storage.from_(BUCKET_NAME).upload(path="angel_master.db", file=f.read(), 
                                                          file_options={"x-upsert": "true", "content-type": "application/octet-stream"})
             os.remove(temp_path)
-            print("✅ [Success] Master DB Overwritten.")
+            print("✅ [Success] Master DB Overwritten on Supabase.")
             return True
     except Exception as e:
         print(f"❌ Master Error: {e}")
         return False
 
-# --- 3. TICK ENGINE ---
+# --- 3. TICK ENGINE (REDIS PUBLISH) ---
 def on_data(wsapp, msg):
-    global last_price_cache
     if isinstance(msg, dict) and 'token' in msg:
         token = str(msg.get('token'))
         ltp_raw = msg.get('last_traded_price') or msg.get('ltp', 0)
         ltp = float(ltp_raw) / 100
-        if ltp > 0 and token in token_to_fb_items:
-            if last_price_cache.get(token) == ltp: return
-            updates = {}
-            now_time = datetime.datetime.now(IST).strftime("%H:%M:%S")
-            for item in token_to_fb_items[token]:
-                path = f"central_watchlist/{item['key']}"
-                is_4_dec = any(x in item['exch'].upper() for x in ["MCX", "CDS"])
-                updates[f"{path}/price"] = "{:.4f}".format(ltp) if is_4_dec else "{:.2f}".format(ltp)
-                updates[f"{path}/utime"] = now_time
-                if 'close' in msg and float(msg['close']) > 0:
-                    cp = float(msg['close']) / 100
-                    updates[f"{path}/pChange"] = "{:.2f}".format(((ltp - cp) / cp) * 100)
-            if updates:
-                try: db.reference().update(updates); last_price_cache[token] = ltp
-                except: pass
+        
+        if ltp > 0:
+            # Data Packet for Android
+            tick_data = {
+                "t": token,
+                "p": "{:.2f}".format(ltp),
+                "c": "{:.2f}".format(float(msg.get('close', 0)) / 100) if 'close' in msg else "0.00"
+            }
+            # Redis Channel mein phenk do
+            r.publish("live_ticks", json.dumps(tick_data))
 
-# --- 4. CONNECTION MANAGER ---
+# --- 4. WEBSOCKET GATEWAY ---
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    pubsub = r.pubsub()
+    pubsub.subscribe("live_ticks")
+    try:
+        while True:
+            message = pubsub.get_message()
+            if message and message['type'] == 'message':
+                await websocket.send_text(message['data'])
+            await asyncio.sleep(0.01) 
+    except WebSocketDisconnect:
+        pubsub.unsubscribe("live_ticks")
+
+# --- 5. CONNECTION MANAGER ---
 def manage_connection():
-    global sws, is_ws_ready, subscribed_tokens_set, last_master_update_date
+    global sws, is_ws_ready, last_master_update_date
     while True:
         now = datetime.datetime.now(IST)
+        # 8:30 AM Master Data Sync
         if now.hour == 8 and 30 <= now.minute <= 59 and last_master_update_date != now.date():
             if refresh_supabase_master(): last_master_update_date = now.date()
+            
         if 8 <= now.hour < 24:
             if not is_ws_ready:
                 try:
@@ -98,52 +110,29 @@ def manage_connection():
                     if session.get('status'):
                         sws = SmartWebSocketV2(session['data']['jwtToken'], API_KEY, CLIENT_CODE, session['data']['feedToken'])
                         sws.on_data = on_data
-                        sws.on_open = lambda ws: exec("global is_ws_ready; is_ws_ready=True; print('🟢 WebSocket Live')")
+                        sws.on_open = lambda ws: exec("global is_ws_ready; is_ws_ready=True; print('🟢 Angel WebSocket Live')")
                         sws.on_close = lambda ws,c,r: exec("global is_ws_ready; is_ws_ready=False")
                         eventlet.spawn(sws.connect)
                 except: pass
         else:
             if is_ws_ready:
                 if sws: sws.close()
-                is_ws_ready = False; subscribed_tokens_set.clear()
+                is_ws_ready = False
         eventlet.sleep(60)
 
-# --- 5. SMART SYNC (FIXES SEGMENT ERRORS) ---
-def sync_watchlist():
-    global token_to_fb_items, subscribed_tokens_set
+# Yahan aap permanent tokens subscribe kar sakte hain
+def auto_subscribe():
+    global is_ws_ready, sws
     while True:
-        try:
-            if is_ws_ready and sws:
-                full_data = db.reference('central_watchlist').get()
-                if full_data:
-                    temp_map = {}
-                    batches = {1: [], 2: [], 3: [], 4: [], 5: []}
-                    for fb_key, val in full_data.items():
-                        token = str(val.get('token', ''))
-                        symbol = str(val.get('symbol', '')).upper()
-                        exch = str(val.get('exch_seg', 'NSE')).upper()
-                        if not token or token == "None": continue
-                        if token not in temp_map: temp_map[token] = []
-                        temp_map[token].append({'key': fb_key, 'exch': exch})
-                        if token not in subscribed_tokens_set:
-                            etype = 1 # NSE Cash
-                            if "MCX" in exch: etype = 5
-                            elif any(x in symbol for x in ["CE", "PE", "FUT"]) or "NFO" in exch:
-                                etype = 4 if "SENSEX" in symbol or "BFO" in exch else 2
-                            elif "BSE" in exch: etype = 3
-                            batches[etype].append(token)
-                    token_to_fb_items = temp_map
-                    for etype, tokens in batches.items():
-                        if tokens:
-                            for i in range(0, len(tokens), 50):
-                                b = tokens[i:i+50]
-                                sws.subscribe("myt", 1, [{"exchangeType": etype, "tokens": b}])
-                                for t in b: subscribed_tokens_set.add(t)
-                                print(f"📡 Subscribed: {len(b)} tokens in Etype {etype}")
-            eventlet.sleep(2)
-        except: eventlet.sleep(5)
+        if is_ws_ready and sws:
+            # Aap yahan Nifty/BankNifty ke tokens dal sakte hain jo hamesha chalu rahein
+            # sws.subscribe("myt", 1, [{"exchangeType": 1, "tokens": ["26000", "26009"]}])
+            pass
+        eventlet.sleep(30)
 
 if __name__ == '__main__':
-    eventlet.spawn(manage_connection); eventlet.spawn(sync_watchlist)
-    from eventlet import wsgi
-    wsgi.server(eventlet.listen(('0.0.0.0', int(os.environ.get("PORT", 10000)))), lambda e,s: [b"STABLE"])
+    eventlet.spawn(manage_connection)
+    eventlet.spawn(auto_subscribe)
+    import uvicorn
+    # Render automatically sets the PORT environment variable
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
