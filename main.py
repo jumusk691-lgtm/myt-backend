@@ -1,6 +1,7 @@
 import eventlet
 eventlet.monkey_patch(all=True)
-import os, pyotp, time, datetime, pytz, requests, sqlite3, tempfile, threading
+import os, pyotp, time, datetime, firebase_admin, pytz, requests, sqlite3, tempfile, threading
+from firebase_admin import credentials, db
 from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 from supabase import create_client
@@ -12,13 +13,18 @@ PWD = "0000"
 TOTP_STR = "XFTXZ2445N4V2UMB7EWUCBDRMU"
 IST = pytz.timezone('Asia/Kolkata')
 
-# SUPABASE CONFIG (Exactly as you provided)
+# SUPABASE (Master Data Only)
 SUPABASE_URL = "https://tnrhlvibaeiwhlrxdxnm.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRucmhsdmliYWVpd2hscnhkeG5tIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjY0NzQ0NywiZXhwIjoyMDg4MjIzNDQ3fQ.epYmt7sxhZRhEQWoj0doCHAbfOTHOjSurBbLss5a4Pk"
 BUCKET_NAME = "Myt"
 
-# VERCEL CONFIG (Barcelona)
+# VERCEL (Barcelona) - Live Price Destination
 VERCEL_URL = "https://myt-backend-s2q2.vercel.app/api" 
+
+# FIREBASE SETUP (Sirf Watchlist Read karne ke liye)
+if not firebase_admin._apps:
+    cred = credentials.Certificate("trade-f600a-firebase-adminsdk-fbsvc-269ab50c0c.json")
+    firebase_admin.initialize_app(cred, {'databaseURL': 'https://trade-f600a-default-rtdb.firebaseio.com/'})
 
 # --- GLOBAL STATE ---
 sws = None
@@ -30,9 +36,9 @@ last_master_update_date = None
 # --- 2. VERCEL PUSH SERVICE ---
 def send_to_vercel(token, price):
     try:
-        # Har tick ko Vercel par phekne ke liye
-        requests.post(VERCEL_URL, json={"token": str(token), "price": str(price)}, timeout=0.5)
-    except:
+        # Live price sirf Vercel jayega, Firebase safe rahega
+        requests.post(VERCEL_URL, json={"token": str(token), "price": str(price)}, timeout=0.4)
+    except: 
         pass
 
 # --- 3. MASTER DATA SYNC (SUPABASE - NO CHANGES) ---
@@ -79,21 +85,19 @@ def on_data(wsapp, msg):
             # Check price change to avoid unnecessary hits
             if last_price_cache.get(token) != ltp:
                 last_price_cache[token] = ltp
-                # Threading use kar rahe hain taaki main process delay na ho
+                # Background thread taaki WebSocket slow na ho
                 threading.Thread(target=send_to_vercel, args=(token, ltp)).start()
 
 # --- 5. BATCH SUBSCRIPTION (500 TOKENS) ---
 def subscribe_in_batches(token_list, exchange_type):
     global sws
     if not sws or not token_list: return
-    
-    # 500-500 ke groups mein subscribe karna
     for i in range(0, len(token_list), 500):
         batch = token_list[i : i + 500]
         try:
             sws.subscribe("myt_batch", 1, [{"exchangeType": exchange_type, "tokens": batch}])
             print(f"📡 Subscribed Batch: {len(batch)} tokens (Type: {exchange_type})")
-            eventlet.sleep(0.5) # Angel One limit ke liye gap
+            eventlet.sleep(0.5) 
         except Exception as e:
             print(f"❌ Subscription Error: {e}")
 
@@ -106,7 +110,7 @@ def manage_connection():
         if now.hour == 8 and 30 <= now.minute <= 59 and last_master_update_date != now.date():
             if refresh_supabase_master(): last_master_update_date = now.date()
         
-        # 8 AM to Midnight Live
+        # Market Hours
         if 8 <= now.hour < 24:
             if not is_ws_ready:
                 try:
@@ -125,25 +129,28 @@ def manage_connection():
                 is_ws_ready = False; subscribed_tokens_set.clear()
         eventlet.sleep(60)
 
-# --- 7. SYNC ENGINE (500 BATCHING) ---
+# --- 7. SYNC ENGINE (READ FROM FIREBASE) ---
 def sync_watchlist():
     global subscribed_tokens_set, is_ws_ready
     while True:
         try:
             if is_ws_ready and sws:
-                # Yahan aap apne tokens ki list dalen
-                # Filhaal example ke liye kuch tokens:
-                all_tokens = ["26000", "26009", "3045"] 
-                
-                new_tokens = [t for t in all_tokens if t not in subscribed_tokens_set]
-                
-                if new_tokens:
-                    # Sirf un-subscribed tokens ko 500 ke batch mein bhejna
-                    subscribe_in_batches(new_tokens, 1) # Default NSE Cash
-                    for t in new_tokens: subscribed_tokens_set.add(t)
+                # Firebase se user ki watchlist ki list uthao
+                user_watchlist = db.reference('central_watchlist').get()
+                if user_watchlist:
+                    # Token list nikaalo
+                    all_tokens = [str(v.get('token')) for k, v in user_watchlist.items() if v.get('token')]
+                    
+                    # Jo naye tokens hain sirf unhe 500 ke batch mein subscribe karo
+                    new_tokens = [t for t in all_tokens if t not in subscribed_tokens_set]
+                    
+                    if new_tokens:
+                        subscribe_in_batches(new_tokens, 1) # Default NSE Cash
+                        for t in new_tokens: subscribed_tokens_set.add(t)
             
             eventlet.sleep(10)
-        except:
+        except Exception as e:
+            print(f"Sync Error: {e}")
             eventlet.sleep(5)
 
 if __name__ == '__main__':
