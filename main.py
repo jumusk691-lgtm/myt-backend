@@ -1,34 +1,41 @@
 import eventlet
 eventlet.monkey_patch(all=True)
-import os, pyotp, time, datetime, firebase_admin, pytz, requests, sqlite3, tempfile
-from firebase_admin import credentials, db
+import os, pyotp, time, datetime, pytz, requests, sqlite3, tempfile, threading
 from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 from supabase import create_client
 
-# --- 1. CONFIG & FIREBASE SETUP ---
+# --- 1. CONFIG SETUP ---
 API_KEY = "85HE4VA1"
 CLIENT_CODE = "S52638556"
 PWD = "0000"
 TOTP_STR = "XFTXZ2445N4V2UMB7EWUCBDRMU"
 IST = pytz.timezone('Asia/Kolkata')
+
+# SUPABASE CONFIG (Exactly as you provided)
 SUPABASE_URL = "https://tnrhlvibaeiwhlrxdxnm.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRucmhsdmliYWVpd2hscnhkeG5tIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjY0NzQ0NywiZXhwIjoyMDg4MjIzNDQ3fQ.epYmt7sxhZRhEQWoj0doCHAbfOTHOjSurBbLss5a4Pk"
 BUCKET_NAME = "Myt"
 
-if not firebase_admin._apps:
-    cred = credentials.Certificate("trade-f600a-firebase-adminsdk-fbsvc-269ab50c0c.json")
-    firebase_admin.initialize_app(cred, {'databaseURL': 'https://trade-f600a-default-rtdb.firebaseio.com/'})
+# VERCEL CONFIG (Barcelona)
+VERCEL_URL = "https://myt-backend-s2q2.vercel.app/api" 
 
 # --- GLOBAL STATE ---
 sws = None
 is_ws_ready = False
-token_to_fb_items = {} 
 last_price_cache = {} 
 subscribed_tokens_set = set() 
 last_master_update_date = None 
 
-# --- 2. MASTER DATA SYNC (AUTO-OVERWRITE AT 8:30 AM) ---
+# --- 2. VERCEL PUSH SERVICE ---
+def send_to_vercel(token, price):
+    try:
+        # Har tick ko Vercel par phekne ke liye
+        requests.post(VERCEL_URL, json={"token": str(token), "price": str(price)}, timeout=0.5)
+    except:
+        pass
+
+# --- 3. MASTER DATA SYNC (SUPABASE - NO CHANGES) ---
 def refresh_supabase_master():
     print(f"🔄 [System] Overwriting Master Data...")
     try:
@@ -60,36 +67,46 @@ def refresh_supabase_master():
         print(f"❌ Master Error: {e}")
         return False
 
-# --- 3. TICK ENGINE ---
+# --- 4. TICK ENGINE ---
 def on_data(wsapp, msg):
     global last_price_cache
     if isinstance(msg, dict) and 'token' in msg:
         token = str(msg.get('token'))
         ltp_raw = msg.get('last_traded_price') or msg.get('ltp', 0)
         ltp = float(ltp_raw) / 100
-        if ltp > 0 and token in token_to_fb_items:
-            if last_price_cache.get(token) == ltp: return
-            updates = {}
-            now_time = datetime.datetime.now(IST).strftime("%H:%M:%S")
-            for item in token_to_fb_items[token]:
-                path = f"central_watchlist/{item['key']}"
-                is_4_dec = any(x in item['exch'].upper() for x in ["MCX", "CDS"])
-                updates[f"{path}/price"] = "{:.4f}".format(ltp) if is_4_dec else "{:.2f}".format(ltp)
-                updates[f"{path}/utime"] = now_time
-                if 'close' in msg and float(msg['close']) > 0:
-                    cp = float(msg['close']) / 100
-                    updates[f"{path}/pChange"] = "{:.2f}".format(((ltp - cp) / cp) * 100)
-            if updates:
-                try: db.reference().update(updates); last_price_cache[token] = ltp
-                except: pass
+        
+        if ltp > 0:
+            # Check price change to avoid unnecessary hits
+            if last_price_cache.get(token) != ltp:
+                last_price_cache[token] = ltp
+                # Threading use kar rahe hain taaki main process delay na ho
+                threading.Thread(target=send_to_vercel, args=(token, ltp)).start()
 
-# --- 4. CONNECTION MANAGER ---
+# --- 5. BATCH SUBSCRIPTION (500 TOKENS) ---
+def subscribe_in_batches(token_list, exchange_type):
+    global sws
+    if not sws or not token_list: return
+    
+    # 500-500 ke groups mein subscribe karna
+    for i in range(0, len(token_list), 500):
+        batch = token_list[i : i + 500]
+        try:
+            sws.subscribe("myt_batch", 1, [{"exchangeType": exchange_type, "tokens": batch}])
+            print(f"📡 Subscribed Batch: {len(batch)} tokens (Type: {exchange_type})")
+            eventlet.sleep(0.5) # Angel One limit ke liye gap
+        except Exception as e:
+            print(f"❌ Subscription Error: {e}")
+
+# --- 6. CONNECTION MANAGER ---
 def manage_connection():
-    global sws, is_ws_ready, subscribed_tokens_set, last_master_update_date
+    global sws, is_ws_ready, last_master_update_date
     while True:
         now = datetime.datetime.now(IST)
+        # Master Update at 8:30 AM (Supabase)
         if now.hour == 8 and 30 <= now.minute <= 59 and last_master_update_date != now.date():
             if refresh_supabase_master(): last_master_update_date = now.date()
+        
+        # 8 AM to Midnight Live
         if 8 <= now.hour < 24:
             if not is_ws_ready:
                 try:
@@ -108,42 +125,29 @@ def manage_connection():
                 is_ws_ready = False; subscribed_tokens_set.clear()
         eventlet.sleep(60)
 
-# --- 5. SMART SYNC (FIXES SEGMENT ERRORS) ---
+# --- 7. SYNC ENGINE (500 BATCHING) ---
 def sync_watchlist():
-    global token_to_fb_items, subscribed_tokens_set
+    global subscribed_tokens_set, is_ws_ready
     while True:
         try:
             if is_ws_ready and sws:
-                full_data = db.reference('central_watchlist').get()
-                if full_data:
-                    temp_map = {}
-                    batches = {1: [], 2: [], 3: [], 4: [], 5: []}
-                    for fb_key, val in full_data.items():
-                        token = str(val.get('token', ''))
-                        symbol = str(val.get('symbol', '')).upper()
-                        exch = str(val.get('exch_seg', 'NSE')).upper()
-                        if not token or token == "None": continue
-                        if token not in temp_map: temp_map[token] = []
-                        temp_map[token].append({'key': fb_key, 'exch': exch})
-                        if token not in subscribed_tokens_set:
-                            etype = 1 # NSE Cash
-                            if "MCX" in exch: etype = 5
-                            elif any(x in symbol for x in ["CE", "PE", "FUT"]) or "NFO" in exch:
-                                etype = 4 if "SENSEX" in symbol or "BFO" in exch else 2
-                            elif "BSE" in exch: etype = 1
-                            batches[etype].append(token)
-                    token_to_fb_items = temp_map
-                    for etype, tokens in batches.items():
-                        if tokens:
-                            for i in range(0, len(tokens), 50):
-                                b = tokens[i:i+50]
-                                sws.subscribe("myt", 1, [{"exchangeType": etype, "tokens": b}])
-                                for t in b: subscribed_tokens_set.add(t)
-                                print(f"📡 Subscribed: {len(b)} tokens in Etype {etype}")
-            eventlet.sleep(2)
-        except: eventlet.sleep(5)
+                # Yahan aap apne tokens ki list dalen
+                # Filhaal example ke liye kuch tokens:
+                all_tokens = ["26000", "26009", "3045"] 
+                
+                new_tokens = [t for t in all_tokens if t not in subscribed_tokens_set]
+                
+                if new_tokens:
+                    # Sirf un-subscribed tokens ko 500 ke batch mein bhejna
+                    subscribe_in_batches(new_tokens, 1) # Default NSE Cash
+                    for t in new_tokens: subscribed_tokens_set.add(t)
+            
+            eventlet.sleep(10)
+        except:
+            eventlet.sleep(5)
 
 if __name__ == '__main__':
-    eventlet.spawn(manage_connection); eventlet.spawn(sync_watchlist)
+    eventlet.spawn(manage_connection)
+    eventlet.spawn(sync_watchlist)
     from eventlet import wsgi
     wsgi.server(eventlet.listen(('0.0.0.0', int(os.environ.get("PORT", 10000)))), lambda e,s: [b"STABLE"])
