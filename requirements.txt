@@ -12,3 +12,4 @@ websocket-client
 logzero
 pytz
 supabase
+firebase admin
