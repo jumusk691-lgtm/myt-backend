@@ -15,7 +15,7 @@ IST = pytz.timezone('Asia/Kolkata')
 
 # Supabase (Sirf Master File Upload ke liye)
 SUPABASE_URL = "https://tnrhlvibaeiwhlrxdxnm.supabase.co"
-SUPA" # Full key yahan paste karein
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRnbHV6c2xqYnhrZG93cWFwamhvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMwNjI0NDcsImV4cCI6MjA4ODYzODQ0N30.5dvATkqcnVn7FgJcmhcjpJsOANZxrALhKQoFaQTdzHY" # Full key yahan paste karein
 BUCKET_NAME = "Myt"
 
 # --- GLOBAL STATE ---
