@@ -26,7 +26,7 @@ SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJ
 BUCKET_NAME = "Myt"
 
 # Pusher Client
-pusher_client = Pusher(myt_id=PUSHER_APP_ID, key=PUSHER_APP_KEY, secret=PUSHER_APP_SECRET, host=SOKETI_HOST, port=443, ssl=True
+pusher_client = Pusher (myt_id=PUSHER_APP_ID, key=PUSHER_APP_KEY, secret=PUSHER_APP_SECRET, host=SOKETI_HOST, port=443, ssl=True) 
 
 # Firebase Init
 if not firebase_admin._apps:
