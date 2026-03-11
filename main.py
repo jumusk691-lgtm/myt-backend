@@ -4,6 +4,7 @@ import os, pyotp, time, datetime, firebase_admin, pytz, requests, sqlite3, tempf
 from firebase_admin import credentials, db
 from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
+from pusher import Pusher
 from supabase import create_client
 
 # --- 1. CONFIG SETUP ---
@@ -13,56 +14,34 @@ PWD = "0000"
 TOTP_STR = "XFTXZ2445N4V2UMB7EWUCBDRMU"
 IST = pytz.timezone('Asia/Kolkata')
 
-# Render App URL (Ise Render settings se copy karke yahan paste kar)
-RENDER_APP_URL = "https://myt-backend.onrender.com" 
-VERCEL_URL = "https://myt-backend-ztm2.vercel.app/api"
+# SOKETI CONFIG (Middleman)
+SOKETI_HOST = "myt-market-socket.onrender.com"
+PUSHER_APP_ID = "app-id"
+PUSHER_APP_KEY = "app-key"
+PUSHER_APP_SECRET = "app-secret"
 
-# DATABASES
+# SUPABASE CONFIG (For Master DB)
+SUPABASE_URL = "https://tnrhlvibaeiwhlrxdxnm.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." # Apni puri key rakhiye
+BUCKET_NAME = "Myt"
+
+# Pusher Client
+pusher_client = Pusher(app_id=PUSHER_APP_ID, key=PUSHER_APP_KEY, secret=PUSHER_APP_SECRET, host=SOKETI_HOST, port=443, ssl=True)
+
+# Firebase Init
 if not firebase_admin._apps:
     cred = credentials.Certificate("trade-f600a-firebase-adminsdk-fbsvc-269ab50c0c.json")
     firebase_admin.initialize_app(cred, {'databaseURL': 'https://trade-f600a-default-rtdb.firebaseio.com/'})
-
-SUPABASE_URL = "https://tnrhlvibaeiwhlrxdxnm.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRucmhsdmliYWVpd2hscnhkeG5tIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjY0NzQ0NywiZXhwIjoyMDg4MjIzNDQ3fQ.epYmt7sxhZRhEQWoj0doCHAbfOTHOjSurBbLss5a4Pk"
-BUCKET_NAME = "Myt"
 
 # --- GLOBAL STATE ---
 sws = None
 is_ws_ready = False
 last_price_cache = {} 
 subscribed_tokens_set = set() 
-last_master_update_date = None 
+last_master_update_date = None
+last_push_time = {} # Har 2 second gap ke liye
 
-# --- 2. MAINTENANCE ENGINE (ANTI-SLEEP + RAM CLEANER) ---
-def maintenance_engine():
-    global last_price_cache
-    while True:
-        try:
-            # A. ANTI-SLEEP: Render ko ping karo taaki wo hibernate na ho
-            requests.get(RENDER_APP_URL, timeout=15)
-            print("⏰ [Keep-Alive] Render is Awake. Ping successful.")
-            
-            # B. MEMORY CLEANUP: Har 5 minute mein purana data clear karo
-            # Taaki RAM limit hit na ho aur Render crash na kare
-            last_price_cache.clear()
-            gc.collect() # Force Garbage Collection
-            print("🧹 [Cleanup] Cache cleared and RAM optimized.")
-            
-        except Exception as e:
-            print(f"⚠️ Maintenance Alert: {e}")
-        
-        # Har 5 minute (300 seconds) mein ye loop chalega
-        eventlet.sleep(300)
-
-# --- 3. PRICE DISPATCHER (VERCEL PUSH) ---
-def send_to_vercel(token, price):
-    try:
-        # High speed async push to Vercel
-        requests.post(VERCEL_URL, json={"token": str(token), "price": str(price)}, timeout=0.3)
-    except:
-        pass
-
-# --- 4. MASTER DATA AUTO-SYNC (8:30 AM IST) ---
+# --- 2. MASTER DATA SYNC (8:30 AM IST) ---
 def refresh_supabase_master():
     print(f"🔄 [System] Updating Master DB on Supabase...")
     try:
@@ -88,113 +67,84 @@ def refresh_supabase_master():
                 supabase.storage.from_(BUCKET_NAME).upload(path="angel_master.db", file=f.read(), 
                                                          file_options={"x-upsert": "true", "content-type": "application/octet-stream"})
             os.remove(temp_path)
-            print("✅ [Success] Supabase Master DB Replaced.")
+            print("✅ [Success] Master DB Uploaded to Supabase.")
             return True
     except Exception as e:
         print(f"❌ Master Sync Error: {e}")
         return False
 
-# --- 5. SMART TICK ENGINE ---
+# --- 3. SOKETI BROADCASTER (With 2-Second Logic) ---
+def broadcast_to_soketi(token, price):
+    global last_push_time
+    current_time = time.time()
+    
+    # Har token ka price kam se kam 2 second baad hi dobara bhejenge
+    if token not in last_push_time or (current_time - last_push_time[token]) >= 2.0:
+        try:
+            pusher_client.trigger('market-channel', 'price-update', {'token': str(token), 'price': str(price)})
+            last_push_time[token] = current_time
+        except: pass
+
+# --- 4. SMART TICK ENGINE ---
 def on_data(wsapp, msg):
     global last_price_cache
     if isinstance(msg, dict) and 'token' in msg:
         token = str(msg.get('token'))
-        # LTP calculation
-        ltp_raw = msg.get('last_traded_price') or msg.get('ltp', 0)
-        ltp = float(ltp_raw) / 100
-        
-        if ltp > 0:
-            # Sirf tabhi Vercel bhejo jab price change hua ho (Traffic bachane ke liye)
-            if last_price_cache.get(token) != ltp:
-                last_price_cache[token] = ltp
-                # Threading taaki main socket process delay na ho
-                threading.Thread(target=send_to_vercel, args=(token, ltp)).start()
+        ltp = float(msg.get('last_traded_price', 0) or msg.get('ltp', 0)) / 100
+        if ltp > 0 and last_price_cache.get(token) != ltp:
+            last_price_cache[token] = ltp
+            threading.Thread(target=broadcast_to_soketi, args=(token, ltp)).start()
 
-# --- 6. BROKER-LEVEL BATCHING (500 TOKENS LIMIT) ---
-def subscribe_in_batches(token_list, exchange_type):
+# --- 5. BATCH SUBSCRIPTION (500 Limit) ---
+def subscribe_in_batches(token_list):
     global sws
     if not sws or not token_list: return
-    
-    # 500-500 ke groups mein subscribe karna (Angel One Limit)
     for i in range(0, len(token_list), 500):
         batch = token_list[i : i + 500]
-        try:
-            sws.subscribe("myt_batch", 1, [{"exchangeType": exchange_type, "tokens": batch}])
-            print(f"📡 Subscribed Batch: {len(batch)} tokens.")
-            eventlet.sleep(0.6) # Safe gap between batches
-        except Exception as e:
-            print(f"❌ Subscription Error: {e}")
+        sws.subscribe("myt_batch", 1, [{"exchangeType": 1, "tokens": batch}])
+        print(f"📡 Subscribed Batch: {len(batch)} tokens.")
+        eventlet.sleep(0.6)
 
-# --- 7. CONNECTION & MARKET HOUR MANAGER ---
+# --- 6. CONNECTION & MAINTENANCE ---
 def manage_connection():
     global sws, is_ws_ready, last_master_update_date
     while True:
         now = datetime.datetime.now(IST)
-        
-        # A. Subah 8:30 ka Master Sync
-        if now.hour == 8 and 30 <= now.minute <= 59 and last_master_update_date != now.date():
+        # Subah 8:30 Sync
+        if now.hour == 8 and 30 <= now.minute <= 45 and last_master_update_date != now.date():
             if refresh_supabase_master(): last_master_update_date = now.date()
         
-        # B. 24/7 Market Connection (Always On Logic)
-        # 8 AM se Raat 12 AM tak chalu rahega
+        # Connection Logic
         if 8 <= now.hour < 24:
             if not is_ws_ready:
                 try:
                     smart_api = SmartConnect(api_key=API_KEY)
-                    totp = pyotp.TOTP(TOTP_STR).now()
-                    session = smart_api.generateSession(CLIENT_CODE, PWD, totp)
+                    session = smart_api.generateSession(CLIENT_CODE, PWD, pyotp.TOTP(TOTP_STR).now())
                     if session.get('status'):
                         sws = SmartWebSocketV2(session['data']['jwtToken'], API_KEY, CLIENT_CODE, session['data']['feedToken'])
                         sws.on_data = on_data
-                        sws.on_open = lambda ws: exec("global is_ws_ready; is_ws_ready=True; print('🟢 WebSocket Connected')")
-                        sws.on_close = lambda ws,c,r: exec("global is_ws_ready; is_ws_ready=False")
+                        sws.on_open = lambda ws: exec("global is_ws_ready; is_ws_ready=True")
                         eventlet.spawn(sws.connect)
-                except Exception as e:
-                    print(f"🔄 Connection Retry in 60s: {e}")
-        else:
-            # Midnight resetting to keep system fresh
-            if is_ws_ready:
-                if sws: sws.close()
-                is_ws_ready = False
-                subscribed_tokens_set.clear()
-                print("💤 [Midnight Reset] System refreshed for next day.")
-        
+                except: pass
         eventlet.sleep(60)
 
-# --- 8. SYNC WATCHLIST (DYNAMIC) ---
+# --- 7. DYNAMIC SYNC ---
 def sync_watchlist():
     global subscribed_tokens_set, is_ws_ready
     while True:
-        try:
-            if is_ws_ready and sws:
-                # Firebase se user ki watchlist uthao (Manmarzi wale tokens)
+        if is_ws_ready:
+            try:
                 user_watchlist = db.reference('central_watchlist').get()
                 if user_watchlist:
-                    all_tokens_from_fb = []
-                    for k, v in user_watchlist.items():
-                        t = str(v.get('token'))
-                        if t and t != "None": all_tokens_from_fb.append(t)
-                    
-                    # Sirf wo tokens jo pehle se subscribed nahi hain
-                    new_tokens = [t for t in all_tokens_from_fb if t not in subscribed_tokens_set]
-                    
+                    new_tokens = [str(v.get('token')) for k,v in user_watchlist.items() if str(v.get('token')) not in subscribed_tokens_set]
                     if new_tokens:
-                        subscribe_in_batches(new_tokens, 1)
+                        subscribe_in_batches(new_tokens)
                         for t in new_tokens: subscribed_tokens_set.add(t)
-            
-            eventlet.sleep(10) # Har 10 sec mein nayi watchlist check karo
-        except Exception as e:
-            print(f"🔄 Sync Loop Error: {e}")
-            eventlet.sleep(5)
+            except: pass
+        eventlet.sleep(15)
 
-# --- 9. STARTUP ---
 if __name__ == '__main__':
-    # Saare engines ko background mein start karo
-    eventlet.spawn(maintenance_engine) # Anti-Sleep & Cleaner
-    eventlet.spawn(manage_connection)  # Login & Market Hours
-    eventlet.spawn(sync_watchlist)    # Watchlist Subscription
-    
-    # Render ke Port ko listen karo taaki server chalu dikhe
+    eventlet.spawn(manage_connection)
+    eventlet.spawn(sync_watchlist)
     from eventlet import wsgi
-    print("🚀 [Evergreen Engine] System is LIVE.")
     wsgi.server(eventlet.listen(('0.0.0.0', int(os.environ.get("PORT", 10000)))), lambda e,s: [b"STABLE_LIVE"])
