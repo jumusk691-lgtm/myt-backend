@@ -1,14 +1,14 @@
 import eventlet
-eventlet.monkey_patch()  # Must be the very first line
+eventlet.monkey_patch()
 
 import os, pyotp, time, datetime, pytz, requests, sqlite3, tempfile, json
 from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 from supabase import create_client
-from flask import Flask, request
-from flask_socketio import SocketIO, emit
+from flask import Flask
+from flask_socketio import SocketIO, join_room
 
-# --- CONFIG & CREDENTIALS ---
+# --- 1. CONFIG ---
 API_KEY = "85HE4VA1"
 CLIENT_CODE = "S52638556"
 PWD = "0000"
@@ -25,54 +25,90 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 # --- GLOBAL STATE ---
 sws = None
 is_ws_ready = False
-subscribed_tokens_set = set() # Format: "exchange_token"
+subscribed_tokens_set = set() 
+last_master_update_date = None
 
-# --- TICK ENGINE ---
+# --- 2. MASTER DATA SYNC (8:30 AM Logic) ---
+def refresh_supabase_master():
+    print(f"🔄 [System] Overwriting Master Data...")
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+        response = requests.get(url, timeout=60)
+        if response.status_code == 200:
+            json_data = response.json()
+            with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+                temp_path = tmp.name
+            conn = sqlite3.connect(temp_path)
+            cursor = conn.cursor()
+            cursor.execute("DROP TABLE IF EXISTS symbols")
+            cursor.execute('''CREATE TABLE symbols (token TEXT, symbol TEXT, name TEXT, expiry TEXT,
+                             strike TEXT, lotsize TEXT, instrumenttype TEXT, exch_seg TEXT, tick_size TEXT)''')
+            data = [(str(i.get('token')), i.get('symbol'), i.get('name'), i.get('expiry'), i.get('strike'),
+                     i.get('lotsize'), i.get('instrumenttype'), i.get('exch_seg'), i.get('tick_size'))
+                    for i in json_data if i.get('token')]
+            cursor.executemany("INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?)", data)
+            conn.commit()
+            conn.close()
+            with open(temp_path, "rb") as f:
+                supabase.storage.from_(BUCKET_NAME).upload(path="angel_master.db", file=f.read(),
+                                                         file_options={"x-upsert": "true", "content-type": "application/octet-stream"})
+            os.remove(temp_path)
+            return True
+    except Exception as e:
+        print(f"❌ Master Error: {e}")
+        return False
+
+# --- 3. TICK ENGINE ---
 def on_data(wsapp, msg):
     if isinstance(msg, dict) and 'token' in msg:
-        # Angel SmartApi V2 provides 'exch_feed_time' or we can infer exchange
-        # Send everything back to APK for real-time update
+        token = str(msg.get('token'))
+        ltp = float(msg.get('last_traded_price', 0)) / 100
+        
+        if ltp <= 0: return
+
         payload = {
-            "t": str(msg.get('token')),
-            "p": str(float(msg.get('last_traded_price', 0)) / 100),
-            "e": msg.get('exchange_type') # Sending exchange type back to APK
+            "t": token,
+            "p": "{:.2f}".format(ltp),
+            "e": str(msg.get('exchange_type', '1'))
         }
-        socketio.emit('live_update', payload)
+        
+        # Purana Percentage Change logic
+        if 'close' in msg and float(msg['close']) > 0:
+            cp = float(msg['close']) / 100
+            payload["pc"] = "{:.2f}".format(((ltp - cp) / cp) * 100)
+
+        socketio.emit('live_update', payload, room=token)
 
 def on_open(wsapp):
     global is_ws_ready
     is_ws_ready = True
-    print("🟢 Engine Connected: All Segments (1,2,3,4,5) Ready")
+    print("🟢 Engine Live: All Segments Ready")
 
-def on_error(wsapp, error):
-    print(f"❌ WS Error: {error}")
-
-# --- CONNECTION MANAGER ---
+# --- 4. CONNECTION MANAGER ---
 def run_trading_engine():
-    global sws, is_ws_ready
+    global sws, is_ws_ready, subscribed_tokens_set, last_master_update_date
     while True:
         try:
             now = datetime.datetime.now(IST)
-            # 8 AM to Midnight (Covers NSE & MCX hours)
+            if now.hour == 8 and 30 <= now.minute <= 59 and last_master_update_date != now.date():
+                if refresh_supabase_master(): last_master_update_date = now.date()
+
             if 8 <= now.hour < 24:
                 if not is_ws_ready:
-                    print("🔄 Connecting to Angel One...")
                     smart_api = SmartConnect(api_key=API_KEY)
                     totp = pyotp.TOTP(TOTP_STR).now()
                     session = smart_api.generateSession(CLIENT_CODE, PWD, totp)
                     
                     if session.get('status'):
-                        sws = SmartWebSocketV2(
-                            session['data']['jwtToken'], 
-                            API_KEY, CLIENT_CODE, 
-                            session['data']['feedToken']
-                        )
+                        sws = SmartWebSocketV2(session['data']['jwtToken'], API_KEY, CLIENT_CODE, session['data']['feedToken'])
                         sws.on_data = on_data
                         sws.on_open = on_open
-                        sws.on_error = on_error
-                        sws.connect() 
+                        sws.on_error = lambda ws, err: print(f"❌ Error: {err}")
+                        sws.on_close = lambda ws,c,r: exec("global is_ws_ready; is_ws_ready=False")
+                        sws.connect()
             else:
-                if is_ws_ready and sws:
+                if is_ws_ready:
                     sws.close()
                     is_ws_ready = False
                     subscribed_tokens_set.clear()
@@ -80,39 +116,55 @@ def run_trading_engine():
             print(f"Loop Error: {e}")
         eventlet.sleep(15)
 
-# --- MULTI-SEGMENT SUBSCRIBE LOGIC ---
+# --- 5. PURANA SMART SUBSCRIBE LOGIC (Mixed with New SocketIO) ---
 @socketio.on('subscribe')
 def handle_subscribe(json_data):
     """
-    Expects JSON: {"tokens": ["token1", "token2"], "exchange": 1}
-    Exchanges: 1=NSE, 2=BSE, 3=NFO, 4=MCX, 5=BFO
+    APK should send: {"watchlist": [{"token": "123", "symbol": "GOLD", "exch": "MCX"}]}
     """
     global subscribed_tokens_set, sws, is_ws_ready
     
-    token_list = json_data.get('tokens', [])
-    exchange = int(json_data.get('exchange', 1)) # Default to NSE (1)
-    
-    if is_ws_ready and sws:
-        # Filter only tokens not already subscribed for this specific exchange
-        new_tokens = [t for t in token_list if f"{exchange}_{t}" not in subscribed_tokens_set]
+    watchlist = json_data.get('watchlist', [])
+    if not watchlist: return
+
+    batches = {1: [], 2: [], 3: [], 4: [], 5: []}
+
+    for item in watchlist:
+        token = str(item.get('token'))
+        symbol = str(item.get('symbol', '')).upper()
+        exch = str(item.get('exch', 'NSE')).upper()
         
-        if new_tokens:
-            correlation_id = f"sub_{exchange}_{int(time.time())}"
-            payload = [{"exchangeType": exchange, "tokens": new_tokens}]
+        if not token or token == "None": continue
+
+        # User ko room mein join karwao
+        join_room(token)
+
+        # Wahi Purana Segment Logic (etype detection)
+        if token not in subscribed_tokens_set:
+            etype = 1 # NSE Cash default
+            if "MCX" in exch: 
+                etype = 5
+            elif any(x in symbol for x in ["CE", "PE", "FUT"]) or "NFO" in exch:
+                # Purana NFO/BFO detection
+                etype = 4 if ("SENSEX" in symbol or "BFO" in exch) else 2
+            elif "BSE" in exch: 
+                etype = 3
             
-            # Action 1 = Subscribe
-            sws.subscribe(correlation_id, 1, payload)
-            
-            for t in new_tokens:
-                subscribed_tokens_set.add(f"{exchange}_{t}")
-                
-            print(f"📡 Subscribed {len(new_tokens)} symbols for Exchange: {exchange}")
-    else:
-        print("⚠️ WebSocket Not Ready. Subscription Queued or Ignored.")
+            batches[etype].append(token)
+
+    # Angel API Batch Subscribe
+    if is_ws_ready and sws:
+        for etype, tokens in batches.items():
+            if tokens:
+                for i in range(0, len(tokens), 50):
+                    b = tokens[i:i+50]
+                    sws.subscribe(f"myt_{etype}", 1, [{"exchangeType": etype, "tokens": b}])
+                    for t in b: subscribed_tokens_set.add(t)
+                    print(f"📡 Subscribed: {len(b)} tokens in Etype {etype}")
 
 @app.route('/')
 def health():
-    return f"Live: {is_ws_ready}", 200
+    return f"Live: {is_ws_ready} | Subscribed: {len(subscribed_tokens_set)}", 200
 
 if __name__ == '__main__':
     socketio.start_background_task(run_trading_engine)
