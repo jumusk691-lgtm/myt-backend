@@ -1,0 +1,24 @@
+name: Render Immortal Engine
+
+on:
+  schedule:
+    # Ye IST ke hisaab se Subah 8:25 AM se Raat 12:05 AM tak chalega
+    # Har 5 minute mein Render ko dhakka marega
+    - cron: '*/5 3-18 * * *' 
+  workflow_dispatch: # Taaki tum khud bhi button daba kar start kar sako
+
+jobs:
+  ping-render:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wake Up Render
+        run: |
+          # Yahan apne Render ka asli URL daal dena
+          URL="https://myt-backend.onrender.com"
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" $URL)
+          echo "Render Status: $RESPONSE"
+          if [ $RESPONSE -eq 200 ]; then
+            echo "✅ Render Jaga hua hai aur mast kaam kar raha hai!"
+          else
+            echo "⚠️ Render ko dhakka maara gaya hai (Status: $RESPONSE)"
+          fi
