@@ -16,13 +16,13 @@ IST = pytz.timezone('Asia/Kolkata')
 
 # SOKETI CONFIG (Middleman)
 SOKETI_HOST = "myt-market-socket.onrender.com"
-PUSHER_APP_ID = "app-id"
-PUSHER_APP_KEY = "app-key"
-PUSHER_APP_SECRET = "app-secret"
+PUSHER_APP_ID = "myt-id"
+PUSHER_APP_KEY = "myt-key"
+PUSHER_APP_SECRET = "myt-secret"
 
 # SUPABASE CONFIG (For Master DB)
 SUPABASE_URL = "https://tnrhlvibaeiwhlrxdxnm.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." # Apni puri key rakhiye
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRnbHV6c2xqYnhrZG93cWFwamhvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMwNjI0NDcsImV4cCI6MjA4ODYzODQ0N30.5dvATkqcnVn7FgJcmhcjpJsOANZxrALhKQoFaQTdzHY" # Apni puri key rakhiye
 BUCKET_NAME = "Myt"
 
 # Pusher Client
