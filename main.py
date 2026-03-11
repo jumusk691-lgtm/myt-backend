@@ -16,9 +16,9 @@ IST = pytz.timezone('Asia/Kolkata')
 
 # SOKETI CONFIG (Middleman)
 SOKETI_HOST = "myt-market-socket.onrender.com"
-PUSHER_APP_ID = "myt-id"
-PUSHER_APP_KEY = "myt-key"
-PUSHER_APP_SECRET = "myt-secret"
+PUSHER_APP_ID = "myt_id"
+PUSHER_APP_KEY = "myt_key"
+PUSHER_APP_SECRET = "myt_secret"
 
 # SUPABASE CONFIG (For Master DB)
 SUPABASE_URL = "https://tnrhlvibaeiwhlrxdxnm.supabase.co"
