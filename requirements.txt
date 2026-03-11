@@ -1,4 +1,4 @@
-flask
+
 python-socketio>=5.11.0
 python-engineio>=4.8.0
 eventlet==0.33.3
@@ -13,5 +13,6 @@ logzero
 pytz
 supabase
 firebase-admin
-pusher
 redis
+flask==2.2.5
+pusher==3.3.1
