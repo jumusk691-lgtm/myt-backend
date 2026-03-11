@@ -15,7 +15,7 @@ IST = pytz.timezone('Asia/Kolkata')
 
 # Render App URL (Ise Render settings se copy karke yahan paste kar)
 RENDER_APP_URL = "https://myt-backend.onrender.com" 
-VERCEL_URL = "https://myt-backend-s2q2.vercel.app/api"
+VERCEL_URL = "https://myt-backend-ztm2.vercel.app/api"
 
 # DATABASES
 if not firebase_admin._apps:
