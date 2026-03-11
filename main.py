@@ -5,6 +5,7 @@ from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 from supabase import create_client
 from flask import Flask, request
+from flask_socketio import SocketIO, emit
 
 # --- 1. CONFIG & CREDENTIALS ---
 API_KEY = "85HE4VA1"
@@ -15,8 +16,12 @@ IST = pytz.timezone('Asia/Kolkata')
 
 # Supabase (Sirf Master File Upload ke liye)
 SUPABASE_URL = "https://tnrhlvibaeiwhlrxdxnm.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRnbHV6c2xqYnhrZG93cWFwamhvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMwNjI0NDcsImV4cCI6MjA4ODYzODQ0N30.5dvATkqcnVn7FgJcmhcjpJsOANZxrALhKQoFaQTdzHY" # Full key yahan paste karein
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRnbHV6c2xqYnhrZG93cWFwamhvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMwNjI0NDcsImV4cCI6MjA4ODYzODQ0N30.5dvATkqcnVn7FgJcmhcjpJsOANZxrALhKQoFaQTdzHY"
 BUCKET_NAME = "Myt"
+
+# Flask & SocketIO Setup for Render
+app = Flask(__name__)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
 # --- GLOBAL STATE ---
 sws = None
@@ -69,9 +74,15 @@ def on_data(wsapp, msg):
     if isinstance(msg, dict) and 'token' in msg:
         token = str(msg.get('token'))
         ltp = float(msg.get('last_traded_price', 0)) / 100
-        # Direct Broadcast logic yahan aayega (Binary/JSON to APK)
-        # Abhi ye console par print karega, call par hum isey APK se connect karenge
-        pass
+        
+        # LIVE BROADCAST TO APK
+        # Ye logic ab direct SocketIO ke zariye APK ko data bhejega
+        payload = {
+            "t": token,
+            "p": str(ltp)
+        }
+        socketio.emit('live_update', payload)
+        # print(f"Ticker: {token} -> {ltp}")
 
 # --- 4. CONNECTION MANAGER ---
 def manage_connection():
@@ -79,12 +90,12 @@ def manage_connection():
     while True:
         now = datetime.datetime.now(IST)
         
-        # Morning Update
+        # Morning Update (8:30 AM)
         if now.hour == 8 and 30 <= now.minute <= 45 and last_master_update_date != now.date():
             if refresh_supabase_master(): 
                 last_master_update_date = now.date()
 
-        # Market Connection
+        # Market Connection (Open hours)
         if 8 <= now.hour < 24:
             if not is_ws_ready:
                 try:
@@ -97,7 +108,8 @@ def manage_connection():
                         sws.on_open = lambda ws: exec("global is_ws_ready; is_ws_ready=True; print('🟢 API WebSocket Live')")
                         sws.on_close = lambda ws,c,r: exec("global is_ws_ready; is_ws_ready=False")
                         eventlet.spawn(sws.connect)
-                except: pass
+                except Exception as e:
+                    print(f"WS Connect Error: {e}")
         else:
             if is_ws_ready:
                 if sws: sws.close()
@@ -106,9 +118,12 @@ def manage_connection():
         eventlet.sleep(60)
 
 # --- 5. DIRECT SYNC (APK TO RENDER) ---
-# Ye function APK se aane wali direct requests ko handle karega
-def subscribe_new_tokens(token_list, etype=1):
-    global subscribed_tokens_set
+@socketio.on('subscribe')
+def handle_subscribe(json_data):
+    global subscribed_tokens_set, sws, is_ws_ready
+    token_list = json_data.get('tokens', [])
+    etype = 1 # NSE Default
+    
     if is_ws_ready and sws:
         unique_tokens = [t for t in token_list if t not in subscribed_tokens_set]
         if unique_tokens:
@@ -116,10 +131,16 @@ def subscribe_new_tokens(token_list, etype=1):
                 batch = unique_tokens[i:i+50]
                 sws.subscribe("myt", 1, [{"exchangeType": etype, "tokens": batch}])
                 for t in batch: subscribed_tokens_set.add(t)
-                print(f"📡 Direct Subscribed: {len(batch)} tokens")
+                print(f"📡 Direct Subscribed: {len(batch)} tokens via SocketIO")
+
+@app.route('/')
+def health_check():
+    return "DIRECT ENGINE LIVE", 200
 
 if __name__ == '__main__':
+    # Start background connection manager
     eventlet.spawn(manage_connection)
-    from eventlet import wsgi
-    # Render Port Listening
-    wsgi.server(eventlet.listen(('0.0.0.0', int(os.environ.get("PORT", 10000)))), lambda e,s: [b"DIRECT ENGINE LIVE"])
+    
+    # Start SocketIO Server on Render Port
+    port = int(os.environ.get("PORT", 10000))
+    socketio.run(app, host='0.0.0.0', port=port)
