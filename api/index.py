@@ -22,7 +22,7 @@ def catch_all(path):
         # APK ko price dene ke liye (e.g., /api?token=3045)
         token = request.args.get('token')
         if not token:
-            return "Vercel Barcelona is Live! Send a token to get price.", 200
+            return "Vercel is Live! Send a token to get price.", 200
         return str(data_store.get(token, "0.0")), 200
 
 # Ye line Vercel ke liye zaroori hai
