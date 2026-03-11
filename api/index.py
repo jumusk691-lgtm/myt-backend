@@ -1,29 +1,34 @@
-from flask import Flask, request, jsonify
+import time
+from pusher import Pusher
 
-app = Flask(__name__)
+# Setup Pusher with Soketi Host
+pusher_client = Pusher(
+    app_id="1", 
+    key="myt_key", 
+    secret="myt_secret", 
+    host="myt-market-socket.onrender.com",
+    port=443,
+    ssl=True
+)
 
-# Ye temporary memory (Locker) hai
-data_store = {}
+# 1 lakh users ke liye tracking logic
+last_push_times = {}
 
-@app.route('/', defaults={'path': ''})
-@app.route('/<path:path>', methods=['GET', 'POST'])
-def catch_all(path):
-    if request.method == 'POST':
+def broadcast_live_price(token, price):
+    now = time.time()
+    
+    # 1.5 second ka gap (Throttling)
+    # Isse server par load 80% kam ho jayega aur price live rahegi
+    if token not in last_push_times or (now - last_push_times[token]) >= 1.5:
         try:
-            # Render se data lene ke liye
-            incoming_data = request.get_json()
-            token = str(incoming_data.get('token'))
-            price = str(incoming_data.get('price'))
-            data_store[token] = price
-            return "OK", 200
+            pusher_client.trigger('market-channel', 'price-update', {
+                't': str(token), 
+                'p': str(price)
+            })
+            last_push_times[token] = now
+            print(f"✅ Sent: {token} -> {price}")
         except Exception as e:
-            return f"Error: {str(e)}", 400
-    else:
-        # APK ko price dene ke liye (e.g., /api?token=3045)
-        token = request.args.get('token')
-        if not token:
-            return "Vercel is Live! Send a token to get price.", 200
-        return str(data_store.get(token, "0.0")), 200
+            print(f"❌ Socket Busy: {e}")
 
-# Ye line Vercel ke liye zaroori hai
-app = app
+# Example Use:
+# broadcast_live_price("26009", "572.45")
