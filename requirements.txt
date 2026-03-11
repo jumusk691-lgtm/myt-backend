@@ -11,4 +11,4 @@ websocket-client
 logzero
 pytz
 supabase
-flask
+flask_socketio
