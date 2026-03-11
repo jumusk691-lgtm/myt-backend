@@ -11,7 +11,7 @@ from supabase import create_client
 # Inhe Render Environment Variables mein rakhna behtar hai
 API_KEY = os.environ.get("API_KEY", "85HE4VA1")
 CLIENT_CODE = os.environ.get("CLIENT_CODE", "S52638556")
-PWD = os.environ.get("PWD", "0000")
+PWD = os.environ.get("MPIN", "0000")
 TOTP_STR = os.environ.get("TOTP_STR", "XFTXZ2445N4V2UMB7EWUCBDRMU")
 IST = pytz.timezone('Asia/Kolkata')
 
