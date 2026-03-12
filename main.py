@@ -99,7 +99,7 @@ def run_trading_engine():
                 if refresh_supabase_master(): last_master_update_date = now.date()
 
             # Market Hours: 9 AM to 11:30 PM (For MCX)
-            if 8 <= now.hour < 24:
+            if 7 <= now.hour < 24:
                 if not is_ws_ready:
                     smart_api = SmartConnect(api_key=API_KEY)
                     totp = pyotp.TOTP(TOTP_STR).now()
