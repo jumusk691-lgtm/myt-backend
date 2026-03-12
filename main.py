@@ -177,8 +177,8 @@ def handle_subscribe(json_data):
         for etype, tokens in batches.items():
             if tokens:
                 # API limit 50 tokens per call
-                for i in range(0, len(tokens), 50):
-                    chunk = tokens[i:i+50]
+                for i in range(0, len(tokens), 1000):
+                    chunk = tokens[i:i+1000]
                     sws.subscribe(f"myt_sub_{etype}", 1, [{"exchangeType": etype, "tokens": chunk}])
                     for t in chunk: subscribed_tokens_set.add(t)
                     print(f"📡 Subscribed {len(chunk)} tokens to Etype {etype}")
