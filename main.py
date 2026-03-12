@@ -13,21 +13,6 @@ API_KEY = "85HE4VA1"
 CLIENT_CODE = "S52638556"
 PWD = "0000"
 TOTP_STR = "XFTXZ2445N4V2UMB7EWUCBDRMU"
-import eventlet
-eventlet.monkey_patch()
-
-import os, pyotp, time, datetime, pytz, requests, sqlite3, tempfile, json
-from SmartApi import SmartConnect
-from SmartApi.smartWebSocketV2 import SmartWebSocketV2
-from supabase import create_client
-from flask import Flask
-from flask_socketio import SocketIO, join_room
-
-# --- 1. CONFIG ---
-API_KEY = "85HE4VA1"
-CLIENT_CODE = "S52638556"
-PWD = "0000"
-TOTP_STR = "XFTXZ2445N4V2UMB7EWUCBDRMU"
 IST = pytz.timezone('Asia/Kolkata')
 
 SUPABASE_URL = "https://tnrhlvibaeiwhlrxdxnm.supabase.co"
@@ -177,8 +162,8 @@ def handle_subscribe(json_data):
         for etype, tokens in batches.items():
             if tokens:
                 # API limit 50 tokens per call
-                for i in range(0, len(tokens), 1000):
-                    chunk = tokens[i:i+1000]
+                for i in range(0, len(tokens), 50):
+                    chunk = tokens[i:i+50]
                     sws.subscribe(f"myt_sub_{etype}", 1, [{"exchangeType": etype, "tokens": chunk}])
                     for t in chunk: subscribed_tokens_set.add(t)
                     print(f"📡 Subscribed {len(chunk)} tokens to Etype {etype}")
