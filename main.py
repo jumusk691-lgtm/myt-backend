@@ -13,6 +13,21 @@ API_KEY = "85HE4VA1"
 CLIENT_CODE = "S52638556"
 PWD = "0000"
 TOTP_STR = "XFTXZ2445N4V2UMB7EWUCBDRMU"
+import eventlet
+eventlet.monkey_patch()
+
+import os, pyotp, time, datetime, pytz, requests, sqlite3, tempfile, json
+from SmartApi import SmartConnect
+from SmartApi.smartWebSocketV2 import SmartWebSocketV2
+from supabase import create_client
+from flask import Flask
+from flask_socketio import SocketIO, join_room
+
+# --- 1. CONFIG ---
+API_KEY = "85HE4VA1"
+CLIENT_CODE = "S52638556"
+PWD = "0000"
+TOTP_STR = "XFTXZ2445N4V2UMB7EWUCBDRMU"
 IST = pytz.timezone('Asia/Kolkata')
 
 SUPABASE_URL = "https://tnrhlvibaeiwhlrxdxnm.supabase.co"
@@ -28,9 +43,9 @@ is_ws_ready = False
 subscribed_tokens_set = set() 
 last_master_update_date = None
 
-# --- 2. MASTER DATA SYNC (8:30 AM Logic) ---
+# --- 2. MASTER DATA SYNC ---
 def refresh_supabase_master():
-    print(f"🔄 [System] Overwriting Master Data...")
+    print(f"🔄 [System] Updating Master Data...")
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
@@ -61,29 +76,32 @@ def refresh_supabase_master():
 
 # --- 3. TICK ENGINE ---
 def on_data(wsapp, msg):
-    if isinstance(msg, dict) and 'token' in msg:
-        token = str(msg.get('token'))
-        ltp = float(msg.get('last_traded_price', 0)) / 100
-        
-        if ltp <= 0: return
+    try:
+        if isinstance(msg, dict) and 'token' in msg:
+            token = str(msg.get('token'))
+            ltp = float(msg.get('last_traded_price', 0)) / 100
+            
+            if ltp <= 0: return
 
-        payload = {
-            "t": token,
-            "p": "{:.2f}".format(ltp),
-            "e": str(msg.get('exchange_type', '1'))
-        }
-        
-        # Purana Percentage Change logic
-        if 'close' in msg and float(msg['close']) > 0:
-            cp = float(msg['close']) / 100
-            payload["pc"] = "{:.2f}".format(((ltp - cp) / cp) * 100)
+            payload = {
+                "t": token,
+                "p": "{:.2f}".format(ltp)
+            }
+            
+            # Net Change / Percentage logic
+            if 'close' in msg and float(msg['close']) > 0:
+                cp = float(msg['close']) / 100
+                payload["pc"] = "{:.2f}".format(((ltp - cp) / cp) * 100)
 
-        socketio.emit('live_update', payload, room=token)
+            # Android 'live_update' event sun raha hai
+            socketio.emit('live_update', payload, room=token)
+    except Exception as e:
+        print(f"Tick Data Error: {e}")
 
 def on_open(wsapp):
     global is_ws_ready
     is_ws_ready = True
-    print("🟢 Engine Live: All Segments Ready")
+    print("🟢 Engine Live: Connected to Angel WebSocket")
 
 # --- 4. CONNECTION MANAGER ---
 def run_trading_engine():
@@ -91,9 +109,11 @@ def run_trading_engine():
     while True:
         try:
             now = datetime.datetime.now(IST)
-            if now.hour == 8 and 30 <= now.minute <= 59 and last_master_update_date != now.date():
+            # 8:30 AM Master Data Sync
+            if now.hour == 8 and 30 <= now.minute <= 45 and last_master_update_date != now.date():
                 if refresh_supabase_master(): last_master_update_date = now.date()
 
+            # Market Hours: 9 AM to 11:30 PM (For MCX)
             if 8 <= now.hour < 24:
                 if not is_ws_ready:
                     smart_api = SmartConnect(api_key=API_KEY)
@@ -104,7 +124,7 @@ def run_trading_engine():
                         sws = SmartWebSocketV2(session['data']['jwtToken'], API_KEY, CLIENT_CODE, session['data']['feedToken'])
                         sws.on_data = on_data
                         sws.on_open = on_open
-                        sws.on_error = lambda ws, err: print(f"❌ Error: {err}")
+                        sws.on_error = lambda ws, err: print(f"❌ WebSocket Error: {err}")
                         sws.on_close = lambda ws,c,r: exec("global is_ws_ready; is_ws_ready=False")
                         sws.connect()
             else:
@@ -116,55 +136,59 @@ def run_trading_engine():
             print(f"Loop Error: {e}")
         eventlet.sleep(15)
 
-# --- 5. PURANA SMART SUBSCRIBE LOGIC (Mixed with New SocketIO) ---
+# --- 5. SMART SEGMENT DETECTION & SUBSCRIBE ---
 @socketio.on('subscribe')
 def handle_subscribe(json_data):
-    """
-    APK should send: {"watchlist": [{"token": "123", "symbol": "GOLD", "exch": "MCX"}]}
-    """
     global subscribed_tokens_set, sws, is_ws_ready
     
     watchlist = json_data.get('watchlist', [])
     if not watchlist: return
 
+    # Segment Mapping for Angel One V2
+    # 1:NSE, 2:NFO, 3:BSE, 4:BFO, 5:MCX
     batches = {1: [], 2: [], 3: [], 4: [], 5: []}
 
     for item in watchlist:
         token = str(item.get('token'))
-        symbol = str(item.get('symbol', '')).upper()
         exch = str(item.get('exch', 'NSE')).upper()
+        symbol = str(item.get('symbol', '')).upper()
         
-        if not token or token == "None": continue
+        if not token or token == "None" or token == "": continue
 
-        # User ko room mein join karwao
         join_room(token)
 
-        # Wahi Purana Segment Logic (etype detection)
         if token not in subscribed_tokens_set:
-            etype = 1 # NSE Cash default
+            # Segment Detection
             if "MCX" in exch: 
                 etype = 5
-            elif any(x in symbol for x in ["CE", "PE", "FUT"]) or "NFO" in exch:
-                # Purana NFO/BFO detection
-                etype = 4 if ("SENSEX" in symbol or "BFO" in exch) else 2
+            elif "NFO" in exch or any(x in symbol for x in ["CE", "PE", "FUT"]):
+                etype = 2
+            elif "BFO" in exch:
+                etype = 4
             elif "BSE" in exch: 
                 etype = 3
+            else:
+                etype = 1 # Default NSE Cash
             
             batches[etype].append(token)
 
-    # Angel API Batch Subscribe
+    # Angel Batch Subscription
     if is_ws_ready and sws:
         for etype, tokens in batches.items():
             if tokens:
+                # API limit 50 tokens per call
                 for i in range(0, len(tokens), 50):
-                    b = tokens[i:i+50]
-                    sws.subscribe(f"myt_{etype}", 1, [{"exchangeType": etype, "tokens": b}])
-                    for t in b: subscribed_tokens_set.add(t)
-                    print(f"📡 Subscribed: {len(b)} tokens in Etype {etype}")
+                    chunk = tokens[i:i+50]
+                    sws.subscribe(f"myt_sub_{etype}", 1, [{"exchangeType": etype, "tokens": chunk}])
+                    for t in chunk: subscribed_tokens_set.add(t)
+                    print(f"📡 Subscribed {len(chunk)} tokens to Etype {etype}")
+    else:
+        print("🟠 API not ready, subscription queued.")
 
 @app.route('/')
 def health():
-    return f"Live: {is_ws_ready} | Subscribed: {len(subscribed_tokens_set)}", 200
+    status = "READY" if is_ws_ready else "OFFLINE"
+    return f"Engine: {status} | Tokens: {len(subscribed_tokens_set)}", 200
 
 if __name__ == '__main__':
     socketio.start_background_task(run_trading_engine)
