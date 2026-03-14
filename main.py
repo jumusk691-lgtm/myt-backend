@@ -5,7 +5,7 @@ import os, pyotp, time, datetime, pytz, requests, sqlite3, tempfile, json
 from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 from supabase import create_client
-from flask import Flask, send_file, request
+from flask import Flask, send_file, request, after_this_request
 from flask_socketio import SocketIO, join_room
 
 # --- 1. CONFIG ---
@@ -28,9 +28,9 @@ is_ws_ready = False
 subscribed_tokens_set = set() 
 last_master_update_date = None
 
-# --- 2. MASTER DATA SYNC ---
+# --- 2. MASTER DATA SYNC (Logic: Only Overwrite) ---
 def refresh_supabase_master():
-    print(f"🔄 [System] Updating Master Data...")
+    print(f"🔄 [System] Updating Master Data (Overwriting Existing File)...")
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
@@ -50,10 +50,16 @@ def refresh_supabase_master():
             cursor.executemany("INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?)", data)
             conn.commit()
             conn.close()
+            
+            # x-upsert: true ensures the file is overwritten on Supabase
             with open(temp_path, "rb") as f:
-                supabase.storage.from_(BUCKET_NAME).upload(path="angel_master.db", file=f.read(),
-                                                         file_options={"x-upsert": "true", "content-type": "application/octet-stream"})
+                supabase.storage.from_(BUCKET_NAME).upload(
+                    path="angel_master.db", 
+                    file=f.read(),
+                    file_options={"x-upsert": "true", "content-type": "application/octet-stream"}
+                )
             os.remove(temp_path)
+            print("✅ [System] Master Data Overwritten Successfully.")
             return True
     except Exception as e:
         print(f"❌ Master Error: {e}")
@@ -89,9 +95,14 @@ def on_open(wsapp):
 # --- 4. CONNECTION MANAGER ---
 def run_trading_engine():
     global sws, is_ws_ready, subscribed_tokens_set, last_master_update_date
+    
+    # --- HAR DEPLOY PAR UPDATE ---
+    refresh_supabase_master()
+    
     while True:
         try:
             now = datetime.datetime.now(IST)
+            # --- HAR SUBHA UPDATE ---
             if now.hour == 8 and 30 <= now.minute <= 45 and last_master_update_date != now.date():
                 if refresh_supabase_master(): last_master_update_date = now.date()
 
@@ -169,10 +180,18 @@ def download_db():
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         res = supabase.storage.from_(BUCKET_NAME).download("angel_master.db")
         
+        # Temporary file to store the downloaded content
         with tempfile.NamedTemporaryFile(delete=False) as tmp:
             tmp.write(res)
             tmp_path = tmp.name
         
+        # Ensures local server temp file is deleted after sending to Android
+        @after_this_request
+        def cleanup(response):
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            return response
+            
         return send_file(tmp_path, as_attachment=True, download_name="angel_master.db")
     except Exception as e:
         return f"Error: {e}", 500
