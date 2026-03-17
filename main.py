@@ -8,7 +8,7 @@ from supabase import create_client
 from flask import Flask, send_file, request, after_this_request
 from flask_socketio import SocketIO, join_room, emit
 
-# --- 1. CONFIG & RENDER STABILITY FIX ---
+# --- 1. CONFIG & RENDER STABILITY FIX (LOGIC 1) ---
 API_KEY = "85HE4VA1"
 CLIENT_CODE = "S52638556"
 PWD = "0000"
@@ -20,21 +20,23 @@ SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJ
 BUCKET_NAME = "Myt"
 
 app = Flask(__name__)
-# CRITICAL: Buffer size badhaya aur timeout set kiya taaki "Too many packets" error na aaye
+# Render Payload Error Fix: Buffer size badhaya gaya hai
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet', 
                    ping_timeout=60, ping_interval=25, 
                    max_http_buffer_size=10000000) 
 
-# --- GLOBAL STATE ---
+# --- GLOBAL STATE (LOGIC 2: ELITE MANAGEMENT) ---
 sws = None
 is_ws_ready = False
-subscribed_tokens_set = set() 
-last_tick_time = {} 
-previous_price = {} # 1-sec purana data yaad rakhne ke liye
+subscribed_tokens_set = set() # Global Pooling
+token_masters = {}           # P2P Master-Slave Tracking {token: socket_id}
+last_tick_time = {}          # Throttling
+previous_price = {}          # 1-sec History Memory
+last_master_update_date = None
 
-# --- 2. MASTER DATA SYNC (Indexed) ---
+# --- 2. MASTER DATA SYNC (LOGIC 3: INDEXED SEARCH) ---
 def refresh_supabase_master():
-    print(f"🔄 [System] Updating Master Data (Indexed Search)...")
+    print(f"🔄 [System] Updating Master Data with Indexing...")
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
@@ -54,7 +56,7 @@ def refresh_supabase_master():
                     for i in json_data if i.get('token')]
             cursor.executemany("INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?)", data)
             
-            # Indexing for Fast Search
+            # Speed Indexing
             cursor.execute("CREATE INDEX idx_sym ON symbols(symbol)")
             cursor.execute("CREATE INDEX idx_tok ON symbols(token)")
             
@@ -74,7 +76,7 @@ def refresh_supabase_master():
         print(f"❌ Master Error: {e}")
         return False
 
-# --- 3. ELITE TICK ENGINE (1s Update + 1s History) ---
+# --- 3. TICK ENGINE (LOGIC 4: 1s THROTTLE & HISTORY) ---
 def on_data(wsapp, msg):
     global last_tick_time, previous_price
     try:
@@ -82,14 +84,14 @@ def on_data(wsapp, msg):
             token = str(msg.get('token'))
             curr_time = time.time()
             
-            # Logic: Strictly 1 tick per second per token (Render Stability)
+            # Strict 1-Second Throttling (Render Stability)
             if token in last_tick_time and (curr_time - last_tick_time[token]) < 1.0:
                 return
             
             ltp = float(msg.get('last_traded_price', 0)) / 100
             if ltp <= 0: return
 
-            # Get 1-sec purana price
+            # Get 1-sec purana price for comparison in APK
             old_p = previous_price.get(token, "{:.2f}".format(ltp))
 
             payload = {
@@ -105,13 +107,14 @@ def on_data(wsapp, msg):
                 cp = float(msg['close']) / 100
                 payload["pc"] = "{:.2f}".format(((ltp - cp) / cp) * 100)
 
-            # Update State
+            # Update Memories
             previous_price[token] = "{:.2f}".format(ltp)
             last_tick_time[token] = curr_time
 
+            # Emit to Room
             socketio.emit('live_update', payload, room=token)
             
-            # Memory Cleanup (Logic: Har 5 second baad old logs clean)
+            # 5-Sec Auto Cleanup Logic (Free Tier Memory Management)
             if len(last_tick_time) > 1000:
                 last_tick_time.clear()
                 previous_price.clear()
@@ -119,7 +122,7 @@ def on_data(wsapp, msg):
     except Exception as e:
         print(f"Tick Data Error: {e}")
 
-# --- 4. ENGINE & RECOVERY ---
+# --- 4. ENGINE & SELF-HEALING (LOGIC 5) ---
 def run_trading_engine():
     global sws, is_ws_ready, subscribed_tokens_set, last_master_update_date
     refresh_supabase_master()
@@ -127,11 +130,13 @@ def run_trading_engine():
     while True:
         try:
             now = datetime.datetime.now(IST)
+            # Daily Master Update at 8:30 AM
             if now.hour == 8 and 30 <= now.minute <= 45 and last_master_update_date != now.date():
                 if refresh_supabase_master(): last_master_update_date = now.date()
 
             if 7 <= now.hour < 24:
                 if not is_ws_ready:
+                    print("🔄 [System] Connecting Angel One...")
                     smart_api = SmartConnect(api_key=API_KEY)
                     totp = pyotp.TOTP(TOTP_STR).now()
                     session = smart_api.generateSession(CLIENT_CODE, PWD, totp)
@@ -139,25 +144,32 @@ def run_trading_engine():
                     if session.get('status'):
                         sws = SmartWebSocketV2(session['data']['jwtToken'], API_KEY, CLIENT_CODE, session['data']['feedToken'])
                         sws.on_data = on_data
-                        sws.on_open = lambda ws: exec("global is_ws_ready; is_ws_ready=True")
+                        sws.on_open = lambda ws: exec("global is_ws_ready; is_ws_ready=True; print('🟢 WebSocket Ready')")
                         sws.on_error = lambda ws, err: print(f"❌ WS Error: {err}")
                         sws.on_close = lambda ws,c,r: exec("global is_ws_ready; is_ws_ready=False")
                         sws.connect()
+                        
+                        # Resubscribe tokens if disconnected
+                        eventlet.sleep(2)
+                        if is_ws_ready and subscribed_tokens_set:
+                            # Subscribing in batches logic would go here
+                            pass
             else:
                 if is_ws_ready:
                     sws.close()
                     is_ws_ready = False
                     subscribed_tokens_set.clear()
+                    token_masters.clear()
         except Exception as e:
             print(f"Loop Error: {e}")
-        eventlet.sleep(10)
+        eventlet.sleep(15)
 
-# --- 5. P2P & SUBSCRIPTION ---
+# --- 5. P2P MASTER-SLAVE & SUBSCRIPTION (LOGIC 6) ---
 @socketio.on('subscribe')
 def handle_subscribe(json_data):
-    global subscribed_tokens_set, sws, is_ws_ready
+    global subscribed_tokens_set, token_masters, sws, is_ws_ready
     watchlist = json_data.get('watchlist', [])
-    batches = {1: [], 2: [], 3: [], 4: [], 5: []}
+    new_to_angel = {1: [], 2: [], 3: [], 4: [], 5: []}
 
     for item in watchlist:
         token = str(item.get('token'))
@@ -165,26 +177,37 @@ def handle_subscribe(json_data):
         if not token or token == "None": continue
 
         join_room(token)
-        if token not in subscribed_tokens_set:
-            etype = 1
-            if "MCX" in exch: etype = 5
-            elif "NFO" in exch: etype = 2
-            elif "BSE" in exch: etype = 3
-            batches[etype].append(token)
-            subscribed_tokens_set.add(token)
+
+        # P2P MASTER-SLAVE LOGIC: Check if someone is already a master for this token
+        if token in token_masters and token_masters[token] != request.sid:
+            # Pair this user (Slave) with existing Master
+            emit('p2p_connect_to_master', {'token': token, 'masterId': token_masters[token]}, room=request.sid)
+            print(f"🔗 P2P Pairing: {request.sid} (Slave) -> {token_masters[token]} (Master) for {token}")
+        else:
+            # Set this user as the Master for this token
+            token_masters[token] = request.sid
+            
+            # Global Pooling: Only subscribe to Angel One if not already in set
+            if token not in subscribed_tokens_set:
+                etype = 1
+                if "MCX" in exch: etype = 5
+                elif "NFO" in exch: etype = 2
+                elif "BSE" in exch: etype = 3
+                new_to_angel[etype].append(token)
+                subscribed_tokens_set.add(token)
 
     if is_ws_ready and sws:
-        for etype, tokens in batches.items():
+        for etype, tokens in new_to_angel.items():
             if tokens:
                 sws.subscribe(f"sub_{etype}", 1, [{"exchangeType": etype, "tokens": tokens}])
 
-# --- P2P SIGNALING ---
+# --- 6. P2P SIGNALING BRIDGE (LOGIC 7) ---
 @socketio.on('join_p2p')
 def on_p2p_join(data):
     user_id = data.get('user_id')
     if user_id:
         join_room(user_id)
-        print(f"📱 P2P Node: {user_id}")
+        print(f"📱 P2P Node Registered: {user_id}")
 
 @socketio.on('p2p_signal')
 def forward_signal(data):
@@ -197,7 +220,16 @@ def forward_ice(data):
     target = data.get('targetId')
     emit('ice_candidate', data, room=target)
 
-# --- 6. ROUTES ---
+@socketio.on('disconnect')
+def on_disconnect():
+    global token_masters
+    # Cleanup token masters if they disconnect
+    for token, master_id in list(token_masters.items()):
+        if master_id == request.sid:
+            del token_masters[token]
+            print(f"🧹 Cleanup: Master left for token {token}")
+
+# --- 7. ROUTES & HEALTH (LOGIC 8) ---
 @app.route('/download_db')
 def download_db():
     try:
@@ -225,14 +257,18 @@ def get_history():
         from_date = (datetime.datetime.now(IST) - datetime.timedelta(days=90)).strftime('%Y-%m-%d %H:%M')
         res = smart_api.getCandleData({"exchange": exch, "symboltoken": token, "interval": "FIVE_MINUTE", "fromdate": from_date, "todate": to_date})
         if res.get('status'):
-            return json.dumps([{"time": int(datetime.datetime.strptime(c[0], "%Y-%m-%dT%H:%M:%S%z").timestamp()), "open": c[1], "high": c[2], "low": c[3], "close": c[4]} for c in res['data']])
+            return json.dumps([{"time": int(datetime.datetime.strptime(c[0], "%Y-%m-%dT%H:%M:%S%z").timestamp()), 
+                               "open": c[1], "high": c[2], "low": c[3], "close": c[4]} for c in res['data']])
         return "Error", 404
     except Exception as e: return str(e), 500
 
 @app.route('/')
 def health():
-    # Logic: Har hit par status check
-    return f"Engine: {'READY' if is_ws_ready else 'OFFLINE'} | Tokens: {len(subscribed_tokens_set)}", 200
+    return {
+        "engine": "READY" if is_ws_ready else "OFFLINE",
+        "active_tokens": len(subscribed_tokens_set),
+        "p2p_masters": len(token_masters)
+    }, 200
 
 if __name__ == '__main__':
     socketio.start_background_task(run_trading_engine)
