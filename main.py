@@ -83,6 +83,7 @@ def on_data(wsapp, msg):
                 cp = float(msg['close']) / 100
                 payload["pc"] = "{:.2f}".format(((ltp - cp) / cp) * 100)
 
+            # Room Based Broadcast: Sirf un users ko jayega jo is token room mein hain
             socketio.emit('live_update', payload, room=token)
     except Exception as e:
         print(f"Tick Data Error: {e}")
@@ -134,7 +135,9 @@ def handle_subscribe(json_data):
     global subscribed_tokens_set, sws, is_ws_ready
     
     watchlist = json_data.get('watchlist', [])
-    if not watchlist: return
+    if not watchlist: 
+        print("⚠️ No watchlist received")
+        return
 
     batches = {1: [], 2: [], 3: [], 4: [], 5: []}
 
@@ -145,8 +148,11 @@ def handle_subscribe(json_data):
         
         if not token or token == "None" or token == "": continue
 
+        # [CRITICAL FIX]: Room join har device ke liye hona chahiye
         join_room(token)
+        print(f"👤 Device joined room: {token}")
 
+        # Check karo agar token Angel One se subscribe karna hai ya pehle se ho chuka hai
         if token not in subscribed_tokens_set:
             if "MCX" in exch: 
                 etype = 5
@@ -161,6 +167,7 @@ def handle_subscribe(json_data):
             
             batches[etype].append(token)
 
+    # Angel One Engine ko subscription bhej rahe hain
     if is_ws_ready and sws:
         for etype, tokens in batches.items():
             if tokens:
@@ -168,24 +175,21 @@ def handle_subscribe(json_data):
                     chunk = tokens[i:i+50]
                     sws.subscribe(f"myt_sub_{etype}", 1, [{"exchangeType": etype, "tokens": chunk}])
                     for t in chunk: subscribed_tokens_set.add(t)
-                    print(f"📡 Subscribed {len(chunk)} tokens to Etype {etype}")
+                    print(f"📡 Angel One: Subscribed {len(chunk)} tokens to Etype {etype}")
     else:
-        print("🟠 API not ready, subscription queued.")
+        print("🟠 API not ready, room joined but subscription queued.")
 
-# --- 6. NEW: DATABASE DOWNLOAD (For Android Client) ---
+# --- 6. DATABASE DOWNLOAD (For Android Client) ---
 @app.route('/download_db')
 def download_db():
-    """यूजर इस URL से नई SQLite फाइल डाउनलोड कर सकता है"""
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         res = supabase.storage.from_(BUCKET_NAME).download("angel_master.db")
         
-        # Temporary file to store the downloaded content
         with tempfile.NamedTemporaryFile(delete=False) as tmp:
             tmp.write(res)
             tmp_path = tmp.name
         
-        # Ensures local server temp file is deleted after sending to Android
         @after_this_request
         def cleanup(response):
             if os.path.exists(tmp_path):
@@ -196,13 +200,12 @@ def download_db():
     except Exception as e:
         return f"Error: {e}", 500
 
-# --- 7. NEW: HISTORICAL DATA (For 3-Month Candles) ---
+# --- 7. HISTORICAL DATA (For 3-Month Candles) ---
 @app.route('/history')
 def get_history():
-    """Android ऐप यहाँ से 3 महीने की कैंडल लेगी"""
     token = request.args.get('token')
     exch = request.args.get('exch', 'NSE').upper()
-    interval = request.args.get('interval', 'FIVE_MINUTE') # 1, 3, 5, 15, 30, DAY
+    interval = request.args.get('interval', 'FIVE_MINUTE') 
 
     if not token: return "Token required", 400
 
@@ -211,7 +214,6 @@ def get_history():
         totp = pyotp.TOTP(TOTP_STR).now()
         smart_api.generateSession(CLIENT_CODE, PWD, totp)
 
-        # 3 महीने पहले से आज तक का समय
         to_date = datetime.datetime.now(IST).strftime('%Y-%m-%d %H:%M')
         from_date = (datetime.datetime.now(IST) - datetime.timedelta(days=90)).strftime('%Y-%m-%d %H:%M')
 
@@ -226,10 +228,8 @@ def get_history():
         res = smart_api.getCandleData(params)
         
         if res.get('status') and res.get('data'):
-            # TradingView फॉर्मेट में डेटा बदलें
             formatted = []
             for c in res['data']:
-                # c = [time, open, high, low, close, volume]
                 t_obj = datetime.datetime.strptime(c[0], "%Y-%m-%dT%H:%M:%S%z")
                 formatted.append({
                     "time": int(t_obj.timestamp()),
