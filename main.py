@@ -1,5 +1,5 @@
 import eventlet
-eventlet.monkey_patch() # DNS Stability aur networking ke liye sabse upar hona chahiye
+eventlet.monkey_patch() 
 
 import os
 import pyotp
@@ -34,7 +34,6 @@ BUCKET_NAME = "Myt"
 
 app = Flask(__name__)
 
-# Render ke liye CORS aur Buffer size optimized
 socketio = SocketIO(
     app, 
     cors_allowed_origins="*", 
@@ -68,7 +67,7 @@ def check_dns(host="apiconnect.angelone.in"):
         return False
 
 # ==============================================================================
-# --- 4. MASTER DATA ENGINE (2 DAYS LOGIC) ---
+# --- 4. MASTER DATA ENGINE ---
 # ==============================================================================
 def refresh_supabase_master():
     print(f"🔄 [System] {datetime.datetime.now(IST)}: Master Data Sync Started...")
@@ -76,7 +75,7 @@ def refresh_supabase_master():
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
         
-        response = requests.get(url, timeout=60) # Timeout badha diya Render ke liye
+        response = requests.get(url, timeout=60)
         if response.status_code == 200:
             json_data = response.json()
             with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
@@ -114,24 +113,21 @@ def refresh_supabase_master():
         return False
 
 # ==============================================================================
-# --- 5. DATA BROADCASTER & AUTO CLEANER (5 SEC) ---
+# --- 5. DATA BROADCASTER ---
 # ==============================================================================
 def auto_batch_broadcaster():
-    global live_data_queue, token_masters, last_tick_time, previous_price
+    global live_data_queue, last_tick_time, previous_price
     last_clean_time = time.time()
     
     while True:
         try:
-            # BROADCASTER LOGIC
             if live_data_queue:
                 current_items = list(live_data_queue.items())
                 live_data_queue.clear() 
 
                 for token, payload in current_items:
-                    # Sabhi rooms (tokens) mein data broadcast karna
                     socketio.emit('live_update', payload, to=token)
             
-            # AUTO CLEANER LOGIC (Runs every 5 seconds)
             if time.time() - last_clean_time > 5:
                 if len(last_tick_time) > 1500:
                     last_tick_time.clear()
@@ -141,7 +137,6 @@ def auto_batch_broadcaster():
                 
             eventlet.sleep(0.1) 
         except Exception as e:
-            print(f"⚠️ Broadcaster Error: {e}")
             eventlet.sleep(1)
 
 # ==============================================================================
@@ -174,11 +169,11 @@ def on_data(wsapp, msg):
             previous_price[token] = "{:.2f}".format(ltp)
             last_tick_time[token] = curr_time
             live_data_queue[token] = payload
-    except Exception as e:
-        print(f"⚠️ [Tick Error] {e}")
+    except:
+        pass
 
 # ==============================================================================
-# --- 7. SELF-HEALING ENGINE (24/7 LOGIC) ---
+# --- 7. SELF-HEALING ENGINE ---
 # ==============================================================================
 def run_trading_engine():
     global sws, is_ws_ready, subscribed_tokens_set, last_master_update_date
@@ -191,63 +186,49 @@ def run_trading_engine():
         try:
             now = datetime.datetime.now(IST)
             
-            days_since_update = (now.date() - last_master_update_date).days
-            if days_since_update >= 2 and now.hour == 8 and 30 <= now.minute <= 45:
-                if refresh_supabase_master():
-                    last_master_update_date = now.date()
-
             if not is_ws_ready:
                 if not check_dns():
-                    print("🚫 DNS Wait: Retrying connection...")
                     eventlet.sleep(10)
                     continue
 
-                print(f"🔄 [Engine] Connecting Angel One...")
                 smart_api = SmartConnect(api_key=API_KEY)
                 try:
                     totp = pyotp.TOTP(TOTP_STR).now()
                     session = smart_api.generateSession(CLIENT_CODE, MPIN, totp)
                     
                     if session and session.get('status'):
-                        print("🟢 [Engine] WebSocket Initializing...")
                         sws = SmartWebSocketV2(session['data']['jwtToken'], API_KEY, CLIENT_CODE, session['data']['feedToken'])
                         
                         def on_open_wrapper(ws):
                             global is_ws_ready
                             is_ws_ready = True
-                            print('💎 WS Live!')
+                            print('💎 WS Connected!')
 
                         def on_close_wrapper(ws, code, reason):
                             global is_ws_ready
                             is_ws_ready = False
-                            print(f'🔴 WS Closed: {reason}')
 
                         sws.on_data = on_data
                         sws.on_open = on_open_wrapper
-                        sws.on_error = lambda ws, err: print(f"❌ WS Error: {err}")
                         sws.on_close = on_close_wrapper
                         sws.connect()
                     else:
-                        print(f"❌ [Login Error] {session.get('message') if session else 'Timeout'}")
-                except Exception as login_err:
-                    print(f"⚠️ Login Failed: {login_err}")
+                        print(f"❌ Login Failed: {session.get('message') if session else 'Timeout'}")
+                except Exception as e:
+                    print(f"⚠️ Connection Error: {e}")
             
         except Exception as e:
-            print(f"🔴 [Engine Critical] {e}")
             is_ws_ready = False
         eventlet.sleep(20)
 
 # ==============================================================================
-# --- 8. SUBSCRIPTION & SCORE LOGIC ---
+# --- 8. EVENTS & API ---
 # ==============================================================================
 @socketio.on('subscribe')
 def handle_subscribe(json_data):
-    global subscribed_tokens_set, sws, is_ws_ready, token_masters, user_scores
+    global subscribed_tokens_set, sws, is_ws_ready
     watchlist = json_data.get('watchlist', [])
     if not watchlist: return
-
-    sid = request.sid
-    user_scores[sid] = user_scores.get(sid, 0) + 1
 
     batches = {1: [], 2: [], 3: [], 4: [], 5: []}
     for item in watchlist:
@@ -257,12 +238,6 @@ def handle_subscribe(json_data):
         if not token or token == "None": continue
 
         join_room(token)
-        if token not in token_masters: token_masters[token] = []
-        if sid not in token_masters[token]: token_masters[token].append(sid)
-
-        if len(token_masters[token]) > 1:
-            emit('p2p_assign', {'token': token, 'master_sid': token_masters[token][0]}, to=sid)
-
         if token not in subscribed_tokens_set:
             if "MCX" in exch: etype = 5
             elif "BFO" in exch or "SENSEX" in symbol: etype = 4
@@ -273,57 +248,10 @@ def handle_subscribe(json_data):
 
     if is_ws_ready and sws:
         for etype, tokens in batches.items():
-            for i in range(0, len(tokens), 50):
-                chunk = tokens[i : i + 50]
-                try:
-                    sws.subscribe(f"myt_{etype}_{time.time()}", 1, [{"exchangeType": etype, "tokens": chunk}])
-                    for t in chunk: subscribed_tokens_set.add(t)
-                    eventlet.sleep(0.2)
-                except: pass
-
-# ==============================================================================
-# --- 9. SIGNALING & DISCONNECT ---
-# ==============================================================================
-@socketio.on('p2p_signal')
-def forward_signal(data):
-    target = data.get('targetId')
-    data['senderId'] = request.sid
-    emit('p2p_signal', data, to=target)
-
-@socketio.on('ice_candidate')
-def forward_ice(data):
-    target = data.get('targetId')
-    emit('ice_candidate', data, to=target)
-
-@socketio.on('disconnect')
-def on_disconnect():
-    global token_masters
-    sid = request.sid
-    for token in list(token_masters.keys()):
-        if sid in token_masters[token]:
-            token_masters[token].remove(sid)
-            if not token_masters[token]: del token_masters[token]
-
-# ==============================================================================
-# --- 10. API & MAIN ---
-# ==============================================================================
-@app.route('/history')
-def get_history():
-    token = request.args.get('token')
-    exch = request.args.get('exch', 'NSE').upper()
-    try:
-        smart_api = SmartConnect(api_key=API_KEY)
-        smart_api.generateSession(CLIENT_CODE, MPIN, pyotp.TOTP(TOTP_STR).now())
-        res = smart_api.getCandleData({
-            "exchange": exch, "symboltoken": token, "interval": "FIVE_MINUTE", 
-            "fromdate": (datetime.datetime.now(IST) - datetime.timedelta(days=90)).strftime('%Y-%m-%d %H:%M'),
-            "todate": datetime.datetime.now(IST).strftime('%Y-%m-%d %H:%M')
-        })
-        if res.get('status'):
-            return jsonify([{"time": int(datetime.datetime.strptime(c[0], "%Y-%m-%dT%H:%M:%S%z").timestamp()), 
-                             "open": c[1], "high": c[2], "low": c[3], "close": c[4]} for c in res['data']])
-        return jsonify({"error": "No data"}), 404
-    except Exception as e: return str(e), 500
+            if tokens:
+                sws.subscribe(f"sub_{time.time()}", 1, [{"exchangeType": etype, "tokens": tokens}])
+                for t in tokens: subscribed_tokens_set.add(t)
+                eventlet.sleep(0.2)
 
 @app.route('/')
 def health():
@@ -334,7 +262,5 @@ if __name__ == '__main__':
     socketio.start_background_task(run_trading_engine)
     
     port = int(os.environ.get("PORT", 10000))
-    print(f"🚀 Starting server on port {port}...")
-    
     import eventlet.wsgi
     eventlet.wsgi.server(eventlet.listen(('0.0.0.0', port)), app)
