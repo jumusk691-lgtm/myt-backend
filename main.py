@@ -54,10 +54,9 @@ live_data_queue = {}
 last_tick_time = {}                
 previous_price = {}                
 last_master_update_date = None
-user_scores = {} 
 
 # ==============================================================================
-# --- 3. DNS HELPERS ---
+# --- 3. DNS & IP HELPERS (STABILITY FIX) ---
 # ==============================================================================
 def check_dns(host="apiconnect.angelone.in"):
     try:
@@ -136,7 +135,7 @@ def auto_batch_broadcaster():
                 last_clean_time = time.time()
                 
             eventlet.sleep(0.1) 
-        except Exception as e:
+        except:
             eventlet.sleep(1)
 
 # ==============================================================================
@@ -173,7 +172,7 @@ def on_data(wsapp, msg):
         pass
 
 # ==============================================================================
-# --- 7. SELF-HEALING ENGINE (FIXED LOGIN) ---
+# --- 7. SELF-HEALING ENGINE (IP TIMEOUT FIX) ---
 # ==============================================================================
 def run_trading_engine():
     global sws, is_ws_ready, subscribed_tokens_set, last_master_update_date
@@ -189,9 +188,13 @@ def run_trading_engine():
                     eventlet.sleep(10)
                     continue
 
-                # SmartConnect initialization with disable_ssl logic to bypass ipify check
+                # SmartConnect logic with forced timeout handling
                 smart_api = SmartConnect(api_key=API_KEY)
                 try:
+                    # Manually setting a placeholder local IP to bypass ipify check failures
+                    smart_api.local_ip = "127.0.0.1" 
+                    smart_api.public_ip = "1.1.1.1"
+                    
                     totp = pyotp.TOTP(TOTP_STR).now()
                     session = smart_api.generateSession(CLIENT_CODE, MPIN, totp)
                     
@@ -201,22 +204,23 @@ def run_trading_engine():
                         def on_open_wrapper(ws):
                             global is_ws_ready
                             is_ws_ready = True
-                            print('💎 WS Connected!')
+                            print('🟢 [Engine] WebSocket Live!')
 
                         def on_close_wrapper(ws, code, reason):
                             global is_ws_ready
                             is_ws_ready = False
+                            print('🔴 [Engine] WS Disconnected.')
 
                         sws.on_data = on_data
                         sws.on_open = on_open_wrapper
                         sws.on_close = on_close_wrapper
                         sws.connect()
                     else:
-                        print(f"❌ Login Error: {session.get('message') if session else 'Timeout'}")
+                        print(f"❌ Login Error: {session.get('message', 'Timeout')}")
                 except Exception as e:
-                    print(f"⚠️ Session Attempt Failed: {e}")
+                    print(f"⚠️ Session Fail: {str(e)[:50]}")
             
-        except Exception as e:
+        except:
             is_ws_ready = False
         eventlet.sleep(20)
 
@@ -234,7 +238,7 @@ def handle_subscribe(json_data):
         token = str(item.get('token'))
         exch = str(item.get('exch', 'NSE')).upper()
         symbol = str(item.get('symbol', '')).upper()
-        if not token or token == "None": continue
+        if not token: continue
 
         join_room(token)
         if token not in subscribed_tokens_set:
@@ -251,7 +255,7 @@ def handle_subscribe(json_data):
                 try:
                     sws.subscribe(f"sub_{time.time()}", 1, [{"exchangeType": etype, "tokens": tokens}])
                     for t in tokens: subscribed_tokens_set.add(t)
-                    eventlet.sleep(0.2)
+                    eventlet.sleep(0.1)
                 except: pass
 
 @app.route('/')
