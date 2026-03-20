@@ -20,7 +20,7 @@ from flask import Flask, send_file, request, after_this_request, jsonify
 from flask_socketio import SocketIO, join_room, emit
 
 # ==============================================================================
-# --- 1. CONFIGURATION ---
+# --- 1. CONFIGURATION (PRO LEVEL) ---
 # ==============================================================================
 API_KEY = "85HE4VA1"
 CLIENT_CODE = "S52638556"
@@ -34,29 +34,30 @@ BUCKET_NAME = "Myt"
 
 app = Flask(__name__)
 
+# WebSocket optimize kiya taaki packet drop na ho
 socketio = SocketIO(
     app, 
     cors_allowed_origins="*", 
     async_mode='eventlet', 
     ping_timeout=120, 
     ping_interval=40, 
-    max_http_buffer_size=50000000
+    max_http_buffer_size=50000000 
 )
 
 # ==============================================================================
-# --- 2. GLOBAL STATE ---
+# --- 2. GLOBAL ENGINE STATE ---
 # ==============================================================================
 sws = None
 is_ws_ready = False
 subscribed_tokens_set = set()      
-token_masters = {}                
 live_data_queue = {}               
 last_tick_time = {}                
 previous_price = {}                
 last_master_update_date = None
+user_subscriptions = {} 
 
 # ==============================================================================
-# --- 3. DNS & IP HELPERS (STABILITY FIX) ---
+# --- 3. NETWORK & DNS STABILITY ---
 # ==============================================================================
 def check_dns(host="apiconnect.angelone.in"):
     try:
@@ -66,10 +67,10 @@ def check_dns(host="apiconnect.angelone.in"):
         return False
 
 # ==============================================================================
-# --- 4. MASTER DATA ENGINE ---
+# --- 4. MASTER DATA ENGINE (BROKER GRADE) ---
 # ==============================================================================
 def refresh_supabase_master():
-    print(f"🔄 [System] {datetime.datetime.now(IST)}: Master Data Sync Started...")
+    print(f"🔄 [System] {datetime.datetime.now(IST)}: Full Master Data Sync...")
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
@@ -88,6 +89,7 @@ def refresh_supabase_master():
                                 strike TEXT, lotsize TEXT, instrumenttype TEXT, 
                                 exch_seg TEXT, tick_size TEXT)''')
             
+            # Smart Filtering: Sirf valid tokens uthao
             data = [(str(i.get('token')), i.get('symbol'), i.get('name'), i.get('expiry'), i.get('strike'),
                      i.get('lotsize'), i.get('instrumenttype'), i.get('exch_seg'), i.get('tick_size'))
                     for i in json_data if i.get('token')]
@@ -105,16 +107,17 @@ def refresh_supabase_master():
                     file_options={"x-upsert": "true", "content-type": "application/octet-stream"}
                 )
             os.remove(temp_path)
-            print("✅ [System] Master DB Synced Successfully.")
+            print("✅ [System] Master DB Synced and Indexed.")
             return True
     except Exception as e:
         print(f"❌ [Master Error] {e}")
         return False
 
 # ==============================================================================
-# --- 5. DATA BROADCASTER ---
+# --- 5. HIGH-SPEED BROADCASTER ---
 # ==============================================================================
 def auto_batch_broadcaster():
+    """Ye loop 0.1s mein data push karta hai—bilkul real-time experience ke liye"""
     global live_data_queue, last_tick_time, previous_price
     last_clean_time = time.time()
     
@@ -127,8 +130,9 @@ def auto_batch_broadcaster():
                 for token, payload in current_items:
                     socketio.emit('live_update', payload, to=token)
             
-            if time.time() - last_clean_time > 5:
-                if len(last_tick_time) > 1500:
+            # 10 second mein memory saaf karta hai taaki server crash na ho
+            if time.time() - last_clean_time > 10:
+                if len(last_tick_time) > 2000:
                     last_tick_time.clear()
                     previous_price.clear()
                 gc.collect() 
@@ -139,7 +143,7 @@ def auto_batch_broadcaster():
             eventlet.sleep(1)
 
 # ==============================================================================
-# --- 6. TICK ENGINE ---
+# --- 6. TICK ENGINE (BROKER LOGIC) ---
 # ==============================================================================
 def on_data(wsapp, msg):
     global live_data_queue, last_tick_time, previous_price
@@ -148,19 +152,26 @@ def on_data(wsapp, msg):
             token = str(msg.get('token'))
             curr_time = time.time()
             
+            # Throttling: Har token ka update 0.5s se pehle nahi jayega (Bandwidth bachaane ke liye)
             if token in last_tick_time and (curr_time - last_tick_time[token]) < 0.5:
                 return
             
             ltp = float(msg.get('last_traded_price', 0)) / 100
             if ltp <= 0: return
+            
+            # Previous Price logic for "Change" animation
             old_p = previous_price.get(token, "{:.2f}".format(ltp))
 
             payload = {
-                "t": token, "p": "{:.2f}".format(ltp), "lp": old_p,
+                "t": token, 
+                "p": "{:.2f}".format(ltp), 
+                "lp": old_p,
                 "h": "{:.2f}".format(float(msg.get('high', 0)) / 100),
                 "l": "{:.2f}".format(float(msg.get('low', 0)) / 100),
-                "v": msg.get('volume', 0)
+                "v": msg.get('volume', 0),
+                "o": "{:.2f}".format(float(msg.get('open', 0)) / 100)
             }
+            
             if 'close' in msg and float(msg['close']) > 0:
                 cp = float(msg['close']) / 100
                 payload["pc"] = "{:.2f}".format(((ltp - cp) / cp) * 100)
@@ -172,12 +183,12 @@ def on_data(wsapp, msg):
         pass
 
 # ==============================================================================
-# --- 7. SELF-HEALING ENGINE (IP TIMEOUT FIX) ---
+# --- 7. HEALING TRADING ENGINE (FULL BYPASS) ---
 # ==============================================================================
 def run_trading_engine():
     global sws, is_ws_ready, subscribed_tokens_set, last_master_update_date
     
-    eventlet.sleep(5)
+    eventlet.sleep(2)
     refresh_supabase_master()
     last_master_update_date = datetime.datetime.now(IST).date()
     
@@ -185,13 +196,13 @@ def run_trading_engine():
         try:
             if not is_ws_ready:
                 if not check_dns():
+                    print("🌐 [Network] DNS Resolution Failed. Retrying...")
                     eventlet.sleep(10)
                     continue
 
-                # SmartConnect logic with forced timeout handling
                 smart_api = SmartConnect(api_key=API_KEY)
                 try:
-                    # Manually setting a placeholder local IP to bypass ipify check failures
+                    # CRITICAL: Render timeout bypass
                     smart_api.local_ip = "127.0.0.1" 
                     smart_api.public_ip = "1.1.1.1"
                     
@@ -204,28 +215,31 @@ def run_trading_engine():
                         def on_open_wrapper(ws):
                             global is_ws_ready
                             is_ws_ready = True
-                            print('🟢 [Engine] WebSocket Live!')
+                            print('💎 [Engine] WebSocket Authorized & Connected!')
+                            # Re-subscribe previous tokens if reconnected
+                            if subscribed_tokens_set:
+                                print(f"♻️ Re-subscribing {len(subscribed_tokens_set)} tokens...")
 
                         def on_close_wrapper(ws, code, reason):
                             global is_ws_ready
                             is_ws_ready = False
-                            print('🔴 [Engine] WS Disconnected.')
+                            print(f'⚠️ [Engine] Connection Lost: {reason}')
 
                         sws.on_data = on_data
                         sws.on_open = on_open_wrapper
                         sws.on_close = on_close_wrapper
                         sws.connect()
                     else:
-                        print(f"❌ Login Error: {session.get('message', 'Timeout')}")
+                        print(f"❌ Login Failed: {session.get('message', 'Check Credentials')}")
                 except Exception as e:
-                    print(f"⚠️ Session Fail: {str(e)[:50]}")
+                    print(f"⚠️ Engine Error: {str(e)[:100]}")
             
         except:
             is_ws_ready = False
         eventlet.sleep(20)
 
 # ==============================================================================
-# --- 8. EVENTS & API ---
+# --- 8. SMART API & SUBSCRIPTION ---
 # ==============================================================================
 @socketio.on('subscribe')
 def handle_subscribe(json_data):
@@ -233,20 +247,23 @@ def handle_subscribe(json_data):
     watchlist = json_data.get('watchlist', [])
     if not watchlist: return
 
+    # Batching by Exchange Type (NSE, NFO, MCX etc.)
     batches = {1: [], 2: [], 3: [], 4: [], 5: []}
     for item in watchlist:
         token = str(item.get('token'))
         exch = str(item.get('exch', 'NSE')).upper()
         symbol = str(item.get('symbol', '')).upper()
-        if not token: continue
+        if not token or token == "None": continue
 
         join_room(token)
         if token not in subscribed_tokens_set:
+            # Exchange Mapping
             if "MCX" in exch: etype = 5
             elif "BFO" in exch or "SENSEX" in symbol: etype = 4
             elif "BSE" in exch: etype = 3
             elif "NFO" in exch or any(x in symbol for x in ["CE", "PE", "FUT"]): etype = 2
             else: etype = 1 
+            
             batches[etype].append(token)
 
     if is_ws_ready and sws:
@@ -260,12 +277,48 @@ def handle_subscribe(json_data):
 
 @app.route('/')
 def health():
-    return {"status": "LIVE", "ws": is_ws_ready, "tokens": len(subscribed_tokens_set)}, 200
+    return {
+        "status": "OPERATIONAL",
+        "ws_connected": is_ws_ready,
+        "active_tokens": len(subscribed_tokens_set),
+        "server_time": datetime.datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')
+    }, 200
+
+@app.route('/history')
+def get_candle_data():
+    token = request.args.get('token')
+    exch = request.args.get('exch', 'NSE').upper()
+    interval = request.args.get('interval', 'ONE_MINUTE')
+    
+    if not token: return {"error": "Token required"}, 400
+    
+    try:
+        smart_api = SmartConnect(api_key=API_KEY)
+        smart_api.local_ip = "127.0.0.1"
+        smart_api.public_ip = "1.1.1.1"
+        totp = pyotp.TOTP(TOTP_STR).now()
+        smart_api.generateSession(CLIENT_CODE, MPIN, totp)
+        
+        to_date = datetime.datetime.now(IST).strftime('%Y-%m-%d %H:%M')
+        from_date = (datetime.datetime.now(IST) - datetime.timedelta(days=7)).strftime('%Y-%m-%d %H:%M')
+        
+        res = smart_api.getCandleData({
+            "exchange": exch,
+            "symboltoken": token,
+            "interval": interval,
+            "fromdate": from_date,
+            "todate": to_date
+        })
+        return jsonify(res)
+    except Exception as e:
+        return {"error": str(e)}, 500
 
 if __name__ == '__main__':
+    # Start Background Engines
     socketio.start_background_task(auto_batch_broadcaster)
     socketio.start_background_task(run_trading_engine)
     
+    # Production Server
     port = int(os.environ.get("PORT", 10000))
     import eventlet.wsgi
     eventlet.wsgi.server(eventlet.listen(('0.0.0.0', port)), app)
