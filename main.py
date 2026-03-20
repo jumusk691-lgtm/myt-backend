@@ -54,6 +54,9 @@ last_tick_time = {}
 previous_price = {}                
 last_master_update_date = None
 
+# New Global State for Score Tracking
+user_scores = {} # Dictionary to keep track of scores
+
 # ==============================================================================
 # --- 3. MASTER DATA ENGINE ---
 # ==============================================================================
@@ -63,7 +66,6 @@ def refresh_supabase_master():
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
         
-        # Logic: Increased timeout and retries for Render stability
         response = requests.get(url, timeout=30)
         if response.status_code == 200:
             json_data = response.json()
@@ -200,16 +202,21 @@ def run_trading_engine():
         except Exception as e:
             print(f"🔴 [Engine Loop Critical] {e}")
             is_ws_ready = False
-        eventlet.sleep(30) # Increased wait time for stability
+        eventlet.sleep(30)
 
 # ==============================================================================
-# --- 7. SUBSCRIPTION ---
+# --- 7. SUBSCRIPTION & SCORE LOGIC ---
 # ==============================================================================
 @socketio.on('subscribe')
 def handle_subscribe(json_data):
-    global subscribed_tokens_set, sws, is_ws_ready, token_masters
+    global subscribed_tokens_set, sws, is_ws_ready, token_masters, user_scores
     watchlist = json_data.get('watchlist', [])
     if not watchlist: return
+
+    # Update Score logic: increment score on every subscription attempt
+    sid = request.sid
+    user_scores[sid] = user_scores.get(sid, 0) + 1
+    print(f"📈 [Score] SID {sid} updated to: {user_scores[sid]}")
 
     batches = {1: [], 2: [], 3: [], 4: [], 5: []}
     for item in watchlist:
@@ -259,10 +266,15 @@ def forward_ice(data):
 
 @socketio.on('disconnect')
 def on_disconnect():
-    global token_masters
+    global token_masters, user_scores
+    sid = request.sid
+    if sid in user_scores:
+        print(f"📉 [Score] Final score for {sid}: {user_scores[sid]}")
+        # Not deleting score here to keep it for history if needed
+    
     for token in list(token_masters.keys()):
-        if request.sid in token_masters[token]:
-            token_masters[token].remove(request.sid)
+        if sid in token_masters[token]:
+            token_masters[token].remove(sid)
             if not token_masters[token]: del token_masters[token]
 
 # ==============================================================================
@@ -285,6 +297,10 @@ def get_history():
                              "open": c[1], "high": c[2], "low": c[3], "close": c[4]} for c in res['data']])
         return jsonify({"error": "No data"}), 404
     except Exception as e: return str(e), 500
+
+@app.route('/score')
+def get_score():
+    return jsonify(user_scores), 200
 
 @app.route('/')
 def health():
