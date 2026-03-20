@@ -11,7 +11,7 @@ from flask_socketio import SocketIO, join_room, emit
 # --- 1. CONFIG ---
 API_KEY = "85HE4VA1"
 CLIENT_CODE = "S52638556"
-PWD = "0000"
+MPIN = "0000"
 TOTP_STR = "XFTXZ2445N4V2UMB7EWUCBDRMU"
 IST = pytz.timezone('Asia/Kolkata')
 
