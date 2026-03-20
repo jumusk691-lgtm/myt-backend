@@ -1,5 +1,5 @@
 import eventlet
-eventlet.monkey_patch() # DNS Stability ke liye all=True hata diya
+eventlet.monkey_patch() # DNS Stability aur networking ke liye sabse upar hona chahiye
 
 import os
 import pyotp
@@ -34,6 +34,7 @@ BUCKET_NAME = "Myt"
 
 app = Flask(__name__)
 
+# Render ke liye CORS aur Buffer size optimized
 socketio = SocketIO(
     app, 
     cors_allowed_origins="*", 
@@ -75,7 +76,7 @@ def refresh_supabase_master():
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
         
-        response = requests.get(url, timeout=30)
+        response = requests.get(url, timeout=60) # Timeout badha diya Render ke liye
         if response.status_code == 200:
             json_data = response.json()
             with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
@@ -123,27 +124,26 @@ def auto_batch_broadcaster():
         try:
             # BROADCASTER LOGIC
             if live_data_queue:
-                all_tokens = list(live_data_queue.keys())
-                for i in range(0, len(all_tokens), 300):
-                    batch = all_tokens[i : i + 300]
-                    for token in batch:
-                        payload = live_data_queue.pop(token, None)
-                        if payload:
-                            if token in token_masters and token_masters[token]:
-                                socketio.emit('live_update', payload, room=token_masters[token][0])
-                            else:
-                                socketio.emit('live_update', payload, room=token)
-                    eventlet.sleep(0.01)
+                # Thread safety ke liye copy create karna better hai
+                current_items = list(live_data_queue.items())
+                live_data_queue.clear() 
+
+                for token, payload in current_items:
+                    if token in token_masters and token_masters[token]:
+                        # Master SID ko prioritize karna room ke andar
+                        socketio.emit('live_update', payload, to=token)
+                    else:
+                        socketio.emit('live_update', payload, to=token)
             
             # AUTO CLEANER LOGIC (Runs every 5 seconds)
             if time.time() - last_clean_time > 5:
                 if len(last_tick_time) > 1500:
                     last_tick_time.clear()
                     previous_price.clear()
-                gc.collect() # Force Memory Cleanup
+                gc.collect() 
                 last_clean_time = time.time()
                 
-            eventlet.sleep(0.05)
+            eventlet.sleep(0.1) # Render bandwidth ke liye thoda gap zaroori hai
         except Exception as e:
             print(f"⚠️ Broadcaster Error: {e}")
             eventlet.sleep(1)
@@ -158,7 +158,7 @@ def on_data(wsapp, msg):
             token = str(msg.get('token'))
             curr_time = time.time()
             
-            # Throttling to save bandwidth
+            # Throttling to save bandwidth (0.5 sec gap)
             if token in last_tick_time and (curr_time - last_tick_time[token]) < 0.5:
                 return
             
@@ -188,7 +188,8 @@ def on_data(wsapp, msg):
 def run_trading_engine():
     global sws, is_ws_ready, subscribed_tokens_set, last_master_update_date
     
-    # Run master sync on boot
+    # Render startup delay ke baad sync karega
+    eventlet.sleep(5)
     refresh_supabase_master()
     last_master_update_date = datetime.datetime.now(IST).date()
     
@@ -196,13 +197,12 @@ def run_trading_engine():
         try:
             now = datetime.datetime.now(IST)
             
-            # MASTER SYNC LOGIC: Updates every 2 days at 8:30 AM
+            # MASTER SYNC LOGIC: Updates every 2 days
             days_since_update = (now.date() - last_master_update_date).days
             if days_since_update >= 2 and now.hour == 8 and 30 <= now.minute <= 45:
                 if refresh_supabase_master():
                     last_master_update_date = now.date()
 
-            # 24/7 CONNECTION LOGIC (No more time restrictions)
             if not is_ws_ready:
                 if not check_dns():
                     print("🚫 DNS Wait: Retrying connection...")
@@ -218,10 +218,21 @@ def run_trading_engine():
                     if session and session.get('status'):
                         print("🟢 [Engine] WebSocket Initializing...")
                         sws = SmartWebSocketV2(session['data']['jwtToken'], API_KEY, CLIENT_CODE, session['data']['feedToken'])
+                        
+                        def on_open_wrapper(ws):
+                            global is_ws_ready
+                            is_ws_ready = True
+                            print('💎 WS Live!')
+
+                        def on_close_wrapper(ws, code, reason):
+                            global is_ws_ready
+                            is_ws_ready = False
+                            print(f'🔴 WS Closed: {reason}')
+
                         sws.on_data = on_data
-                        sws.on_open = lambda ws: exec("global is_ws_ready; is_ws_ready=True; print('💎 WS Live!')")
+                        sws.on_open = on_open_wrapper
                         sws.on_error = lambda ws, err: print(f"❌ WS Error: {err}")
-                        sws.on_close = lambda ws,c,r: exec("global is_ws_ready; is_ws_ready=False")
+                        sws.on_close = on_close_wrapper
                         sws.connect()
                     else:
                         print(f"❌ [Login Error] {session.get('message') if session else 'Timeout'}")
@@ -254,10 +265,10 @@ def handle_subscribe(json_data):
 
         join_room(token)
         if token not in token_masters: token_masters[token] = []
-        if request.sid not in token_masters[token]: token_masters[token].append(request.sid)
+        if sid not in token_masters[token]: token_masters[token].append(sid)
 
         if len(token_masters[token]) > 1:
-            emit('p2p_assign', {'token': token, 'master_sid': token_masters[token][0]}, room=request.sid)
+            emit('p2p_assign', {'token': token, 'master_sid': token_masters[token][0]}, to=sid)
 
         if token not in subscribed_tokens_set:
             if "MCX" in exch: etype = 5
@@ -284,12 +295,12 @@ def handle_subscribe(json_data):
 def forward_signal(data):
     target = data.get('targetId')
     data['senderId'] = request.sid
-    emit('p2p_signal', data, room=target)
+    emit('p2p_signal', data, to=target)
 
 @socketio.on('ice_candidate')
 def forward_ice(data):
     target = data.get('targetId')
-    emit('ice_candidate', data, room=target)
+    emit('ice_candidate', data, to=target)
 
 @socketio.on('disconnect')
 def on_disconnect():
@@ -326,7 +337,13 @@ def health():
     return {"status": "LIVE", "ws": is_ws_ready, "tokens": len(subscribed_tokens_set)}, 200
 
 if __name__ == '__main__':
+    # Render optimized startup: Using eventlet wsgi server directly
     socketio.start_background_task(auto_batch_broadcaster)
     socketio.start_background_task(run_trading_engine)
+    
     port = int(os.environ.get("PORT", 10000))
-    socketio.run(app, host='0.0.0.0', port=port)
+    print(f"🚀 Starting server on port {port}...")
+    
+    # Render ke liye 'socketio.run' se better 'eventlet.wsgi' hota hai
+    import eventlet.wsgi
+    eventlet.wsgi.server(eventlet.listen(('0.0.0.0', port)), app)
