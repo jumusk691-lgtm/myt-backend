@@ -124,16 +124,12 @@ def auto_batch_broadcaster():
         try:
             # BROADCASTER LOGIC
             if live_data_queue:
-                # Thread safety ke liye copy create karna better hai
                 current_items = list(live_data_queue.items())
                 live_data_queue.clear() 
 
                 for token, payload in current_items:
-                    if token in token_masters and token_masters[token]:
-                        # Master SID ko prioritize karna room ke andar
-                        socketio.emit('live_update', payload, to=token)
-                    else:
-                        socketio.emit('live_update', payload, to=token)
+                    # Sabhi rooms (tokens) mein data broadcast karna
+                    socketio.emit('live_update', payload, to=token)
             
             # AUTO CLEANER LOGIC (Runs every 5 seconds)
             if time.time() - last_clean_time > 5:
@@ -143,7 +139,7 @@ def auto_batch_broadcaster():
                 gc.collect() 
                 last_clean_time = time.time()
                 
-            eventlet.sleep(0.1) # Render bandwidth ke liye thoda gap zaroori hai
+            eventlet.sleep(0.1) 
         except Exception as e:
             print(f"⚠️ Broadcaster Error: {e}")
             eventlet.sleep(1)
@@ -158,7 +154,6 @@ def on_data(wsapp, msg):
             token = str(msg.get('token'))
             curr_time = time.time()
             
-            # Throttling to save bandwidth (0.5 sec gap)
             if token in last_tick_time and (curr_time - last_tick_time[token]) < 0.5:
                 return
             
@@ -188,7 +183,6 @@ def on_data(wsapp, msg):
 def run_trading_engine():
     global sws, is_ws_ready, subscribed_tokens_set, last_master_update_date
     
-    # Render startup delay ke baad sync karega
     eventlet.sleep(5)
     refresh_supabase_master()
     last_master_update_date = datetime.datetime.now(IST).date()
@@ -197,7 +191,6 @@ def run_trading_engine():
         try:
             now = datetime.datetime.now(IST)
             
-            # MASTER SYNC LOGIC: Updates every 2 days
             days_since_update = (now.date() - last_master_update_date).days
             if days_since_update >= 2 and now.hour == 8 and 30 <= now.minute <= 45:
                 if refresh_supabase_master():
@@ -337,13 +330,11 @@ def health():
     return {"status": "LIVE", "ws": is_ws_ready, "tokens": len(subscribed_tokens_set)}, 200
 
 if __name__ == '__main__':
-    # Render optimized startup: Using eventlet wsgi server directly
     socketio.start_background_task(auto_batch_broadcaster)
     socketio.start_background_task(run_trading_engine)
     
     port = int(os.environ.get("PORT", 10000))
     print(f"🚀 Starting server on port {port}...")
     
-    # Render ke liye 'socketio.run' se better 'eventlet.wsgi' hota hai
     import eventlet.wsgi
     eventlet.wsgi.server(eventlet.listen(('0.0.0.0', port)), app)
