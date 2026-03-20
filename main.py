@@ -1,5 +1,5 @@
 import eventlet
-eventlet.monkey_patch(all=True) 
+eventlet.monkey_patch() # DNS Stability ke liye all=True hata diya
 
 import os
 import pyotp
@@ -12,7 +12,7 @@ import tempfile
 import json
 import gc
 import sys
-import socket # Added for DNS stability check
+import socket
 from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 from supabase import create_client
@@ -57,10 +57,9 @@ last_master_update_date = None
 user_scores = {} 
 
 # ==============================================================================
-# --- 3. DNS HELPERS (For Render Stability) ---
+# --- 3. DNS HELPERS ---
 # ==============================================================================
 def check_dns(host="apiconnect.angelone.in"):
-    """Check if Render can see the Angel One API"""
     try:
         socket.gethostbyname(host)
         return True
@@ -68,7 +67,7 @@ def check_dns(host="apiconnect.angelone.in"):
         return False
 
 # ==============================================================================
-# --- 4. MASTER DATA ENGINE ---
+# --- 4. MASTER DATA ENGINE (2 DAYS LOGIC) ---
 # ==============================================================================
 def refresh_supabase_master():
     print(f"🔄 [System] {datetime.datetime.now(IST)}: Master Data Sync Started...")
@@ -107,19 +106,22 @@ def refresh_supabase_master():
                     file_options={"x-upsert": "true", "content-type": "application/octet-stream"}
                 )
             os.remove(temp_path)
-            print("✅ [System] Master DB Synced.")
+            print("✅ [System] Master DB Synced Successfully.")
             return True
     except Exception as e:
         print(f"❌ [Master Error] {e}")
         return False
 
 # ==============================================================================
-# --- 5. DATA BROADCASTER ---
+# --- 5. DATA BROADCASTER & AUTO CLEANER (5 SEC) ---
 # ==============================================================================
 def auto_batch_broadcaster():
-    global live_data_queue, token_masters
+    global live_data_queue, token_masters, last_tick_time, previous_price
+    last_clean_time = time.time()
+    
     while True:
         try:
+            # BROADCASTER LOGIC
             if live_data_queue:
                 all_tokens = list(live_data_queue.keys())
                 for i in range(0, len(all_tokens), 300):
@@ -131,11 +133,19 @@ def auto_batch_broadcaster():
                                 socketio.emit('live_update', payload, room=token_masters[token][0])
                             else:
                                 socketio.emit('live_update', payload, room=token)
-                    eventlet.sleep(0.02)
-            else:
-                eventlet.sleep(0.1)
+                    eventlet.sleep(0.01)
+            
+            # AUTO CLEANER LOGIC (Runs every 5 seconds)
+            if time.time() - last_clean_time > 5:
+                if len(last_tick_time) > 1500:
+                    last_tick_time.clear()
+                    previous_price.clear()
+                gc.collect() # Force Memory Cleanup
+                last_clean_time = time.time()
+                
+            eventlet.sleep(0.05)
         except Exception as e:
-            print(f"⚠️ Broadcaster Loop Error: {e}")
+            print(f"⚠️ Broadcaster Error: {e}")
             eventlet.sleep(1)
 
 # ==============================================================================
@@ -147,7 +157,9 @@ def on_data(wsapp, msg):
         if isinstance(msg, dict) and 'token' in msg:
             token = str(msg.get('token'))
             curr_time = time.time()
-            if token in last_tick_time and (curr_time - last_tick_time[token]) < 1.0:
+            
+            # Throttling to save bandwidth
+            if token in last_tick_time and (curr_time - last_tick_time[token]) < 0.5:
                 return
             
             ltp = float(msg.get('last_traded_price', 0)) / 100
@@ -167,56 +179,59 @@ def on_data(wsapp, msg):
             previous_price[token] = "{:.2f}".format(ltp)
             last_tick_time[token] = curr_time
             live_data_queue[token] = payload
-
-            if len(last_tick_time) > 2000:
-                last_tick_time.clear(); previous_price.clear(); gc.collect()
     except Exception as e:
         print(f"⚠️ [Tick Error] {e}")
 
 # ==============================================================================
-# --- 7. SELF-HEALING ENGINE ---
+# --- 7. SELF-HEALING ENGINE (24/7 LOGIC) ---
 # ==============================================================================
 def run_trading_engine():
     global sws, is_ws_ready, subscribed_tokens_set, last_master_update_date
+    
+    # Run master sync on boot
     refresh_supabase_master()
+    last_master_update_date = datetime.datetime.now(IST).date()
     
     while True:
         try:
             now = datetime.datetime.now(IST)
             
-            # DNS Stability Check before Login
-            if not is_ws_ready and not check_dns():
-                print("🚫 [DNS Wait] Angel One API not reachable from Render. Retrying in 10s...")
-                eventlet.sleep(10)
-                continue
+            # MASTER SYNC LOGIC: Updates every 2 days at 8:30 AM
+            days_since_update = (now.date() - last_master_update_date).days
+            if days_since_update >= 2 and now.hour == 8 and 30 <= now.minute <= 45:
+                if refresh_supabase_master():
+                    last_master_update_date = now.date()
 
-            if 7 <= now.hour < 24:
-                if not is_ws_ready:
-                    print(f"🔄 [Engine] Attempting Login at {now}...")
-                    smart_api = SmartConnect(api_key=API_KEY)
-                    try:
-                        totp = pyotp.TOTP(TOTP_STR).now()
-                        session = smart_api.generateSession(CLIENT_CODE, MPIN, totp)
-                        
-                        if session and session.get('status'):
-                            print("🟢 [Engine] Login Success. Starting WS...")
-                            sws = SmartWebSocketV2(session['data']['jwtToken'], API_KEY, CLIENT_CODE, session['data']['feedToken'])
-                            sws.on_data = on_data
-                            sws.on_open = lambda ws: exec("global is_ws_ready; is_ws_ready=True; print('💎 WS Live!')")
-                            sws.on_error = lambda ws, err: print(f"❌ WS Error: {err}")
-                            sws.on_close = lambda ws,c,r: exec("global is_ws_ready; is_ws_ready=False")
-                            sws.connect()
-                        else:
-                            print(f"❌ [Login Error] {session.get('message') if session else 'Timeout'}")
-                    except Exception as login_err:
-                        print(f"⚠️ Login Attempt Failed: {login_err}")
-            else:
-                if is_ws_ready:
-                    sws.close(); is_ws_ready = False; subscribed_tokens_set.clear()
+            # 24/7 CONNECTION LOGIC (No more time restrictions)
+            if not is_ws_ready:
+                if not check_dns():
+                    print("🚫 DNS Wait: Retrying connection...")
+                    eventlet.sleep(10)
+                    continue
+
+                print(f"🔄 [Engine] Connecting Angel One...")
+                smart_api = SmartConnect(api_key=API_KEY)
+                try:
+                    totp = pyotp.TOTP(TOTP_STR).now()
+                    session = smart_api.generateSession(CLIENT_CODE, MPIN, totp)
+                    
+                    if session and session.get('status'):
+                        print("🟢 [Engine] WebSocket Initializing...")
+                        sws = SmartWebSocketV2(session['data']['jwtToken'], API_KEY, CLIENT_CODE, session['data']['feedToken'])
+                        sws.on_data = on_data
+                        sws.on_open = lambda ws: exec("global is_ws_ready; is_ws_ready=True; print('💎 WS Live!')")
+                        sws.on_error = lambda ws, err: print(f"❌ WS Error: {err}")
+                        sws.on_close = lambda ws,c,r: exec("global is_ws_ready; is_ws_ready=False")
+                        sws.connect()
+                    else:
+                        print(f"❌ [Login Error] {session.get('message') if session else 'Timeout'}")
+                except Exception as login_err:
+                    print(f"⚠️ Login Failed: {login_err}")
+            
         except Exception as e:
-            print(f"🔴 [Engine Loop Critical] {e}")
+            print(f"🔴 [Engine Critical] {e}")
             is_ws_ready = False
-        eventlet.sleep(15) # Wait before next check
+        eventlet.sleep(20)
 
 # ==============================================================================
 # --- 8. SUBSCRIPTION & SCORE LOGIC ---
@@ -246,9 +261,9 @@ def handle_subscribe(json_data):
 
         if token not in subscribed_tokens_set:
             if "MCX" in exch: etype = 5
-            elif "NFO" in exch or any(x in symbol for x in ["CE", "PE", "FUT"]): etype = 2
-            elif "BFO" in exch: etype = 4
+            elif "BFO" in exch or "SENSEX" in symbol: etype = 4
             elif "BSE" in exch: etype = 3
+            elif "NFO" in exch or any(x in symbol for x in ["CE", "PE", "FUT"]): etype = 2
             else: etype = 1 
             batches[etype].append(token)
 
@@ -259,7 +274,7 @@ def handle_subscribe(json_data):
                 try:
                     sws.subscribe(f"myt_{etype}_{time.time()}", 1, [{"exchangeType": etype, "tokens": chunk}])
                     for t in chunk: subscribed_tokens_set.add(t)
-                    eventlet.sleep(0.3)
+                    eventlet.sleep(0.2)
                 except: pass
 
 # ==============================================================================
@@ -278,7 +293,7 @@ def forward_ice(data):
 
 @socketio.on('disconnect')
 def on_disconnect():
-    global token_masters, user_scores
+    global token_masters
     sid = request.sid
     for token in list(token_masters.keys()):
         if sid in token_masters[token]:
@@ -305,10 +320,6 @@ def get_history():
                              "open": c[1], "high": c[2], "low": c[3], "close": c[4]} for c in res['data']])
         return jsonify({"error": "No data"}), 404
     except Exception as e: return str(e), 500
-
-@app.route('/score')
-def get_score():
-    return jsonify(user_scores), 200
 
 @app.route('/')
 def health():
