@@ -12,6 +12,7 @@ import tempfile
 import json
 import gc
 import sys
+import socket # Added for DNS stability check
 from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 from supabase import create_client
@@ -53,12 +54,21 @@ live_data_queue = {}
 last_tick_time = {}                
 previous_price = {}                
 last_master_update_date = None
-
-# New Global State for Score Tracking
-user_scores = {} # Dictionary to keep track of scores
+user_scores = {} 
 
 # ==============================================================================
-# --- 3. MASTER DATA ENGINE ---
+# --- 3. DNS HELPERS (For Render Stability) ---
+# ==============================================================================
+def check_dns(host="apiconnect.angelone.in"):
+    """Check if Render can see the Angel One API"""
+    try:
+        socket.gethostbyname(host)
+        return True
+    except socket.gaierror:
+        return False
+
+# ==============================================================================
+# --- 4. MASTER DATA ENGINE ---
 # ==============================================================================
 def refresh_supabase_master():
     print(f"🔄 [System] {datetime.datetime.now(IST)}: Master Data Sync Started...")
@@ -104,7 +114,7 @@ def refresh_supabase_master():
         return False
 
 # ==============================================================================
-# --- 4. DATA BROADCASTER ---
+# --- 5. DATA BROADCASTER ---
 # ==============================================================================
 def auto_batch_broadcaster():
     global live_data_queue, token_masters
@@ -129,7 +139,7 @@ def auto_batch_broadcaster():
             eventlet.sleep(1)
 
 # ==============================================================================
-# --- 5. TICK ENGINE ---
+# --- 6. TICK ENGINE ---
 # ==============================================================================
 def on_data(wsapp, msg):
     global live_data_queue, last_tick_time, previous_price
@@ -164,7 +174,7 @@ def on_data(wsapp, msg):
         print(f"⚠️ [Tick Error] {e}")
 
 # ==============================================================================
-# --- 6. SELF-HEALING ENGINE (STABILITY FIX) ---
+# --- 7. SELF-HEALING ENGINE ---
 # ==============================================================================
 def run_trading_engine():
     global sws, is_ws_ready, subscribed_tokens_set, last_master_update_date
@@ -173,8 +183,12 @@ def run_trading_engine():
     while True:
         try:
             now = datetime.datetime.now(IST)
-            if now.hour == 8 and 35 <= now.minute <= 45 and last_master_update_date != now.date():
-                if refresh_supabase_master(): last_master_update_date = now.date()
+            
+            # DNS Stability Check before Login
+            if not is_ws_ready and not check_dns():
+                print("🚫 [DNS Wait] Angel One API not reachable from Render. Retrying in 10s...")
+                eventlet.sleep(10)
+                continue
 
             if 7 <= now.hour < 24:
                 if not is_ws_ready:
@@ -194,18 +208,18 @@ def run_trading_engine():
                             sws.connect()
                         else:
                             print(f"❌ [Login Error] {session.get('message') if session else 'Timeout'}")
-                    except requests.exceptions.ConnectionError:
-                        print("🚫 [DNS Error] Render network unstable. Retrying...")
+                    except Exception as login_err:
+                        print(f"⚠️ Login Attempt Failed: {login_err}")
             else:
                 if is_ws_ready:
                     sws.close(); is_ws_ready = False; subscribed_tokens_set.clear()
         except Exception as e:
             print(f"🔴 [Engine Loop Critical] {e}")
             is_ws_ready = False
-        eventlet.sleep(30)
+        eventlet.sleep(15) # Wait before next check
 
 # ==============================================================================
-# --- 7. SUBSCRIPTION & SCORE LOGIC ---
+# --- 8. SUBSCRIPTION & SCORE LOGIC ---
 # ==============================================================================
 @socketio.on('subscribe')
 def handle_subscribe(json_data):
@@ -213,10 +227,8 @@ def handle_subscribe(json_data):
     watchlist = json_data.get('watchlist', [])
     if not watchlist: return
 
-    # Update Score logic: increment score on every subscription attempt
     sid = request.sid
     user_scores[sid] = user_scores.get(sid, 0) + 1
-    print(f"📈 [Score] SID {sid} updated to: {user_scores[sid]}")
 
     batches = {1: [], 2: [], 3: [], 4: [], 5: []}
     for item in watchlist:
@@ -251,7 +263,7 @@ def handle_subscribe(json_data):
                 except: pass
 
 # ==============================================================================
-# --- 8. SIGNALING & DISCONNECT ---
+# --- 9. SIGNALING & DISCONNECT ---
 # ==============================================================================
 @socketio.on('p2p_signal')
 def forward_signal(data):
@@ -268,17 +280,13 @@ def forward_ice(data):
 def on_disconnect():
     global token_masters, user_scores
     sid = request.sid
-    if sid in user_scores:
-        print(f"📉 [Score] Final score for {sid}: {user_scores[sid]}")
-        # Not deleting score here to keep it for history if needed
-    
     for token in list(token_masters.keys()):
         if sid in token_masters[token]:
             token_masters[token].remove(sid)
             if not token_masters[token]: del token_masters[token]
 
 # ==============================================================================
-# --- 9. API & MAIN ---
+# --- 10. API & MAIN ---
 # ==============================================================================
 @app.route('/history')
 def get_history():
