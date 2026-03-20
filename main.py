@@ -34,6 +34,7 @@ BUCKET_NAME = "Myt"
 
 app = Flask(__name__)
 
+# WebSocket optimize kiya taaki packet drop na ho
 socketio = SocketIO(
     app, 
     cors_allowed_origins="*", 
@@ -44,14 +45,15 @@ socketio = SocketIO(
 )
 
 # ==============================================================================
-# --- 2. GLOBAL ENGINE STATE (NEW MASS LOGIC) ---
+# --- 2. GLOBAL ENGINE STATE (BATCHING & P2P MIXED) ---
 # ==============================================================================
 sws = None
 is_ws_ready = False
 subscribed_tokens_set = set()      
-global_market_cache = {}           # Saare 500+ symbols ka current price yahan rahega
-active_peers = {}                  # P2P users ki list
+global_market_cache = {}           # Saare 500+ symbols ka data yahan jama hota hai
+last_tick_time = {}                
 previous_price = {}                
+active_peers = {}                  # P2P users tracking
 last_master_update_date = None
 
 # ==============================================================================
@@ -104,68 +106,77 @@ def refresh_supabase_master():
                     file_options={"x-upsert": "true", "content-type": "application/octet-stream"}
                 )
             os.remove(temp_path)
-            print("✅ [System] Master DB Synced.")
+            print("✅ [System] Master DB Synced and Indexed.")
             return True
     except Exception as e:
         print(f"❌ [Master Error] {e}")
         return False
 
 # ==============================================================================
-# --- 5. ULTRA-MASS BROADCASTER (BATCHING + P2P HYBRID) ---
+# --- 5. ULTRA BROADCASTER (BATCHING + P2P LOGIC) ---
 # ==============================================================================
 def mass_broadcaster_engine():
-    """Ye loop 1 second mein saare 500+ symbols ka ek packet banakar sabko bhejta hai"""
+    """Ye loop har 1 second mein 500 symbols ka MEGA PACKET sabko bhejta hai"""
     global global_market_cache, active_peers
+    print("🚀 [Engine] Mass Broadcaster Engine Started...")
+    
     while True:
         try:
             if global_market_cache:
-                # 1. Mega Packet taiyar karo
+                # Mega Packet taiyar karo (Batching)
                 mega_packet = list(global_market_cache.values())
                 
-                # 2. P2P Logic: Agar 100 se zyada users hain, toh sirf seeders ko bhejo
-                # Taki server ki bandwidth na phate
+                # P2P Hybrid Logic: Agar users 100 se zyada hain toh relay signal on karo
                 if len(active_peers) > 100:
-                    seeders = list(active_peers.values())[:20] # Top 20 users seeders banenge
+                    # Sirf first 20 'Super Nodes' ko direct data (Seeders)
+                    seeders = list(active_peers.values())[:20]
                     for sid in seeders:
                         socketio.emit('market_snapshot', mega_packet, to=sid)
                     
-                    # Baaki sabko bolo P2P relay use karein
-                    socketio.emit('p2p_relay_signal', {"active": True}, broadcast=True)
+                    # Baaki sab ko P2P ke liye signal bhejo
+                    socketio.emit('p2p_relay_on', {"status": True})
                 else:
-                    # Normal Broadcast sabko ek saath (Mass Batching)
-                    socketio.emit('market_snapshot', mega_packet, broadcast=True)
+                    # Sabko direct broadcast (Render Error Fixed: removed 'broadcast=True')
+                    socketio.emit('market_snapshot', mega_packet)
                 
-                # Memory clean for large caches
-                if len(global_market_cache) > 2000:
+                # Memory Maintenance
+                if len(global_market_cache) > 2500:
                     global_market_cache.clear()
                     gc.collect()
 
-            eventlet.sleep(1.0) # Har 1 second mein 500 symbols ka update
+            eventlet.sleep(1.0) # 1 second pulse
         except Exception as e:
-            print(f"⚠️ Broadcaster Error: {e}")
+            print(f"⚠️ [Broadcaster Error] {e}")
             eventlet.sleep(2)
 
 # ==============================================================================
 # --- 6. TICK ENGINE (BROKER LOGIC) ---
 # ==============================================================================
 def on_data(wsapp, msg):
-    global global_market_cache, previous_price
+    global global_market_cache, previous_price, last_tick_time
     try:
         if isinstance(msg, dict) and 'token' in msg:
             token = str(msg.get('token'))
+            curr_time = time.time()
+            
+            # Throttling
+            if token in last_tick_time and (curr_time - last_tick_time[token]) < 0.3:
+                return
+            
             ltp = float(msg.get('last_traded_price', 0)) / 100
             if ltp <= 0: return
             
             old_p = previous_price.get(token, "{:.2f}".format(ltp))
-            
-            # Global Cache Update (Batching ke liye data yahan jama hota hai)
+
+            # Batching cache mein update
             global_market_cache[token] = {
                 "t": token, 
                 "p": "{:.2f}".format(ltp), 
                 "lp": old_p,
                 "h": "{:.2f}".format(float(msg.get('high', 0)) / 100),
                 "l": "{:.2f}".format(float(msg.get('low', 0)) / 100),
-                "v": msg.get('volume', 0)
+                "v": msg.get('volume', 0),
+                "o": "{:.2f}".format(float(msg.get('open', 0)) / 100)
             }
             
             if 'close' in msg and float(msg['close']) > 0:
@@ -173,6 +184,7 @@ def on_data(wsapp, msg):
                 global_market_cache[token]["pc"] = "{:.2f}".format(((ltp - cp) / cp) * 100)
 
             previous_price[token] = "{:.2f}".format(ltp)
+            last_tick_time[token] = curr_time
     except:
         pass
 
@@ -180,10 +192,11 @@ def on_data(wsapp, msg):
 # --- 7. HEALING TRADING ENGINE ---
 # ==============================================================================
 def run_trading_engine():
-    global sws, is_ws_ready, subscribed_tokens_set
+    global sws, is_ws_ready, subscribed_tokens_set, last_master_update_date
     
     eventlet.sleep(2)
     refresh_supabase_master()
+    last_master_update_date = datetime.datetime.now(IST).date()
     
     while True:
         try:
@@ -205,13 +218,12 @@ def run_trading_engine():
                     def on_open_wrapper(ws):
                         global is_ws_ready
                         is_ws_ready = True
-                        print('💎 [Engine] Connected & Ready for 500+ Symbols!')
+                        print('💎 [Engine] WebSocket Connected!')
                         if subscribed_tokens_set:
-                            # Re-subscribe everything in batches
-                            tokens_list = list(subscribed_tokens_set)
-                            for i in range(0, len(tokens_list), 50):
-                                batch = tokens_list[i:i+50]
-                                sws.subscribe(f"resub_{i}", 1, [{"exchangeType": 1, "tokens": batch}])
+                            t_list = list(subscribed_tokens_set)
+                            for i in range(0, len(t_list), 50):
+                                batch = t_list[i:i+50]
+                                sws.subscribe(f"sub_{i}", 1, [{"exchangeType": 1, "tokens": batch}])
                                 eventlet.sleep(0.2)
 
                     def on_close_wrapper(ws, code, reason):
@@ -222,18 +234,20 @@ def run_trading_engine():
                     sws.on_open = on_open_wrapper
                     sws.on_close = on_close_wrapper
                     sws.connect()
+                else:
+                    print(f"❌ Login Failed: {session.get('message', 'Credentials')}")
             
         except:
             is_ws_ready = False
         eventlet.sleep(20)
 
 # ==============================================================================
-# --- 8. SOCKET EVENTS (P2P & MESH) ---
+# --- 8. SMART API & PEER TRACKING ---
 # ==============================================================================
 @socketio.on('connect')
 def handle_connect():
     active_peers[request.sid] = request.sid
-    print(f"➕ User Connected: {request.sid}")
+    print(f"📡 Peer Connected: {request.sid}")
 
 @socketio.on('disconnect')
 def handle_disconnect():
@@ -249,32 +263,45 @@ def handle_subscribe(json_data):
     for item in watchlist:
         token = str(item.get('token'))
         if not token or token == "None": continue
-        
-        # Room join karo lekin mass broadcast sabko milega
+
         join_room(token)
-        
         if token not in subscribed_tokens_set:
             subscribed_tokens_set.add(token)
             if is_ws_ready and sws:
-                # Auto-detect exchange and subscribe
-                etype = 1 # Default NSE
-                if "MCX" in str(item.get('exch')): etype = 5
-                sws.subscribe(f"sub_{token}", 1, [{"exchangeType": etype, "tokens": [token]}])
+                # Exchange logic for 500+ symbols
+                exch = str(item.get('exch', 'NSE')).upper()
+                etype = 5 if "MCX" in exch else 1
+                sws.subscribe(f"s_{token}", 1, [{"exchangeType": etype, "tokens": [token]}])
 
-# ==============================================================================
-# --- 9. ROUTES ---
-# ==============================================================================
 @app.route('/')
 def health():
     return {
         "status": "OPERATIONAL",
-        "live_symbols": len(global_market_cache),
-        "connected_users": len(active_peers),
-        "engine_ready": is_ws_ready
+        "ws": is_ws_ready,
+        "symbols": len(global_market_cache),
+        "peers": len(active_peers)
     }, 200
 
+@app.route('/history')
+def get_candle_data():
+    token = request.args.get('token')
+    exch = request.args.get('exch', 'NSE').upper()
+    if not token: return {"error": "Token required"}, 400
+    try:
+        smart_api = SmartConnect(api_key=API_KEY)
+        smart_api.local_ip = "127.0.0.1"
+        smart_api.public_ip = "1.1.1.1"
+        totp = pyotp.TOTP(TOTP_STR).now()
+        smart_api.generateSession(CLIENT_CODE, MPIN, totp)
+        to_date = datetime.datetime.now(IST).strftime('%Y-%m-%d %H:%M')
+        from_date = (datetime.datetime.now(IST) - datetime.timedelta(days=7)).strftime('%Y-%m-%d %H:%M')
+        res = smart_api.getCandleData({"exchange": exch, "symboltoken": token, "interval": "ONE_MINUTE", "fromdate": from_date, "todate": to_date})
+        return jsonify(res)
+    except Exception as e:
+        return {"error": str(e)}, 500
+
 if __name__ == '__main__':
-    # Saare engines ek saath start
+    # Start both background engines
     socketio.start_background_task(mass_broadcaster_engine)
     socketio.start_background_task(run_trading_engine)
     
