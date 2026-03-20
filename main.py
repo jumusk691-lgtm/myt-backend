@@ -1,5 +1,5 @@
 import eventlet
-eventlet.monkey_patchalltrue) 
+eventlet.monkey_patch(all=true) 
 
 import os, pyotp, time, datetime, pytz, requests, sqlite3, tempfile, json
 from SmartApi import SmartConnect
