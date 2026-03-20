@@ -45,7 +45,7 @@ socketio = SocketIO(
 )
 
 # ==============================================================================
-# --- 2. GLOBAL ENGINE STATE (BATCHING, ROOMS & P2P) ---
+# --- 2. GLOBAL ENGINE STATE ---
 # ==============================================================================
 sws = None
 is_ws_ready = False
@@ -56,13 +56,13 @@ previous_price = {}
 active_peers = {}                  # For P2P Relay tracking
 last_master_update_date = None
 room_members = {}                  # Tracking members in each token room
-user_scores = {}                   # Track score as requested
+user_scores = {}                   # Track score as requested bhai
 
 # ==============================================================================
-# --- 3. NETWORK & DNS STABILITY (FIX FOR RENDER ERROR) ---
+# --- 3. NETWORK & DNS STABILITY ---
 # ==============================================================================
 def check_dns(host="apiconnect.angelone.in"):
-    """Bhai, yeh function Render ke DNS timeout error ko handle karega"""
+    """Bhai yeh Render ke 'Lookup Timed Out' error ko handle karega"""
     try:
         socket.gethostbyname(host)
         return True
@@ -71,7 +71,7 @@ def check_dns(host="apiconnect.angelone.in"):
         return False
 
 # ==============================================================================
-# --- 4. MASTER DATA ENGINE (BROKER GRADE) ---
+# --- 4. MASTER DATA ENGINE ---
 # ==============================================================================
 def refresh_supabase_master():
     print(f"🔄 [System] {datetime.datetime.now(IST)}: Full Master Data Sync...")
@@ -120,6 +120,7 @@ def refresh_supabase_master():
 # --- 5. HYBRID BROADCASTER ENGINE ---
 # ==============================================================================
 def mass_broadcaster_engine():
+    """Ye engine pulse par data batch karke rooms mein bhejta hai"""
     global global_market_cache, active_peers
     print("🚀 [Engine] Hybrid Broadcaster Engine Started...")
     
@@ -129,7 +130,7 @@ def mass_broadcaster_engine():
                 current_cache = dict(global_market_cache)
                 global_market_cache.clear()
                 
-                # Room-based emission: Sirf unhe jayega jo us token ko subscribe kiye hain
+                # Room-based emission
                 for token, payload in current_cache.items():
                     socketio.emit('live_update', payload, to=token)
                 
@@ -139,13 +140,13 @@ def mass_broadcaster_engine():
                     last_tick_time.clear()
                     gc.collect()
 
-            eventlet.sleep(0.4) # 400ms broadcast pulse
+            eventlet.sleep(0.4) 
         except Exception as e:
             print(f"⚠️ [Broadcaster Error] {e}")
             eventlet.sleep(1)
 
 # ==============================================================================
-# --- 6. TICK ENGINE (ON_DATA PROCESSING) ---
+# --- 6. TICK ENGINE ---
 # ==============================================================================
 def on_data(wsapp, msg):
     global global_market_cache, previous_price, last_tick_time
@@ -154,7 +155,7 @@ def on_data(wsapp, msg):
             token = str(msg.get('token'))
             curr_time = time.time()
             
-            # Anti-flood check (0.2s throttle)
+            # Throttle check
             if token in last_tick_time and (curr_time - last_tick_time[token]) < 0.2:
                 return
             
@@ -184,7 +185,7 @@ def on_data(wsapp, msg):
         pass
 
 # ==============================================================================
-# --- 7. HEALING TRADING ENGINE (AUTO-RECOVERY LOGIC) ---
+# --- 7. HEALING TRADING ENGINE ---
 # ==============================================================================
 def run_trading_engine():
     global sws, is_ws_ready, subscribed_tokens_set, last_master_update_date
@@ -195,7 +196,6 @@ def run_trading_engine():
     while True:
         try:
             if not is_ws_ready:
-                # DNS Check: Render network stabilize hone ka wait karega
                 if not check_dns():
                     eventlet.sleep(5)
                     continue
@@ -214,8 +214,7 @@ def run_trading_engine():
                     def on_open_wrapper(ws):
                         global is_ws_ready
                         is_ws_ready = True
-                        print('💎 [Engine] WebSocket Connected & Authorized!')
-                        # Re-subscribe tokens on reconnect
+                        print('💎 [Engine] WebSocket Connected!')
                         if subscribed_tokens_set:
                             tokens = list(subscribed_tokens_set)
                             for i in range(0, len(tokens), 50):
@@ -241,7 +240,7 @@ def run_trading_engine():
         eventlet.sleep(15)
 
 # ==============================================================================
-# --- 8. SOCKET HANDLERS (ROOMS & SCORE) ---
+# --- 8. SOCKET HANDLERS ---
 # ==============================================================================
 @socketio.on('connect')
 def handle_connect():
@@ -260,7 +259,7 @@ def handle_subscribe(json_data):
     watchlist = json_data.get('watchlist', [])
     if not watchlist: return
 
-    # Score Logic: Bhai, yahan score update hoga subscription par
+    # Score update logic
     sid = request.sid
     user_scores[sid] = user_scores.get(sid, 0) + len(watchlist)
 
@@ -279,12 +278,16 @@ def handle_subscribe(json_data):
                     sws.subscribe(f"sub_{token}", 1, [{"exchangeType": etype, "tokens": [token]}])
                 except: pass
 
-@socketio.on('unsubscribe')
-def handle_unsubscribe(json_data):
-    token = str(json_data.get('token'))
-    if token:
-        leave_room(token)
-        print(f"🚪 Left Room: {token}")
+@socketio.on('p2p_signal')
+def forward_signal(data):
+    target = data.get('targetId')
+    data['senderId'] = request.sid
+    emit('p2p_signal', data, room=target)
+
+@socketio.on('ice_candidate')
+def forward_ice(data):
+    target = data.get('targetId')
+    emit('ice_candidate', data, room=target)
 
 # ==============================================================================
 # --- 9. REST API ROUTES ---
@@ -313,10 +316,10 @@ def get_candle_data():
         smart_api.generateSession(CLIENT_CODE, MPIN, totp)
         
         to_date = datetime.datetime.now(IST).strftime('%Y-%m-%d %H:%M')
-        from_date = (datetime.datetime.now(IST) - datetime.timedelta(days=7)).strftime('%Y-%m-%d %H:%M')
+        from_date = (datetime.datetime.now(IST) - datetime.timedelta(days=90)).strftime('%Y-%m-%d %H:%M')
         
         res = smart_api.getCandleData({
-            "exchange": exch, "symboltoken": token, "interval": "ONE_MINUTE",
+            "exchange": exch, "symboltoken": token, "interval": "FIVE_MINUTE",
             "fromdate": from_date, "todate": to_date
         })
         return jsonify(res)
