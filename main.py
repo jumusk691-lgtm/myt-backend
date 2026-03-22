@@ -293,51 +293,70 @@ def slice_order():
     except: return jsonify({"error": "Invalid Input"})
 
 # ==============================================================================
-# --- 8. SMART 500 BATCHING & SOCKET LOGIC ---
+# --- 8. SMART 500 BATCHING & SOCKET LOGIC (UPDATED FOR FULL SYNC) ---
 # ==============================================================================
 @socketio.on('connect')
 def handle_connect():
     state.active_users_pool[request.sid] = time.time()
+    logger.info(f"🔌 [New Connection] User {request.sid} linked.")
 
 @socketio.on('subscribe')
 def handle_incoming_subscription(data):
-    """Logic 13: 500-Batch Subscription Logic"""
+    """
+    Logic 13: UPDATED Full Sync Logic
+    Handles both new and old subscriptions without missing a single token.
+    """
     watchlist = data.get('watchlist', [])
-    if not watchlist: return
+    if not watchlist:
+        logger.warning("⚠️ [Sub] Subscription triggered but watchlist is empty.")
+        return
 
+    # High-Priority Batch Registry
     batch_registry = {1: [], 2: [], 3: [], 5: []}
 
     for instrument in watchlist:
         token = str(instrument.get('token'))
         exch = str(instrument.get('exch', 'NSE')).upper()
-        if not token or token == "None": continue
+        
+        if not token or token == "None" or token == "":
+            continue
 
+        # User ko us token ke updates receive karne ke liye room mein daalo
         join_room(token)
         
-        # Segment Identification Logic
-        etype = 1
-        if "MCX" in exch: etype = 5
-        elif "NFO" in exch: etype = 2
-        elif "BSE" in exch: etype = 3
+        # --- ENHANCED SEGMENT LOGIC (Logic 13 Extension) ---
+        etype = 1 # NSE Cash
+        if "MCX" in exch: 
+            etype = 5
+        elif "NFO" in exch or "FUT" in exch or "OPT" in exch: 
+            etype = 2
+        elif "BSE" in exch: 
+            etype = 3
         
         state.token_metadata[token] = etype
         
-        if token not in state.subscribed_tokens_set:
+        # Hamesha registry mein add karein, ye puraana data bhi subscribe karega
+        if token not in batch_registry[etype]:
             batch_registry[etype].append(token)
             state.subscribed_tokens_set.add(token)
 
-    # 500-Batch Execution
+    # 500-Batch Immediate Execution for WebSocket
     if state.is_ws_ready and state.sws:
         for etype, tokens in batch_registry.items():
+            if not tokens: continue
+            
             for i in range(0, len(tokens), 500):
                 final_batch = tokens[i:i+500]
-                if final_batch:
-                    try:
-                        state.sws.subscribe(f"live_batch_{i}", 1, [{"exchangeType": etype, "tokens": final_batch}])
-                        logger.info(f"📈 [Sub] Activated {len(final_batch)} tokens for Seg {etype}")
-                        eventlet.sleep(0.1)
-                    except Exception as e:
-                        logger.error(f"❌ [Sub Error]: {e}")
+                try:
+                    # SmartApi Standard Batch Subscription
+                    state.sws.subscribe(f"live_sync_{etype}_{i}", 1, [{"exchangeType": etype, "tokens": final_batch}])
+                    logger.info(f"📈 [Sync] Activated {len(final_batch)} tokens for Segment {etype}")
+                    eventlet.sleep(0.05) 
+                except Exception as e:
+                    logger.error(f"❌ [Sub Error]: {e}")
+                    traceback.print_exc()
+    else:
+        logger.warning("🔌 [Sub Pending] Socket not ready. Tokens queued for lifecycle recovery.")
 
 # ==============================================================================
 # --- 9. LIFECYCLE, AUTO-HEALING & RECOVERY ---
@@ -367,6 +386,7 @@ def engine_lifecycle_manager():
                         state.is_ws_ready = True
                         state.reconnect_count += 1
                         logger.info(f"💎 [WS] Connected! Session: {state.reconnect_count}")
+                        # Auto-Resubscribe everything when WS connects
                         re_subscribe_all_tokens()
 
                     def handle_close(ws, code, reason):
@@ -387,8 +407,10 @@ def engine_lifecycle_manager():
         eventlet.sleep(25)
 
 def re_subscribe_all_tokens():
-    """Resubscribes all tokens in 500 batches after reconnection"""
+    """Resubscribes all tokens in 500 batches after reconnection/startup"""
     if not state.sws or not state.is_ws_ready: return
+    
+    logger.info(f"🔄 [Recover] Resubscribing {len(state.subscribed_tokens_set)} tokens...")
     
     seg_map = {1: [], 2: [], 3: [], 5: []}
     for t in state.subscribed_tokens_set:
@@ -396,28 +418,32 @@ def re_subscribe_all_tokens():
         seg_map[s].append(t)
         
     for seg, tokens in seg_map.items():
+        if not tokens: continue
         for i in range(0, len(tokens), 500):
             batch = tokens[i:i+500]
             if batch:
                 try:
                     state.sws.subscribe(f"recon_{seg}_{i}", 1, [{"exchangeType": seg, "tokens": batch}])
-                    eventlet.sleep(0.2)
-                except: pass
+                    eventlet.sleep(0.1)
+                except Exception as e:
+                    logger.error(f"❌ [Recon Sub Error]: {e}")
 
 # ==============================================================================
 # --- 10. DEPLOYMENT BOOTSTRAP ---
 # ==============================================================================
 if __name__ == '__main__':
-    # Initialize background threads
+    # Initialize background threads (Logic 21, 6, 18)
     socketio.start_background_task(pulse_broadcaster)
     socketio.start_background_task(engine_lifecycle_manager)
     socketio.start_background_task(system_memory_protector)
     
-    # Port configuration
+    # Port configuration for Cloud Deployment
     port = int(os.environ.get("PORT", 10000))
     logger.info(f"🚀 [Munh V3 Titan] Booting on port {port}...")
     
     try:
+        # High-performance eventlet server
         eventlet.wsgi.server(eventlet.listen(('0.0.0.0', port)), app)
     except Exception as fatal:
         logger.critical(f"💀 [Server Crash]: {fatal}")
+        traceback.print_exc()
