@@ -7,7 +7,7 @@ def memory_protector():
     """Logic 3 & 18: Cleans RAM to prevent Render crashes"""
     import gc
     while True:
-        eventlet.sleep(600)
+        eventlet.sleep(5)
         gc.collect()
         logger.info(f"🧹 [System] RAM Optimized. Packets: {state.total_packets}")
 
