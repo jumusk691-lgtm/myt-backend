@@ -1,230 +1,240 @@
 import eventlet
-eventlet.monkey_patch(all=True)
+eventlet.monkey_patch()
 
-import os, pyotp, time, datetime, pytz, requests, sqlite3, tempfile, json, gc, socket, sys, logging, threading, traceback
-from flask import Flask, send_file, request, jsonify
-from flask_socketio import SocketIO, join_room, emit
+import os, pyotp, time, datetime, pytz, requests, sqlite3, tempfile, json
 from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 from supabase import create_client
+from flask import Flask, send_file, request, after_this_request
+from flask_socketio import SocketIO, join_room, emit
 
-# ==============================================================================
-# --- CONFIGURATION & PRO LOGGING ---
-# ==============================================================================
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
-logger = logging.getLogger(__name__)
-
+# --- 1. CONFIG & RENDER STABILITY FIX ---
 API_KEY = "85HE4VA1"
 CLIENT_CODE = "S52638556"
-MPIN = "0000"
+PWD = "0000"
 TOTP_STR = "XFTXZ2445N4V2UMB7EWUCBDRMU"
 IST = pytz.timezone('Asia/Kolkata')
 
-# Supabase
 SUPABASE_URL = "https://tnrhlvibaeiwhlrxdxnm.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRucmhsdmliYWVpd2hscnhkeG5tIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjY0NzQ0NywiZXhwIjoyMDg4MjIzNDQ3fQ.epYmt7sxhZRhEQWoj0doCHAbfOTHOjSurBbLss5a4Pk"
 BUCKET_NAME = "Myt"
 
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet', ping_timeout=120)
+# CRITICAL: Buffer size badhaya aur timeout set kiya taaki "Too many packets" error na aaye
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet', 
+                   ping_timeout=60, ping_interval=25, 
+                   max_http_buffer_size=10000000) 
 
-# ==============================================================================
-# --- ENGINE STATE (THE BRAIN) ---
-# ==============================================================================
-class SmartTitanEngine:
-    def __init__(self):
-        self.smart_api = None
-        self.sws = None
-        self.is_ws_ready = False
-        self.subscribed_tokens = set()      # Logic 20: Recovery Tracking
-        self.token_meta = {}                # Logic 10: Segment Memory
-        self.price_cache = {}               # Logic 17: Global Cache
-        self.ohlc_data = {}                 # Logic 14: Real-time OHLC
-        self.db_path = None
-        self.total_packets = 0              # Logic 13: Health Score
-        self.start_time = datetime.datetime.now(IST)
+# --- GLOBAL STATE ---
+sws = None
+is_ws_ready = False
+subscribed_tokens_set = set() 
+last_tick_time = {} 
+previous_price = {} # 1-sec purana data yaad rakhne ke liye
 
-state = SmartTitanEngine()
-
-# ==============================================================================
-# --- SMART SEGMENT DETECTOR (LOGIC 8 & 13) ---
-# ==============================================================================
-def get_smart_segment(exch, symbol, token):
-    """
-    Logic 8: Intelligent Segment Identifier
-    Detects if it's NSE, NFO, MCX, BSE or BSE_FO automatically.
-    """
-    exch = str(exch).upper()
-    sym = str(symbol).upper()
-    
-    if "MCX" in exch: return 5
-    if "BSE" in exch:
-        if any(x in sym for x in ["CE", "PE", "FUT"]): return 4 # BSE F&O
-        return 3 # BSE Cash
-    if any(x in sym for x in ["CE", "PE", "FUT"]) or "NFO" in exch:
-        return 2 # NSE F&O
-    return 1 # NSE Cash
-
-# ==============================================================================
-# --- MASTER CORE (LOGIC 4, 5, 25) ---
-# ==============================================================================
-def sync_master_data():
+# --- 2. MASTER DATA SYNC (Indexed) ---
+def refresh_supabase_master():
+    print(f"🔄 [System] Updating Master Data (Indexed Search)...")
     try:
-        master_url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-        res = requests.get(master_url, timeout=30)
-        if res.status_code == 200:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+        response = requests.get(url, timeout=60)
+        if response.status_code == 200:
+            json_data = response.json()
             with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
-                state.db_path = tmp.name
-            conn = sqlite3.connect(state.db_path)
-            c = conn.cursor()
-            c.execute("PRAGMA journal_mode=WAL") # Logic 5: Fast DB
-            c.execute("CREATE TABLE symbols (token TEXT, symbol TEXT, name TEXT, exch_seg TEXT)")
+                temp_path = tmp.name
+            conn = sqlite3.connect(temp_path)
+            cursor = conn.cursor()
+            cursor.execute("DROP TABLE IF EXISTS symbols")
+            cursor.execute('''CREATE TABLE symbols (token TEXT, symbol TEXT, name TEXT, expiry TEXT,
+                             strike TEXT, lotsize TEXT, instrumenttype TEXT, exch_seg TEXT, tick_size TEXT)''')
             
-            data = [(i['token'], i['symbol'], i['name'], i['exch_seg']) for i in res.json() if i.get('token')]
-            c.executemany("INSERT INTO symbols VALUES (?,?,?,?)", data)
+            data = [(str(i.get('token')), i.get('symbol'), i.get('name'), i.get('expiry'), i.get('strike'),
+                     i.get('lotsize'), i.get('instrumenttype'), i.get('exch_seg'), i.get('tick_size'))
+                    for i in json_data if i.get('token')]
+            cursor.executemany("INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?)", data)
+            
+            # Indexing for Fast Search
+            cursor.execute("CREATE INDEX idx_sym ON symbols(symbol)")
+            cursor.execute("CREATE INDEX idx_tok ON symbols(token)")
+            
             conn.commit()
             conn.close()
-            logger.info("✅ [Master] SQLite Ready & Indexed.")
-    except Exception as e: logger.error(f"Master Sync Fail: {e}")
-
-# ==============================================================================
-# --- THE SMART SUBSCRIPTION ENGINE (LOGIC 9, 10, 20) ---
-# ==============================================================================
-def execute_smart_subscription(watchlist):
-    """
-    Core Logic: Batching 500 tokens and auto-detecting segments.
-    """
-    if not state.is_ws_ready or not state.sws:
+            
+            with open(temp_path, "rb") as f:
+                supabase.storage.from_(BUCKET_NAME).upload(
+                    path="angel_master.db", 
+                    file=f.read(),
+                    file_options={"x-upsert": "true", "content-type": "application/octet-stream"}
+                )
+            os.remove(temp_path)
+            print("✅ [System] Indexed Master DB Uploaded.")
+            return True
+    except Exception as e:
+        print(f"❌ Master Error: {e}")
         return False
 
-    batches = {1:[], 2:[], 3:[], 4:[], 5:[]}
-    
-    for item in watchlist:
-        token = str(item.get('token'))
-        if not token or token == "None": continue
-        
-        # Smart Logic: Segment detect karo bina user se puche
-        etype = get_smart_segment(item.get('exch', 'NSE'), item.get('symbol', ''), token)
-        state.token_meta[token] = etype
-        
-        if token not in state.subscribed_tokens:
-            batches[etype].append(token)
-            state.subscribed_tokens.add(token)
-
-    for etype, tokens in batches.items():
-        if not tokens: continue
-        # Logic 9: 500-Batch Slicing
-        for i in range(0, len(tokens), 500):
-            chunk = tokens[i:i+500]
-            try:
-                state.sws.subscribe(f"smart_{etype}_{i}", 1, [{"exchangeType": etype, "tokens": chunk}])
-                eventlet.sleep(0.05)
-            except: pass
-    return True
-
-# ==============================================================================
-# --- SMART API ROUTES (URL HIT LOGIC) ---
-# ==============================================================================
-@app.route('/api/smart_subscribe', methods=['POST'])
-def url_subscribe():
-    """
-    Logic: APK or URL Manager can hit this to force subscribe tokens.
-    URL ke zariye bhi price activation hoga.
-    """
-    data = request.json
-    watchlist = data.get('watchlist', [])
-    success = execute_smart_subscription(watchlist)
-    return jsonify({"status": success, "active_count": len(state.subscribed_tokens)})
-
-@socketio.on('subscribe')
-def handle_socket_sub(data):
-    watchlist = data.get('watchlist', [])
-    for item in watchlist: join_room(str(item.get('token')))
-    execute_smart_subscription(watchlist)
-
-# ==============================================================================
-# --- TICK & BROADCAST ENGINE (LOGIC 7, 11, 14, 15, 16, 21) ---
-# ==============================================================================
-def on_data_callback(wsapp, msg):
+# --- 3. ELITE TICK ENGINE (1s Update + 1s History) ---
+def on_data(wsapp, msg):
+    global last_tick_time, previous_price
     try:
         if isinstance(msg, dict) and 'token' in msg:
-            token = str(msg['token'])
-            ltp = float(msg.get('last_traded_price', 0)) / 100 # Logic 11
+            token = str(msg.get('token'))
+            curr_time = time.time()
+            
+            # Logic: Strictly 1 tick per second per token (Render Stability)
+            if token in last_tick_time and (curr_time - last_tick_time[token]) < 1.0:
+                return
+            
+            ltp = float(msg.get('last_traded_price', 0)) / 100
             if ltp <= 0: return
 
-            state.total_packets += 1 # Logic 13: Score
-            
-            # Logic 14: Live OHLC Calculation
-            if token not in state.ohlc_data:
-                state.ohlc_data[token] = {"o": ltp, "h": ltp, "l": ltp, "c": ltp}
-            else:
-                state.ohlc_data[token]["h"] = max(state.ohlc_data[token]["h"], ltp)
-                state.ohlc_data[token]["l"] = min(state.ohlc_data[token]["l"], ltp)
+            # Get 1-sec purana price
+            old_p = previous_price.get(token, "{:.2f}".format(ltp))
 
-            packet = {
-                "t": token, "p": "{:.2f}".format(ltp),
-                "h": "{:.2f}".format(state.ohlc_data[token]["h"]),
-                "l": "{:.2f}".format(state.ohlc_data[token]["l"]),
-                "o": "{:.2f}".format(state.ohlc_data[token]["o"]),
-                "s": state.total_packets
+            payload = {
+                "t": token,
+                "p": "{:.2f}".format(ltp),      # Current Price
+                "lp": old_p,                     # Last Price (1s Purana)
+                "h": "{:.2f}".format(float(msg.get('high', 0)) / 100),
+                "l": "{:.2f}".format(float(msg.get('low', 0)) / 100),
+                "v": msg.get('volume', 0)
             }
-            state.price_cache[token] = packet
-    except: pass
+            
+            if 'close' in msg and float(msg['close']) > 0:
+                cp = float(msg['close']) / 100
+                payload["pc"] = "{:.2f}".format(((ltp - cp) / cp) * 100)
 
-def pulse_broadcaster():
-    """Logic 16: 0.5s Pulse Distribution"""
-    while True:
-        if state.price_cache:
-            snap = dict(state.price_cache)
-            state.price_cache.clear()
-            socketio.emit('live_update_batch', snap)
-            for t, d in snap.items(): socketio.emit('live_update', d, to=t)
-        eventlet.sleep(0.5)
+            # Update State
+            previous_price[token] = "{:.2f}".format(ltp)
+            last_tick_time[token] = curr_time
 
-# ==============================================================================
-# --- LIFECYCLE & RECOVERY (LOGIC 2, 3, 6, 20) ---
-# ==============================================================================
-def engine_lifecycle():
-    sync_master_data()
+            socketio.emit('live_update', payload, room=token)
+            
+            # Memory Cleanup (Logic: Har 5 second baad old logs clean)
+            if len(last_tick_time) > 1000:
+                last_tick_time.clear()
+                previous_price.clear()
+
+    except Exception as e:
+        print(f"Tick Data Error: {e}")
+
+# --- 4. ENGINE & RECOVERY ---
+def run_trading_engine():
+    global sws, is_ws_ready, subscribed_tokens_set, last_master_update_date
+    refresh_supabase_master()
+    
     while True:
         try:
-            if not state.is_ws_ready:
-                # Logic 2: DNS Resilience
-                socket.gethostbyname("apiconnect.angelone.in")
-                
-                state.smart_api = SmartConnect(api_key=API_KEY)
-                session = state.smart_api.generateSession(CLIENT_CODE, MPIN, pyotp.TOTP(TOTP_STR).now())
-                
-                if session.get('status'):
-                    state.sws = SmartWebSocketV2(session['data']['jwtToken'], API_KEY, CLIENT_CODE, session['data']['feedToken'])
+            now = datetime.datetime.now(IST)
+            if now.hour == 8 and 30 <= now.minute <= 45 and last_master_update_date != now.date():
+                if refresh_supabase_master(): last_master_update_date = now.date()
+
+            if 7 <= now.hour < 24:
+                if not is_ws_ready:
+                    smart_api = SmartConnect(api_key=API_KEY)
+                    totp = pyotp.TOTP(TOTP_STR).now()
+                    session = smart_api.generateSession(CLIENT_CODE, PWD, totp)
                     
-                    def on_open(ws):
-                        state.is_ws_ready = True
-                        logger.info("💎 [WS] Connected & Smart Recovery Started")
-                        # Logic 20: Auto Resubscribe
-                        if state.subscribed_tokens:
-                            execute_smart_subscription([{"token": t, "exch": "NSE"} for t in state.subscribed_tokens])
+                    if session.get('status'):
+                        sws = SmartWebSocketV2(session['data']['jwtToken'], API_KEY, CLIENT_CODE, session['data']['feedToken'])
+                        sws.on_data = on_data
+                        sws.on_open = lambda ws: exec("global is_ws_ready; is_ws_ready=True")
+                        sws.on_error = lambda ws, err: print(f"❌ WS Error: {err}")
+                        sws.on_close = lambda ws,c,r: exec("global is_ws_ready; is_ws_ready=False")
+                        sws.connect()
+            else:
+                if is_ws_ready:
+                    sws.close()
+                    is_ws_ready = False
+                    subscribed_tokens_set.clear()
+        except Exception as e:
+            print(f"Loop Error: {e}")
+        eventlet.sleep(10)
 
-                    state.sws.on_data = on_data_callback
-                    state.sws.on_open = on_open
-                    state.sws.connect()
-            eventlet.sleep(20)
-        except: eventlet.sleep(10)
+# --- 5. P2P & SUBSCRIPTION ---
+@socketio.on('subscribe')
+def handle_subscribe(json_data):
+    global subscribed_tokens_set, sws, is_ws_ready
+    watchlist = json_data.get('watchlist', [])
+    batches = {1: [], 2: [], 3: [], 4: [], 5: []}
 
-def ram_cleaner():
-    """Logic 3: Memory Protector"""
-    while True:
-        eventlet.sleep(600)
-        gc.collect()
+    for item in watchlist:
+        token = str(item.get('token'))
+        exch = str(item.get('exch', 'NSE')).upper()
+        if not token or token == "None": continue
 
-# ==============================================================================
-# --- BOOTSTRAP ---
-# ==============================================================================
+        join_room(token)
+        if token not in subscribed_tokens_set:
+            etype = 1
+            if "MCX" in exch: etype = 5
+            elif "NFO" in exch: etype = 2
+            elif "BSE" in exch: etype = 3
+            batches[etype].append(token)
+            subscribed_tokens_set.add(token)
+
+    if is_ws_ready and sws:
+        for etype, tokens in batches.items():
+            if tokens:
+                sws.subscribe(f"sub_{etype}", 1, [{"exchangeType": etype, "tokens": tokens}])
+
+# --- P2P SIGNALING ---
+@socketio.on('join_p2p')
+def on_p2p_join(data):
+    user_id = data.get('user_id')
+    if user_id:
+        join_room(user_id)
+        print(f"📱 P2P Node: {user_id}")
+
+@socketio.on('p2p_signal')
+def forward_signal(data):
+    target = data.get('targetId')
+    data['senderId'] = request.sid
+    emit('p2p_signal', data, room=target)
+
+@socketio.on('ice_candidate')
+def forward_ice(data):
+    target = data.get('targetId')
+    emit('ice_candidate', data, room=target)
+
+# --- 6. ROUTES ---
+@app.route('/download_db')
+def download_db():
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        res = supabase.storage.from_(BUCKET_NAME).download("angel_master.db")
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp.write(res)
+            tmp_path = tmp.name
+        @after_this_request
+        def cleanup(response):
+            if os.path.exists(tmp_path): os.remove(tmp_path)
+            return response
+        return send_file(tmp_path, as_attachment=True, download_name="angel_master.db")
+    except Exception as e: return f"Error: {e}", 500
+
+@app.route('/history')
+def get_history():
+    token = request.args.get('token')
+    exch = request.args.get('exch', 'NSE').upper()
+    try:
+        smart_api = SmartConnect(api_key=API_KEY)
+        totp = pyotp.TOTP(TOTP_STR).now()
+        smart_api.generateSession(CLIENT_CODE, PWD, totp)
+        to_date = datetime.datetime.now(IST).strftime('%Y-%m-%d %H:%M')
+        from_date = (datetime.datetime.now(IST) - datetime.timedelta(days=90)).strftime('%Y-%m-%d %H:%M')
+        res = smart_api.getCandleData({"exchange": exch, "symboltoken": token, "interval": "FIVE_MINUTE", "fromdate": from_date, "todate": to_date})
+        if res.get('status'):
+            return json.dumps([{"time": int(datetime.datetime.strptime(c[0], "%Y-%m-%dT%H:%M:%S%z").timestamp()), "open": c[1], "high": c[2], "low": c[3], "close": c[4]} for c in res['data']])
+        return "Error", 404
+    except Exception as e: return str(e), 500
+
+@app.route('/')
+def health():
+    # Logic: Har hit par status check
+    return f"Engine: {'READY' if is_ws_ready else 'OFFLINE'} | Tokens: {len(subscribed_tokens_set)}", 200
+
 if __name__ == '__main__':
-    socketio.start_background_task(pulse_broadcaster)
-    socketio.start_background_task(engine_lifecycle)
-    socketio.start_background_task(ram_cleaner)
-    
+    socketio.start_background_task(run_trading_engine)
     port = int(os.environ.get("PORT", 10000))
-    logger.info(f"🚀 [Munh Smart V3] Port: {port}")
-    eventlet.wsgi.server(eventlet.listen(('0.0.0.0', port)), app)
+    socketio.run(app, host='0.0.0.0', port=port)
