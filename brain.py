@@ -50,17 +50,25 @@ socketio = SocketIO(
 # ==============================================================================
 class MunhEngineState:
     def __init__(self):
+        # API & WebSocket
         self.smart_api = None
         self.sws = None
         self.is_ws_ready = False
         self.reconnect_count = 0
+        
+        # Market Data & Subscriptions
         self.subscribed_tokens_set = set()      
         self.token_metadata = {}                
         self.global_market_cache = {}           
         self.previous_price = {}                
         self.live_ohlc = {}                     
+        
+        # P2P & User Management (FIXED: Added missing fields)
+        self.user_levels = {}                   # [FIX] Render error fix: Stores LEVEL_1, LEVEL_2 etc.
         self.user_p2p_scores = {}               
-        self.active_users_pool = {}             
+        self.active_users_pool = {}             # SID based active users
+        
+        # System Monitoring
         self.dns_status = False                 
         self.last_master_update = None
         self.total_packets = 0
