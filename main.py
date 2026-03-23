@@ -18,19 +18,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Credentials
+# Credentials (API Key & Account Details)
 API_KEY = "85HE4VA1"
 CLIENT_CODE = "S52638556"
 MPIN = "0000"
 TOTP_STR = "XFTXZ2445N4V2UMB7EWUCBDRMU"
 IST = pytz.timezone('Asia/Kolkata')
 
-# Supabase Infrastructure
+# Supabase Infrastructure (For Cloud DB Backup)
 SUPABASE_URL = "https://tnrhlvibaeiwhlrxdxnm.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRucmhsdmliYWVpd2hscnhkeG5tIiwicm9sZSI6InNlcnZpY2V_cm9sZSIsImlhdCI6MTc3MjY0NzQ0NywiZXhwIjoyMDg4MjIzNDQ3fQ.epYmt7sxhZRhEQWoj0doCHAbfOTHOjSurBbLss5a4Pk"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRucmhsdmliYWVpd2hscnhkeG5tIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjY0NzQ0NywiZXhwIjoyMDg4MjIzNDQ3fQ.epYmt7sxhZRhEQWoj0doCHAbfOTHOjSurBbLss5a4Pk"
 BUCKET_NAME = "Myt"
 
 app = Flask(__name__)
+# High-Performance Socket Configuration for Mobile Apps
 socketio = SocketIO(
     app, 
     cors_allowed_origins="*", 
@@ -70,6 +71,7 @@ state = MunhEngineState()
 # --- 3. SYSTEM RESILIENCE & MEMORY MANAGEMENT ---
 # ==============================================================================
 def verify_dns_resilience():
+    """Logic: Ensures API reachability before login attempts"""
     try:
         host = "apiconnect.angelone.in"
         socket.gethostbyname(host)
@@ -80,6 +82,7 @@ def verify_dns_resilience():
         return False
 
 def system_memory_protector():
+    """Logic: Cleans RAM to prevent Render.com crashes during high volatility"""
     while True:
         eventlet.sleep(600)
         try:
@@ -92,9 +95,10 @@ def system_memory_protector():
         except: pass
 
 # ==============================================================================
-# --- 4. MASTER DATA SYNCHRONIZATION ---
+# --- 4. MASTER DATA SYNCHRONIZATION (SUPABASE) ---
 # ==============================================================================
 def sync_master_data_v2():
+    """Logic: Downloads and indexes 100k+ scrips for fast searching & option chain"""
     logger.info("🔄 [Master] Initializing Scrip Master Sync...")
     try:
         if not verify_dns_resilience(): return False
@@ -104,6 +108,7 @@ def sync_master_data_v2():
         response = requests.get(master_url, timeout=45)
         if response.status_code == 200:
             json_payload = response.json()
+            
             with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
                 state.db_path = tmp.name
             
@@ -123,6 +128,8 @@ def sync_master_data_v2():
             
             cursor.executemany("INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?)", records)
             cursor.execute("CREATE INDEX idx_token_fast ON symbols(token)")
+            cursor.execute("CREATE INDEX idx_name_fast ON symbols(name)")
+            cursor.execute("CREATE INDEX idx_expiry_fast ON symbols(expiry)")
             conn.commit()
             conn.close()
             
@@ -140,7 +147,7 @@ def sync_master_data_v2():
         return False
 
 # ==============================================================================
-# --- 5. SEARCH & OPTION CHAIN API ROUTES ---
+# --- 5. SEARCH, OPTION CHAIN & EXPIRY API ROUTES ---
 # ==============================================================================
 @app.route('/')
 def health_check():
@@ -162,10 +169,38 @@ def handle_search():
         return jsonify({"symbols": results})
     except: return jsonify([])
 
+@app.route('/api/expiry_list', methods=['POST'])
+def get_expiry():
+    try:
+        name = request.json.get('name')
+        conn = sqlite3.connect(state.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT DISTINCT expiry FROM symbols WHERE name = ? AND expiry != '' ORDER BY expiry ASC", (name,))
+        exps = [r[0] for r in cursor.fetchall()]
+        conn.close()
+        return jsonify({"expiries": exps})
+    except: return jsonify([])
+
+@app.route('/api/option_chain', methods=['POST'])
+def handle_option_chain():
+    try:
+        d = request.json
+        name, expiry = d.get('name'), d.get('expiry')
+        conn = sqlite3.connect(state.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""SELECT strike, token, symbol, instrumenttype, lotsize, exch_seg 
+                          FROM symbols WHERE name = ? AND expiry = ? 
+                          AND instrumenttype LIKE 'OPT%' ORDER BY CAST(strike AS FLOAT) ASC""", (name, expiry))
+        rows = cursor.fetchall()
+        conn.close()
+        return jsonify({"chain": rows})
+    except: return jsonify({"status": False})
+
 # ==============================================================================
 # --- 6. TICK ENGINE (LTP, OHLC & BROADCASTING) ---
 # ==============================================================================
 def on_data_callback(wsapp, msg):
+    """Logic: Processes real-time market ticks and calculates OHLC metrics"""
     try:
         if isinstance(msg, dict) and 'token' in msg:
             token = str(msg.get('token'))
@@ -174,6 +209,7 @@ def on_data_callback(wsapp, msg):
             
             ltp = float(ltp_raw) / 100
             state.total_packets += 1
+            state.user_p2p_scores[token] = state.user_p2p_scores.get(token, 0) + 1
             
             if token not in state.live_ohlc:
                 state.live_ohlc[token] = {"o": ltp, "h": ltp, "l": ltp, "c": ltp}
@@ -182,12 +218,16 @@ def on_data_callback(wsapp, msg):
                 state.live_ohlc[token]["l"] = min(state.live_ohlc[token]["l"], ltp)
                 state.live_ohlc[token]["c"] = ltp
 
+            old_val = state.previous_price.get(token, "{:.2f}".format(ltp))
+            
             data_packet = {
                 "t": token,
                 "p": "{:.2f}".format(ltp),
+                "lp": old_val,
                 "h": "{:.2f}".format(state.live_ohlc[token]["h"]),
                 "l": "{:.2f}".format(state.live_ohlc[token]["l"]),
-                "o": "{:.2f}".format(state.live_ohlc[token]["o"])
+                "o": "{:.2f}".format(state.live_ohlc[token]["o"]),
+                "score": state.user_p2p_scores[token]
             }
             
             if 'close' in msg and float(msg['close']) > 0:
@@ -195,19 +235,58 @@ def on_data_callback(wsapp, msg):
                 data_packet["pc"] = "{:.2f}".format(((ltp - cp) / cp) * 100)
 
             state.global_market_cache[token] = data_packet
+            state.previous_price[token] = "{:.2f}".format(ltp)
     except: pass
 
 def pulse_broadcaster():
+    """Logic: Broadcasts market snapshots to clients every 0.5 seconds"""
     while True:
         try:
             if state.global_market_cache:
                 snap = dict(state.global_market_cache)
                 state.global_market_cache.clear()
+                
                 socketio.emit('live_update_batch', snap)
                 for token, data in snap.items():
                     socketio.emit('live_update', data, to=token)
+            
             eventlet.sleep(state.heartbeat_gap)
         except: eventlet.sleep(1)
+
+# ==============================================================================
+# --- 7. CHARTING & ORDER SLICING UTILITIES ---
+# ==============================================================================
+@app.route('/get_90day_chart', methods=['POST'])
+def chart_logic():
+    """Logic: Fetches historical 90-day candle data for charting"""
+    try:
+        d = request.json
+        if state.smart_api:
+            payload = {
+                "exchange": d.get('exch', 'NSE'),
+                "symboltoken": d.get('token'),
+                "interval": d.get('interval', "ONE_MINUTE"),
+                "fromdate": (datetime.datetime.now(IST) - datetime.timedelta(days=90)).strftime('%Y-%m-%d %H:%M'),
+                "todate": datetime.datetime.now(IST).strftime('%Y-%m-%d %H:%M')
+            }
+            return jsonify(state.smart_api.getCandleData(payload))
+    except: pass
+    return jsonify({"status": False})
+
+@app.route('/order_slice', methods=['POST'])
+def slice_order():
+    """Logic: Slices large orders into smaller chunks to bypass exchange limits"""
+    try:
+        d = request.json
+        qty = int(d.get('qty', 0))
+        max_limit = int(d.get('max', 1800))
+        slices = []
+        while qty > 0:
+            chunk = min(qty, max_limit)
+            slices.append(chunk)
+            qty -= chunk
+        return jsonify({"slices": slices})
+    except: return jsonify({"error": "Invalid Input"})
 
 # ==============================================================================
 # --- 8. SMART FULL-SEGMENT SUBSCRIPTION (NSE/BSE/NFO/MCX - FUT & OPT) ---
@@ -215,7 +294,7 @@ def pulse_broadcaster():
 @socketio.on('subscribe')
 def handle_incoming_subscription(data):
     """
-    Logic 13: UPDATED Full Multi-Segment Sync
+    Logic: UPDATED Full Multi-Segment Sync
     Handles NSE/BSE Cash, Futures, Options and MCX Futures/Options.
     """
     watchlist = data.get('watchlist', [])
@@ -233,19 +312,14 @@ def handle_incoming_subscription(data):
         join_room(token)
         
         # --- PRECISE SEGMENT DETECTION ENGINE ---
-        etype = 1 # NSE Cash Default
-        
+        etype = 1 
         if "MCX" in exch:
-            # MCX Options vs Futures
             etype = 7 if any(x in exch for x in ["OPT", "CE", "PE"]) else 5
         elif "BSE" in exch:
-            # BSE Options vs Cash
             etype = 4 if any(x in exch for x in ["OPT", "FUT", "NFO"]) else 3
         elif any(x in exch for x in ["NFO", "FUT", "OPT", "NI"]):
-            # NSE Derivatives
             etype = 2
         else:
-            # NSE Cash
             etype = 1
         
         state.token_metadata[token] = etype
@@ -254,7 +328,6 @@ def handle_incoming_subscription(data):
             batch_registry[etype].append(token)
             state.subscribed_tokens_set.add(token)
 
-    # 500-Batch Execution
     if state.is_ws_ready and state.sws:
         for seg, tokens in batch_registry.items():
             if not tokens: continue
@@ -267,12 +340,13 @@ def handle_incoming_subscription(data):
                 except Exception as e:
                     logger.error(f"❌ [Sub Error]: {e}")
     else:
-        logger.warning("🔌 [Sub Pending] Socket not ready. Tokens queued.")
+        logger.warning("🔌 [Sub Pending] WebSocket not ready. Tokens queued.")
 
 # ==============================================================================
 # --- 9. LIFECYCLE & AUTO-RECOVERY ---
 # ==============================================================================
 def engine_lifecycle_manager():
+    """Logic: Manages session generation, WebSocket connection, and auto-healing"""
     sync_master_data_v2()
     while True:
         try:
@@ -291,7 +365,7 @@ def engine_lifecycle_manager():
                     
                     def handle_open(ws):
                         state.is_ws_ready = True
-                        logger.info("💎 [WS] Connected!")
+                        logger.info("💎 [WS] Connected Successfully!")
                         re_subscribe_all_tokens()
 
                     state.sws.on_data = on_data_callback
@@ -299,10 +373,13 @@ def engine_lifecycle_manager():
                     state.sws.on_close = lambda ws,c,r: setattr(state, 'is_ws_ready', False)
                     state.sws.connect()
                     eventlet.sleep(5)
-        except: state.is_ws_ready = False
+        except Exception as e:
+            logger.error(f"⚠️ [Lifecycle Error]: {e}")
+            state.is_ws_ready = False
         eventlet.sleep(25)
 
 def re_subscribe_all_tokens():
+    """Resubscribes all active tokens in the pool upon reconnection"""
     if not state.sws or not state.is_ws_ready: return
     
     seg_map = {1: [], 2: [], 3: [], 4: [], 5: [], 7: []}
@@ -314,16 +391,21 @@ def re_subscribe_all_tokens():
         for i in range(0, len(tokens), 500):
             batch = tokens[i:i+500]
             if batch:
-                state.sws.subscribe(f"recon_{seg}", 1, [{"exchangeType": seg, "tokens": batch}])
-                eventlet.sleep(0.1)
+                try:
+                    state.sws.subscribe(f"recon_{seg}", 1, [{"exchangeType": seg, "tokens": batch}])
+                    eventlet.sleep(0.1)
+                except: pass
 
 # ==============================================================================
 # --- 10. BOOTSTRAP ---
 # ==============================================================================
 if __name__ == '__main__':
+    # Start background tasks
     socketio.start_background_task(pulse_broadcaster)
     socketio.start_background_task(engine_lifecycle_manager)
     socketio.start_background_task(system_memory_protector)
     
+    # Port setup for Render.com / Cloud
     port = int(os.environ.get("PORT", 10000))
+    logger.info(f"🚀 [Titan V3] Starting on Port {port}...")
     eventlet.wsgi.server(eventlet.listen(('0.0.0.0', port)), app)
