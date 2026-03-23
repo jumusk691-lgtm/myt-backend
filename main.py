@@ -1,7 +1,7 @@
 # main.py (Aggressive RAM Management)
 import os, eventlet, gc
 from brain import app, socketio, logger, state
-import auth_manager, master_db, tick_engine, socket_manager, recovery_manager, historical_manager, p2p_manager
+import auth_manager, master_db, tick_engine, socket_manager, recovery_manager, historical_manager, p2p_distributor
 
 def aggressive_memory_protector():
     """Logic: Hard-Reset RAM every 10 seconds to stay under 512MB"""
