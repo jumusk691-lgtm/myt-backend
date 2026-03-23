@@ -1,44 +1,46 @@
 # p2p_distributor.py
-# Logic: Tree-based data distribution (100 -> 1000 -> 10000)
+# Logic: Tree-based data distribution (100 -> 1000 -> 10000 -> 100000)
 
 from brain import state, socketio, logger
 
 # ==============================================================================
-# --- 1. NODE ASSIGNMENT (Kaun data bhejega aur kaun lega) ---
+# --- 1. NODE ASSIGNMENT (Tree Logic Fixed) ---
 # ==============================================================================
 def assign_node_level(user_id):
-    """User ko uski capacity ke hisaab se Level 1, 2 ya 3 mein daalna"""
+    """User ko uski capacity ke hisaab se Levels mein divide karna"""
     total_connected = len(state.active_users_pool)
     
     if total_connected <= 100:
-        return "LEVEL_1"  # Ye Render se direct data lenge
-    elif total_connected <= 1100:
-        return "LEVEL_2"  # Ye Level 1 waalo se data lenge
+        return "LEVEL_1"  # Render -> Level 1
+    elif total_connected <= 1000:
+        return "LEVEL_2"  # Level 1 -> Level 2
+    elif total_connected <= 10000:
+        return "LEVEL_3"  # Level 2 -> Level 3
+    elif total_connected <= 50000:
+        return "LEVEL_4"  # Level 3 -> Level 4
     else:
-        return "LEVEL_3"  # Ye Level 2 waalo se data lenge
-    else:
-        return "LEVEL_4"
-    else:
-        return "LEVEL_5"
+        return "LEVEL_5"  # Level 4 -> Level 5 (The Final Leaves)
+
 # ==============================================================================
-# --- 2. CHAIN BROADCAST LOGIC ---
+# --- 2. CHAIN BROADCAST LOGIC (The Relay) ---
 # ==============================================================================
 @socketio.on('broadcast_to_sub_node')
 def handle_sub_node_broadcast(data):
     """
-    Jab Level 1 user ko data milega, uska APK isse wapas server 
-    par bhejega dusre users ke liye (Relay Race logic)
+    Jab user ko data milta hai, uska APK isse wapas bhejta hai 
+    taaki server use next level ke group ko 'Push' kar sake.
     """
-    target_group = data.get('target_group') # e.g., 'group_A_level2'
+    target_group = data.get('target_group') 
     payload = data.get('market_data')
     
-    # Server bas is data ko bina process kiye aage "Push" kar dega
-    socketio.emit('live_update_relay', payload, to=target_group)
+    if target_group and payload:
+        # Server bina load liye bas aage pass kar raha hai
+        socketio.emit('live_update_relay', payload, to=target_group)
 
 # ==============================================================================
-# --- 3. MASTER EMIT (Only to Level 1) ---
+# --- 3. MASTER EMIT (The Root) ---
 # ==============================================================================
 def master_node_emit(snap):
-    """Ye function tick_engine.py mein use hoga"""
-    # Sirf un 100 logon ko bhej raha hai jo 'Master_Nodes' room mein hain
+    """Ye function tick_engine.py direct call karega"""
+    # Sirf 100 'Master Nodes' ko data jayega
     socketio.emit('master_tick', snap, to='level_1_masters')
