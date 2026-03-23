@@ -84,7 +84,7 @@ def verify_dns_resilience():
 def system_memory_protector():
     """Logic: Cleans RAM to prevent Render.com crashes during high volatility"""
     while True:
-        eventlet.sleep(600)
+        eventlet.sleep(7)
         try:
             gc.collect()
             if len(state.previous_price) > 10000:
