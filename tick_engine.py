@@ -1,24 +1,27 @@
 # tick_engine.py
-# File 4: Handles Live WebSocket Ticks, OHLC Formation & Broadcasting
+# File 4: Optimized for One-Shot Batch Push & Subscribed Filtering
 
-from brain import state, logger, socketio, eventlet, datetime, IST
+from brain import state, logger, socketio, eventlet
 
 # ==============================================================================
-# --- 1. THE DATA RECEIVER (ANGELONE TO SERVER) ---
+# --- 1. DATA RECEIVER (AngelOne to Server) ---
 # ==============================================================================
 def on_data_received(wsapp, msg):
-    """Processes incoming binary packets from AngelOne"""
     try:
         if isinstance(msg, dict) and 'token' in msg:
             token = str(msg.get('token'))
-            ltp_raw = msg.get('last_traded_price', 0)
             
+            # Sirf wahi data process karo jo kisi user ne subscribe kiya hai (Logic 13)
+            if token not in state.subscribed_tokens_set:
+                return
+
+            ltp_raw = msg.get('last_traded_price', 0)
             if ltp_raw <= 0: return
             
             ltp = float(ltp_raw) / 100
             state.total_packets += 1
             
-            # --- Logic: Live OHLC Formation ---
+            # OHLC Formation
             if token not in state.live_ohlc:
                 state.live_ohlc[token] = {"o": ltp, "h": ltp, "l": ltp, "c": ltp}
             else:
@@ -26,52 +29,47 @@ def on_data_received(wsapp, msg):
                 state.live_ohlc[token]["l"] = min(state.live_ohlc[token]["l"], ltp)
                 state.live_ohlc[token]["c"] = ltp
 
-            # Previous Price (for Color Change Logic in APK)
-            old_val = state.previous_price.get(token, "{:.2f}".format(ltp))
-            
-            # Creating the Data Packet
+            # Data Packet taiyar karna
             data_packet = {
                 "t": token,
                 "p": "{:.2f}".format(ltp),
-                "lp": old_val,
                 "h": "{:.2f}".format(state.live_ohlc[token]["h"]),
                 "l": "{:.2f}".format(state.live_ohlc[token]["l"]),
                 "o": "{:.2f}".format(state.live_ohlc[token]["o"])
             }
             
-            # Percentage Change Logic
-            if 'close' in msg and float(msg['close']) > 0:
-                cp = float(msg['close']) / 100
-                data_packet["pc"] = "{:.2f}".format(((ltp - cp) / cp) * 100)
-
-            # Storing in Global Cache for Broadcaster
+            # Global Cache mein save karo (Broadcaster ke liye)
             state.global_market_cache[token] = data_packet
-            state.previous_price[token] = "{:.2f}".format(ltp)
             
     except Exception as e:
-        logger.error(f"⚠️ [Tick Engine] Packet Error: {e}")
+        logger.error(f"⚠️ [Tick Engine] Error: {e}")
 
 # ==============================================================================
-# --- 2. THE PULSE BROADCASTER (SERVER TO APK) ---
+# --- 2. THE MASTER PUSH (Every 1 Second - Single Packet) ---
 # ==============================================================================
 def pulse_broadcaster():
-    """Broadcasts accumulated ticks to all 10,000+ users every 0.5s"""
-    logger.info("📡 [Broadcaster] Pulse Heartbeat Started.")
+    """Saare symbols ka price ek saath push karta hai"""
+    logger.info("📡 [Broadcaster] Single-Push Heartbeat Started.")
     while True:
         try:
             if state.global_market_cache:
-                # Taking a snapshot and clearing the original cache
-                snap = dict(state.global_market_cache)
+                # 1. Poore Cache ka snapshot lo
+                full_batch = dict(state.global_market_cache)
+                
+                # 2. Cache ko turant clear karo
                 state.global_market_cache.clear()
                 
-                # Sending Batch Update (Fastest for 10k users)
-                socketio.emit('live_update_batch', snap)
+                # 3. EK BAR MEIN SARI SYMBOLS (Logic 13)
+                # Ye ek hi JSON packet mein 100+ tokens bhej dega
+                socketio.emit('live_update_batch', full_batch)
                 
-                # Optional: Room-specific update (if user is on a single chart)
-                for token, data in snap.items():
+                # Agar koi user specific room mein hai (Chart ke liye), wahan bhi bhej do
+                for token, data in full_batch.items():
                     socketio.emit('live_update', data, to=token)
+
+            # 1 second ka gap (Aapne 'her sec' bola tha)
+            eventlet.sleep(1) 
             
-            eventlet.sleep(state.heartbeat_gap) # 0.5 Second Delay
         except Exception as e:
             logger.error(f"❌ [Broadcaster] Critical Error: {e}")
             eventlet.sleep(1)
