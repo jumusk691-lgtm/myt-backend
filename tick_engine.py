@@ -1,17 +1,18 @@
 # tick_engine.py
-# File 4: Optimized for One-Shot Batch Push & Subscribed Filtering
+# File 4: Direct Stream (No Delay) & P2P Distribution Logic
 
 from brain import state, logger, socketio, eventlet
 
 # ==============================================================================
-# --- 1. DATA RECEIVER (AngelOne to Server) ---
+# --- 1. THE DIRECT PUSH RECEIVER (No Saving/No Waiting) ---
 # ==============================================================================
 def on_data_received(wsapp, msg):
+    """Jaise hi data aaye, bina save kiye turant bhej do"""
     try:
         if isinstance(msg, dict) and 'token' in msg:
             token = str(msg.get('token'))
             
-            # Sirf wahi data process karo jo kisi user ne subscribe kiya hai (Logic 13)
+            # Logic: Sirf wahi process karo jo subscribed hai
             if token not in state.subscribed_tokens_set:
                 return
 
@@ -21,15 +22,14 @@ def on_data_received(wsapp, msg):
             ltp = float(ltp_raw) / 100
             state.total_packets += 1
             
-            # OHLC Formation
+            # Live OHLC Update (Memory mein high/low update karne ke liye)
             if token not in state.live_ohlc:
                 state.live_ohlc[token] = {"o": ltp, "h": ltp, "l": ltp, "c": ltp}
             else:
                 state.live_ohlc[token]["h"] = max(state.live_ohlc[token]["h"], ltp)
                 state.live_ohlc[token]["l"] = min(state.live_ohlc[token]["l"], ltp)
-                state.live_ohlc[token]["c"] = ltp
 
-            # Data Packet taiyar karna
+            # Data Packet Taiyar Karo
             data_packet = {
                 "t": token,
                 "p": "{:.2f}".format(ltp),
@@ -37,39 +37,42 @@ def on_data_received(wsapp, msg):
                 "l": "{:.2f}".format(state.live_ohlc[token]["l"]),
                 "o": "{:.2f}".format(state.live_ohlc[token]["o"])
             }
+
+            # --------------------------------------------------------------
+            # --- SHARED P2P PUSH LOGIC (Level 1 to All) ---
+            # --------------------------------------------------------------
             
-            # Global Cache mein save karo (Broadcaster ke liye)
+            # 1. Direct Push to LEVEL 1 (Master Nodes - First 100 Users)
+            # Inko sabse pehle data milega taaki ye aage relay kar sakein
+            socketio.emit('master_tick', data_packet, to='level_1_masters')
+
+            # 2. Direct Push to Token Room (For everyone watching this stock)
+            # Bina save kiye 'Direct' push ho raha hai
+            socketio.emit('live_update', data_packet, to=token)
+            
+            # 3. Batch Cache (Optional backup for very slow networks)
             state.global_market_cache[token] = data_packet
-            
+
     except Exception as e:
-        logger.error(f"⚠️ [Tick Engine] Error: {e}")
+        logger.error(f"⚠️ [Direct Engine Error]: {e}")
 
 # ==============================================================================
-# --- 2. THE MASTER PUSH (Every 1 Second - Single Packet) ---
+# --- 2. THE BATCH BROADCASTER (Backup Support) ---
 # ==============================================================================
 def pulse_broadcaster():
-    """Saare symbols ka price ek saath push karta hai"""
-    logger.info("📡 [Broadcaster] Single-Push Heartbeat Started.")
+    """Ye har 0.5 sec mein ek saath saari symbols ka guchha (Batch) bhejta hai"""
+    logger.info("📡 [Broadcaster] Batch-Push Ready.")
     while True:
         try:
             if state.global_market_cache:
-                # 1. Poore Cache ka snapshot lo
-                full_batch = dict(state.global_market_cache)
-                
-                # 2. Cache ko turant clear karo
+                # Snap le kar cache clear karo taaki memory save ho
+                snap = dict(state.global_market_cache)
                 state.global_market_cache.clear()
                 
-                # 3. EK BAR MEIN SARI SYMBOLS (Logic 13)
-                # Ye ek hi JSON packet mein 100+ tokens bhej dega
-                socketio.emit('live_update_batch', full_batch)
+                # SARI SYMBOLS EK SATH (One-shot Push)
+                socketio.emit('live_update_batch', snap)
                 
-                # Agar koi user specific room mein hai (Chart ke liye), wahan bhi bhej do
-                for token, data in full_batch.items():
-                    socketio.emit('live_update', data, to=token)
-
-            # 1 second ka gap (Aapne 'her sec' bola tha)
-            eventlet.sleep(0.5) 
-            
+            eventlet.sleep(0.5) # Fast heartbeat
         except Exception as e:
-            logger.error(f"❌ [Broadcaster] Critical Error: {e}")
+            logger.error(f"❌ [Broadcaster Error]: {e}")
             eventlet.sleep(1)
