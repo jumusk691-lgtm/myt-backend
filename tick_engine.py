@@ -1,10 +1,34 @@
 # tick_engine.py
-# File 4: Direct Stream (No Delay) & P2P Distribution Logic
+# File 4: Direct Stream (No Delay) & RAM Auto-Cleaner for 512MB Limit
 
 from brain import state, logger, socketio, eventlet
 
 # ==============================================================================
-# --- 1. THE DIRECT PUSH RECEIVER (No Saving/No Waiting) ---
+# --- 1. THE AUTO-CLEANER (The RAM Guard) ---
+# ==============================================================================
+def market_data_cleaner():
+    """Logic 18: Har 15 second mein RAM ko flush karna taaki Render crash na ho"""
+    while True:
+        eventlet.sleep(15) 
+        try:
+            # 1. Purane Batch Cache ko poora saaf karo
+            state.global_market_cache.clear()
+            
+            # 2. Agar OHLC data 500 stocks se zyada ho jaye toh reset karo
+            # Isse RAM kabhi 512MB cross nahi karegi
+            if len(state.live_ohlc) > 500:
+                state.live_ohlc.clear()
+                logger.info("🧹 [RAM Guard] High-Memory OHLC Reset Done.")
+                
+            # 3. Purane prices ka record bhi limit mein rakho
+            if len(state.previous_price) > 1000:
+                state.previous_price.clear()
+
+        except Exception as e:
+            logger.error(f"⚠️ [Cleaner Error]: {e}")
+
+# ==============================================================================
+# --- 2. THE DIRECT PUSH RECEIVER (No Saving) ---
 # ==============================================================================
 def on_data_received(wsapp, msg):
     """Jaise hi data aaye, bina save kiye turant bhej do"""
@@ -12,7 +36,7 @@ def on_data_received(wsapp, msg):
         if isinstance(msg, dict) and 'token' in msg:
             token = str(msg.get('token'))
             
-            # Logic: Sirf wahi process karo jo subscribed hai
+            # Subscribed check (Security & Performance)
             if token not in state.subscribed_tokens_set:
                 return
 
@@ -22,7 +46,7 @@ def on_data_received(wsapp, msg):
             ltp = float(ltp_raw) / 100
             state.total_packets += 1
             
-            # Live OHLC Update (Memory mein high/low update karne ke liye)
+            # Live OHLC Formation (Update in memory)
             if token not in state.live_ohlc:
                 state.live_ohlc[token] = {"o": ltp, "h": ltp, "l": ltp, "c": ltp}
             else:
@@ -38,41 +62,34 @@ def on_data_received(wsapp, msg):
                 "o": "{:.2f}".format(state.live_ohlc[token]["o"])
             }
 
-            # --------------------------------------------------------------
-            # --- SHARED P2P PUSH LOGIC (Level 1 to All) ---
-            # --------------------------------------------------------------
-            
-            # 1. Direct Push to LEVEL 1 (Master Nodes - First 100 Users)
-            # Inko sabse pehle data milega taaki ye aage relay kar sakein
+            # --- DIRECT P2P & ROOM PUSH ---
+            # 1. Level 1 Masters ko bhej do (P2P Shared Logic)
             socketio.emit('master_tick', data_packet, to='level_1_masters')
 
-            # 2. Direct Push to Token Room (For everyone watching this stock)
-            # Bina save kiye 'Direct' push ho raha hai
+            # 2. Individual Room (Direct Push - No Cache)
             socketio.emit('live_update', data_packet, to=token)
             
-            # 3. Batch Cache (Optional backup for very slow networks)
+            # 3. Batching for backup
             state.global_market_cache[token] = data_packet
 
     except Exception as e:
         logger.error(f"⚠️ [Direct Engine Error]: {e}")
 
 # ==============================================================================
-# --- 2. THE BATCH BROADCASTER (Backup Support) ---
+# --- 3. THE BATCH BROADCASTER (Fast Heartbeat) ---
 # ==============================================================================
 def pulse_broadcaster():
-    """Ye har 0.5 sec mein ek saath saari symbols ka guchha (Batch) bhejta hai"""
-    logger.info("📡 [Broadcaster] Batch-Push Ready.")
+    """Har 0.5 sec mein saari symbols ka guchha bhejta hai"""
     while True:
         try:
             if state.global_market_cache:
-                # Snap le kar cache clear karo taaki memory save ho
                 snap = dict(state.global_market_cache)
                 state.global_market_cache.clear()
                 
-                # SARI SYMBOLS EK SATH (One-shot Push)
+                # SARI SYMBOLS EK SATH
                 socketio.emit('live_update_batch', snap)
                 
-            eventlet.sleep(0.5) # Fast heartbeat
+            eventlet.sleep(0.5) 
         except Exception as e:
             logger.error(f"❌ [Broadcaster Error]: {e}")
             eventlet.sleep(1)
