@@ -71,7 +71,6 @@ state = MunhEngineState()
 # --- 3. SYSTEM RESILIENCE & MEMORY MANAGEMENT ---
 # ==============================================================================
 def verify_dns_resilience():
-    """Logic 2: Ensures API reachability before login attempts"""
     try:
         host = "apiconnect.angelone.in"
         socket.gethostbyname(host)
@@ -82,7 +81,6 @@ def verify_dns_resilience():
         return False
 
 def system_memory_protector():
-    """Logic 3 & 18: Cleans RAM to prevent Render.com crashes"""
     while True:
         eventlet.sleep(600)
         try:
@@ -98,7 +96,6 @@ def system_memory_protector():
 # --- 4. MASTER DATA SYNCHRONIZATION (SUPABASE) ---
 # ==============================================================================
 def sync_master_data_v2():
-    """Logic 4: Downloads and indexes 100k+ scrips for fast searching"""
     logger.info("🔄 [Master] Initializing Scrip Master Sync...")
     try:
         if not verify_dns_resilience(): return False
@@ -200,7 +197,6 @@ def handle_option_chain():
 # --- 6. TICK ENGINE (LTP, OHLC & BROADCASTING) ---
 # ==============================================================================
 def on_data_callback(wsapp, msg):
-    """Logic 7, 11, 15, 17: Handles high-speed market packets"""
     try:
         if isinstance(msg, dict) and 'token' in msg:
             token = str(msg.get('token'))
@@ -211,7 +207,6 @@ def on_data_callback(wsapp, msg):
             state.total_packets += 1
             state.user_p2p_scores[token] = state.user_p2p_scores.get(token, 0) + 1
             
-            # Logic 15 & 17: OHLC Real-time Formation
             if token not in state.live_ohlc:
                 state.live_ohlc[token] = {"o": ltp, "h": ltp, "l": ltp, "c": ltp}
             else:
@@ -240,29 +235,22 @@ def on_data_callback(wsapp, msg):
     except: pass
 
 def pulse_broadcaster():
-    """Logic 21: 0.5s heartbeat broadcaster to all clients"""
     while True:
         try:
             if state.global_market_cache:
                 snap = dict(state.global_market_cache)
                 state.global_market_cache.clear()
-                
-                # Batch update for all tokens
                 socketio.emit('live_update_batch', snap)
-                
-                # Room-specific update for targeted tokens
                 for token, data in snap.items():
                     socketio.emit('live_update', data, to=token)
-            
             eventlet.sleep(state.heartbeat_gap)
         except: eventlet.sleep(1)
 
 # ==============================================================================
-# --- 7. CHARTING & ORDER SLICING UTILITIES ---
+# --- 7. CHARTING & ORDER SLICING ---
 # ==============================================================================
 @app.route('/get_90day_chart', methods=['POST'])
 def chart_logic():
-    """Logic 14 & 16: Historical data for charts"""
     try:
         d = request.json
         if state.smart_api:
@@ -279,7 +267,6 @@ def chart_logic():
 
 @app.route('/order_slice', methods=['POST'])
 def slice_order():
-    """Logic 22: Order Book Slicing"""
     try:
         d = request.json
         qty = int(d.get('qty', 0))
@@ -293,86 +280,77 @@ def slice_order():
     except: return jsonify({"error": "Invalid Input"})
 
 # ==============================================================================
-# --- 8. SMART 500 BATCHING & SOCKET LOGIC (UPDATED FOR FULL SYNC) ---
+# --- 8. SMART AUTO-DETECT SUBSCRIPTION ENGINE ---
 # ==============================================================================
 @socketio.on('connect')
 def handle_connect():
     state.active_users_pool[request.sid] = time.time()
-    logger.info(f"🔌 [New Connection] User {request.sid} linked.")
+    logger.info(f"🔌 [Connection] User {request.sid} linked.")
 
 @socketio.on('subscribe')
 def handle_incoming_subscription(data):
-    """
-    Logic 13: UPDATED Full Sync Logic
-    Handles both new and old subscriptions without missing a single token.
-    """
     watchlist = data.get('watchlist', [])
-    if not watchlist:
-        logger.warning("⚠️ [Sub] Subscription triggered but watchlist is empty.")
-        return
+    if not watchlist: return
 
-    # High-Priority Batch Registry
-    batch_registry = {1: [], 2: [], 3: [], 5: []}
+    # Registry for all segments (1:NSE, 2:NFO, 3:BSE, 4:BFO, 5:MCX)
+    batch_registry = {1: [], 2: [], 3: [], 4: [], 5: []}
 
     for instrument in watchlist:
         token = str(instrument.get('token'))
-        exch = str(instrument.get('exch', 'NSE')).upper()
+        symbol = str(instrument.get('symbol', '')).upper()
+        exch = str(instrument.get('exch', instrument.get('exch_seg', 'NSE'))).upper()
         
-        if not token or token == "None" or token == "":
-            continue
+        if not token or token in ["None", ""]: continue
 
-        # User ko us token ke updates receive karne ke liye room mein daalo
         join_room(token)
         
-        # --- ENHANCED SEGMENT LOGIC (Logic 13 Extension) ---
-        etype = 1 # NSE Cash
-        if "MCX" in exch: 
+        # --- START AUTO-DETECT ENGINE ---
+        etype = 1 # Default: NSE Cash
+        if "MCX" in exch:
             etype = 5
-        elif "NFO" in exch or "FUT" in exch or "OPT" in exch: 
-            etype = 2
-        elif "BSE" in exch: 
-            etype = 3
-        
+        elif "BFO" in exch or (("BSE" in exch or "BFO" in exch) and any(x in symbol for x in ["CE", "PE", "FUT"])):
+            etype = 4 # Sensex/Bankex Options
+        elif "NFO" in exch or any(x in symbol for x in ["CE", "PE", "FUT"]):
+            etype = 2 # Nifty/BankNifty Options
+        elif "BSE" in exch:
+            etype = 3 # BSE Equity
+        elif "NSE" in exch and token.isdigit() and int(token) > 35000:
+            etype = 2 # NFO Fallback
+        # --- END AUTO-DETECT ENGINE ---
+
         state.token_metadata[token] = etype
-        
-        # Hamesha registry mein add karein, ye puraana data bhi subscribe karega
         if token not in batch_registry[etype]:
             batch_registry[etype].append(token)
             state.subscribed_tokens_set.add(token)
 
-    # 500-Batch Immediate Execution for WebSocket
     if state.is_ws_ready and state.sws:
         for etype, tokens in batch_registry.items():
             if not tokens: continue
-            
             for i in range(0, len(tokens), 500):
-                final_batch = tokens[i:i+500]
+                batch = tokens[i:i+500]
                 try:
-                    # SmartApi Standard Batch Subscription
-                    state.sws.subscribe(f"live_sync_{etype}_{i}", 1, [{"exchangeType": etype, "tokens": final_batch}])
-                    logger.info(f"📈 [Sync] Activated {len(final_batch)} tokens for Segment {etype}")
+                    sub_id = f"auto_{etype}_{int(time.time())}_{i}"
+                    state.sws.subscribe(sub_id, 1, [{"exchangeType": etype, "tokens": batch}])
+                    logger.info(f"🚀 [Auto-Sub] Segment {etype} | Batch: {len(batch)}")
                     eventlet.sleep(0.05) 
                 except Exception as e:
-                    logger.error(f"❌ [Sub Error]: {e}")
-                    traceback.print_exc()
+                    logger.error(f"❌ Sub Error: {e}")
     else:
-        logger.warning("🔌 [Sub Pending] Socket not ready. Tokens queued for lifecycle recovery.")
+        logger.warning("🔌 [WS Offline] Tokens queued for reconnect.")
 
 # ==============================================================================
-# --- 9. LIFECYCLE, AUTO-HEALING & RECOVERY ---
+# --- 9. LIFECYCLE & AUTO-RECOVERY ---
 # ==============================================================================
 def engine_lifecycle_manager():
-    """Logic 6, 9, 20: Auto-healing recovery engine"""
     sync_master_data_v2()
     while True:
         try:
             if not state.is_ws_ready:
                 if not verify_dns_resilience():
-                    logger.warning("📡 [Engine] DNS Fail. Retrying...")
                     eventlet.sleep(15)
                     continue
                 
-                logger.info("🔐 [Engine] Establishing Session...")
+                logger.info("🔐 [Auth] Generating Session...")
                 state.smart_api = SmartConnect(api_key=API_KEY)
                 totp = pyotp.TOTP(TOTP_STR).now()
                 session = state.smart_api.generateSession(CLIENT_CODE, MPIN, totp)
@@ -385,13 +363,12 @@ def engine_lifecycle_manager():
                     def handle_open(ws):
                         state.is_ws_ready = True
                         state.reconnect_count += 1
-                        logger.info(f"💎 [WS] Connected! Session: {state.reconnect_count}")
-                        # Auto-Resubscribe everything when WS connects
+                        logger.info(f"💎 [WS] Connected! Reconnect: {state.reconnect_count}")
                         re_subscribe_all_tokens()
 
                     def handle_close(ws, code, reason):
                         state.is_ws_ready = False
-                        logger.error(f"🔌 [WS] Disconnected: {reason}")
+                        logger.error(f"🔌 [WS] Closed: {reason}")
 
                     state.sws.on_data = on_data_callback
                     state.sws.on_open = handle_open
@@ -400,50 +377,38 @@ def engine_lifecycle_manager():
                     eventlet.sleep(5)
                 else:
                     logger.error(f"❌ [Auth] Error: {session.get('message')}")
-            
         except Exception as e:
-            logger.error(f"⚠️ [Critical Engine Failure]: {e}")
+            logger.error(f"⚠️ [Engine Error]: {e}")
             state.is_ws_ready = False
         eventlet.sleep(25)
 
 def re_subscribe_all_tokens():
-    """Resubscribes all tokens in 500 batches after reconnection/startup"""
     if not state.sws or not state.is_ws_ready: return
-    
-    logger.info(f"🔄 [Recover] Resubscribing {len(state.subscribed_tokens_set)} tokens...")
-    
-    seg_map = {1: [], 2: [], 3: [], 5: []}
+    logger.info(f"🔄 [Recover] Re-syncing {len(state.subscribed_tokens_set)} tokens...")
+    seg_map = {1: [], 2: [], 3: [], 4: [], 5: []}
     for t in state.subscribed_tokens_set:
         s = state.token_metadata.get(t, 1)
         seg_map[s].append(t)
-        
     for seg, tokens in seg_map.items():
         if not tokens: continue
         for i in range(0, len(tokens), 500):
             batch = tokens[i:i+500]
-            if batch:
-                try:
-                    state.sws.subscribe(f"recon_{seg}_{i}", 1, [{"exchangeType": seg, "tokens": batch}])
-                    eventlet.sleep(0.1)
-                except Exception as e:
-                    logger.error(f"❌ [Recon Sub Error]: {e}")
+            try:
+                state.sws.subscribe(f"recon_{seg}_{i}", 1, [{"exchangeType": seg, "tokens": batch}])
+                eventlet.sleep(0.1)
+            except: pass
 
 # ==============================================================================
-# --- 10. DEPLOYMENT BOOTSTRAP ---
+# --- 10. BOOTSTRAP ---
 # ==============================================================================
 if __name__ == '__main__':
-    # Initialize background threads (Logic 21, 6, 18)
     socketio.start_background_task(pulse_broadcaster)
     socketio.start_background_task(engine_lifecycle_manager)
     socketio.start_background_task(system_memory_protector)
     
-    # Port configuration for Cloud Deployment
     port = int(os.environ.get("PORT", 10000))
-    logger.info(f"🚀 [Munh V3 Titan] Booting on port {port}...")
-    
+    logger.info(f"🚀 [Titan V3] Booting on port {port}...")
     try:
-        # High-performance eventlet server
         eventlet.wsgi.server(eventlet.listen(('0.0.0.0', port)), app)
     except Exception as fatal:
         logger.critical(f"💀 [Server Crash]: {fatal}")
-        traceback.print_exc()
