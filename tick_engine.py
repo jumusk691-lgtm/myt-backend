@@ -68,7 +68,7 @@ def pulse_broadcaster():
                     socketio.emit('live_update', data, to=token)
 
             # 1 second ka gap (Aapne 'her sec' bola tha)
-            eventlet.sleep(1) 
+            eventlet.sleep(0.5) 
             
         except Exception as e:
             logger.error(f"❌ [Broadcaster] Critical Error: {e}")
