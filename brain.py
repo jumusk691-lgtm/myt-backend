@@ -57,14 +57,18 @@ class MunhEngineState:
         self.reconnect_count = 0
         
         # Market Data & Subscriptions
-        self.subscribed_tokens_set = set()      
-        self.token_metadata = {}                
-        self.global_market_cache = {}           
+        self.subscribed_tokens_set = set()      # Unique tokens currently in Angel feed
+        self.token_metadata = {}                # Token to Etype mapping (1, 2, 3, 5)
+        self.global_market_cache = {}           # Snapshot for batching
         self.previous_price = {}                
         self.live_ohlc = {}                     
         
-        # P2P & User Management (FIXED: Added missing fields)
-        self.user_levels = {}                   # [FIX] Render error fix: Stores LEVEL_1, LEVEL_2 etc.
+        # --- FIXED: MISSING FIELDS FOR SOCKET MANAGER ---
+        self.token_ref_count = {}               # Tracks how many users watching 1 token
+        self.user_subscriptions = {}            # Tracks what each SID has subscribed
+        
+        # P2P & User Management
+        self.user_levels = {}                   # SID to LEVEL mapping
         self.user_p2p_scores = {}               
         self.active_users_pool = {}             # SID based active users
         
