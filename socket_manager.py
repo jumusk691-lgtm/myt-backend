@@ -1,6 +1,6 @@
 # socket_manager.py
 # File 5: Optimized Socket Connections with P2P Leveling & Auth Fix
-# Logic: Smart Persistence + Universal Exchange Support (NSE, BSE, MCX, NFO, BFO)
+# Logic: Smart Persistence + Universal Exchange Support
 
 from brain import state, logger, socketio, request, join_room, leave_room, eventlet
 import p2p_distributor
@@ -9,7 +9,7 @@ import p2p_distributor
 # --- 1. CONNECTION HANDLER (The Entry Point) ---
 # ==============================================================================
 @socketio.on('connect')
-def handle_connect(auth): 
+def handle_connect(auth=None): # Fix: Added auth=None to prevent TypeError
     """Jab user connect ho, use Level assign karo aur room mein daalo"""
     try:
         sid = request.sid
@@ -37,15 +37,15 @@ def handle_connect(auth):
 @socketio.on('subscribe')
 def handle_incoming_subscription(data):
     """
-    NSE, BSE, MCX, NFO, BFO ke liye full automated logic.
-    Logic: Symbol name aur Exch string se sahi Etype select karna.
+    NSE, BSE, MCX, NFO ke liye full automated logic.
+    Logic: SBIN (Cash) aur Nifty (Futures) dono ko sahi etype dena.
     """
     watchlist = data.get('watchlist', [])
     if not watchlist: return
 
     sid = request.sid
-    # Batching for AngelOne (1=NSE/BSE Cash, 2=NFO, 3=BFO, 4=CDS, 5=MCX)
-    batch_registry = {1: [], 2: [], 3: [], 4: [], 5: []}
+    # Batching for AngelOne (1=NSE/BSE Cash, 2=NFO, 5=MCX)
+    batch_registry = {1: [], 2: [], 5: []}
 
     for instrument in watchlist:
         token = str(instrument.get('token'))
@@ -56,21 +56,15 @@ def handle_incoming_subscription(data):
         # --- ROOM ASSIGNMENT ---
         join_room(token)
         
-        # --- SMART EXCHANGE DETECTION (CRITICAL FIX) ---
+        # --- SMART EXCHANGE DETECTION ---
         if token not in state.subscribed_tokens_set:
-            # A. MCX (Commodity)
+            # 1. MCX Detection (Gold/Crude)
             if "MCX" in exch:
                 etype = 5
-            # B. NFO (Nifty/BankNifty Futures & Options)
+            # 2. NFO Detection (Nifty/BankNifty Futures)
             elif any(x in symbol for x in ["FUT", "CE", "PE"]) or "NFO" in exch:
                 etype = 2
-            # C. BFO (Sensex/Bankex Derivatives)
-            elif "BFO" in exch:
-                etype = 3
-            # D. CDS (Currency)
-            elif "CDS" in exch or "CDE" in exch:
-                etype = 4
-            # E. CASH (NSE/BSE Equity - Reliance, SBIN etc.)
+            # 3. NSE/BSE Cash (SBIN, Reliance)
             else:
                 etype = 1
             
@@ -82,7 +76,6 @@ def handle_incoming_subscription(data):
     if state.is_ws_ready and state.sws:
         for etype, tokens in batch_registry.items():
             if not tokens: continue
-            # Split tokens into 500 batches for stability
             for i in range(0, len(tokens), 500):
                 final_batch = tokens[i:i+500]
                 state.sws.subscribe(f"sub_{etype}_{i}", 1, [{"exchangeType": etype, "tokens": final_batch}])
@@ -104,7 +97,6 @@ def handle_disconnect():
 
 @socketio.on('unsubscribe')
 def handle_unsubscribe(data):
-    """Room leave karwao par cache memory mein rehne do"""
     tokens = data.get('tokens', [])
     for token in tokens:
         leave_room(token)
