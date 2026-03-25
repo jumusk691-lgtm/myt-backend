@@ -14,6 +14,7 @@ def fetch_chart_data():
     """
     Fetches historical candles for APK Charts.
     Strictly restricted to 5-minute and 15-minute intervals for 10 days.
+    Includes logic for session-based score tracking.
     """
     try:
         d = request.json
@@ -52,11 +53,19 @@ def fetch_chart_data():
         historic_data = state.smart_api.getCandleData(params)
         
         if historic_data and historic_data.get('status'):
+            # --- SCORE LOGIC ---
+            # Har bar chart data load hone par score update hoga
+            if not hasattr(state, 'score'):
+                state.score = 0
+            state.score += 1
+            logger.info(f"📈 [Score] Chart accessed. Current Score: {state.score}")
+
             # AngelOne returns: [ ["time", O, H, L, C, V], ... ]
             return jsonify({
                 "status": True,
                 "token": token,
                 "interval": interval,
+                "score": state.score,
                 "data": historic_data.get('data', [])
             })
         else:
