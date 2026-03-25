@@ -1,30 +1,46 @@
 # historical_manager.py
-# File 7: Handles Historical Candle Data for Charts (90 Days)
+# File 7: Handles Historical Candle Data (5min & 15min - 10 Day Window)
 
-from brain import state, logger, app, jsonify, request, datetime, IST
+from brain import state, logger, app, IST
+from flask import jsonify, request
+import datetime
+import sqlite3
 
 # ==============================================================================
 # --- 1. HISTORICAL DATA FETCHING LOGIC ---
 # ==============================================================================
-@app.route('/get_90day_chart', methods=['POST'])
+@app.route('/api/get_chart_data', methods=['POST'])
 def fetch_chart_data():
-    """Fetches historical candles for APK Charts"""
+    """
+    Fetches historical candles for APK Charts.
+    Strictly restricted to 5-minute and 15-minute intervals for 10 days.
+    """
     try:
         d = request.json
-        token = d.get('token')
+        token = str(d.get('token'))
         exch = d.get('exch', 'NSE')
-        interval = d.get('interval', "ONE_MINUTE") # 1min, 5min, 15min etc.
         
-        if not state.smart_api:
-            logger.error("❌ [History] SmartApi Session not found!")
-            return jsonify({"status": False, "message": "Session Expired"})
+        # User 5 or 15 bhej sakta hai, default hum 5 rakhenge
+        requested_interval = d.get('interval', "FIVE_MINUTE")
+        
+        # Validation: Sirf 5 aur 15 allow karenge
+        if requested_interval == "FIFTEEN_MINUTE":
+            interval = "FIFTEEN_MINUTE"
+        else:
+            interval = "FIVE_MINUTE"
+        
+        # Session check
+        if not hasattr(state, 'smart_api') or not state.smart_api:
+            logger.error("❌ [History] SmartApi Session is NULL!")
+            return jsonify({"status": False, "message": "API Session Expired"})
 
-        # Time Calculation: Aaj se 90 din pehle tak ka data
-        to_date = datetime.datetime.now(IST).strftime('%Y-%m-%d %H:%M')
-        from_date = (datetime.datetime.now(IST) - datetime.timedelta(days=90)).strftime('%Y-%m-%d %H:%M')
+        # Time Calculation: Strictly Last 10 Days
+        now = datetime.datetime.now(IST)
+        to_date = now.strftime('%Y-%m-%d %H:%M')
+        from_date = (now - datetime.timedelta(days=10)).strftime('%Y-%m-%d %H:%M')
 
-        # AngelOne Historical API Call
-        payload = {
+        # AngelOne API Payload
+        params = {
             "exchange": exch,
             "symboltoken": token,
             "interval": interval,
@@ -32,31 +48,58 @@ def fetch_chart_data():
             "todate": to_date
         }
         
-        historic_data = state.smart_api.getCandleData(payload)
+        logger.info(f"📊 [History] Fetching {interval} (10 Days) for Token: {token}")
+        historic_data = state.smart_api.getCandleData(params)
         
         if historic_data and historic_data.get('status'):
-            logger.info(f"📊 [History] Data sent for Token: {token}")
-            return jsonify(historic_data)
+            # AngelOne returns: [ ["time", O, H, L, C, V], ... ]
+            return jsonify({
+                "status": True,
+                "token": token,
+                "interval": interval,
+                "data": historic_data.get('data', [])
+            })
         else:
-            return jsonify({"status": False, "message": "No data available"})
+            msg = historic_data.get('message', 'No data from API')
+            logger.warning(f"⚠️ [History] API returned no data: {msg}")
+            return jsonify({"status": False, "message": msg})
 
     except Exception as e:
-        logger.error(f"⚠️ [History] Error: {e}")
+        logger.error(f"❌ [History Error]: {e}")
         return jsonify({"status": False, "error": str(e)})
 
 # ==============================================================================
-# --- 2. EXPIRY LIST API (For Options Traders) ---
+# --- 2. EXPIRY LIST API ---
 # ==============================================================================
 @app.route('/api/expiry_list', methods=['POST'])
 def get_expiry():
-    """Helps APK show the list of upcoming Expiries for Options"""
-    import sqlite3
+    """Returns list of expiry dates for Options trading from SQLite master"""
     try:
-        name = request.json.get('name')
+        name = request.json.get('name', '').upper()
+        if not name: return jsonify({"expiries": [], "status": False})
+
+        if not hasattr(state, 'db_path') or not state.db_path:
+             return jsonify({"expiries": [], "status": False, "msg": "DB not ready"})
+
         conn = sqlite3.connect(state.db_path)
         cursor = conn.cursor()
-        cursor.execute("SELECT DISTINCT expiry FROM symbols WHERE name = ? AND expiry != '' ORDER BY expiry ASC", (name,))
+        
+        # Query: Unique expiries in ascending order
+        cursor.execute("""
+            SELECT DISTINCT expiry 
+            FROM symbols 
+            WHERE name = ? AND expiry != '' 
+            ORDER BY expiry ASC
+        """, (name,))
+        
         exps = [r[0] for r in cursor.fetchall()]
         conn.close()
-        return jsonify({"expiries": exps})
-    except: return jsonify([])
+        
+        return jsonify({
+            "status": True,
+            "name": name,
+            "expiries": exps
+        })
+    except Exception as e:
+        logger.error(f"❌ [Expiry API Error]: {e}")
+        return jsonify({"expiries": [], "status": False})
