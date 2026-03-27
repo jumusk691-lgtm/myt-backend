@@ -2,104 +2,71 @@ from brain import state, logger, socketio, eventlet
 import gc
 
 # ==============================================================================
-# --- 1. SMART MARKET CLEANER ---
+# --- 1. SMART RAM MONITOR (Instead of Data Cleaner) ---
 # ==============================================================================
 def market_data_cleaner():
     """
-    Har 5 minute mein memory check karta hai. 
-    Sirf un symbols ka data hatata hai jo ab watchlist mein nahi hain.
+    Ab humein data clean karne ki zarurat nahi hai kyunki hum save hi nahi kar rahe!
+    Lekin ye function RAM monitor ki tarah kaam karega taaki 12MB limit bani rahe.
     """
     while True:
-        eventlet.sleep(300) 
+        eventlet.sleep(60) # Har minute check karo
         try:
-            # Subscribed tokens ka snapshot lo
-            active_tokens = set(state.subscribed_tokens_set)
+            # Forceful Garbage Collection to keep RAM at ~12MB
+            gc.collect()
             
-            # Agar OHLC data bahut badh gaya hai (2000+), toh cleaning karo
-            if len(state.live_ohlc) > 2000:
-                # Sirf active symbols ka data rakho, baaki saaf kardo
-                state.live_ohlc = {k: v for k, v in state.live_ohlc.items() if k in active_tokens}
-                state.previous_price = {k: v for k, v in state.previous_price.items() if k in active_tokens}
-                
-                gc.collect() 
-                logger.info(f"🧹 [Smart Flush] Memory cleaned. Active: {len(active_tokens)}")
+            active_count = len(state.subscribed_tokens_set)
+            if active_count > 0:
+                logger.info(f"⚡ [Bypass Mode] Pipeline Active: {active_count} Tokens | RAM: Stable")
         except Exception as e:
-            logger.error(f"⚠️ [Cleaner Error]: {e}")
+            logger.error(f"⚠️ [Monitor Error]: {e}")
 
 # ==============================================================================
-# --- 2. DIRECT DATA RECEIVER ---
+# --- 2. THE BYPASS PIPELINE (Direct Data Receiver) ---
 # ==============================================================================
 def on_data_received(wsapp, msg):
     """
-    Live ticks ko receive karke Global Cache mein update karta hai.
+    PURE BYPASS LOGIC: 
+    Data Aaya -> Process Hua -> Seedha Bypass (Emit to Room).
+    No Storage. No RAM Usage.
     """
     try:
         if isinstance(msg, dict) and 'token' in msg:
             token = str(msg.get('token'))
             
-            # Agar user ne is token ko subscribe nahi kiya, toh ignore karo
+            # Security Check: Agar koi nahi dekh raha toh kyon bhejhein?
             if token not in state.subscribed_tokens_set:
                 return
 
             ltp_raw = msg.get('last_traded_price', 0)
             if ltp_raw <= 0: return
             
-            # Price calculation (/100 as per AngelOne/Standard API)
+            # Price Calculation
             ltp = float(ltp_raw) / 100
             
-            # 1. OHLC Update logic
-            if token not in state.live_ohlc:
-                state.live_ohlc[token] = {"o": ltp, "h": ltp, "l": ltp}
-            else:
-                if ltp > state.live_ohlc[token]["h"]: state.live_ohlc[token]["h"] = ltp
-                if ltp < state.live_ohlc[token]["l"]: state.live_ohlc[token]["l"] = ltp
-
-            # 2. Global Cache Update (Persistent Format)
-            # YAHAN DATA CLEAR NAHI HOGA, UPDATE HOGA
-            state.global_market_cache[token] = {
+            # --- THE MAGIC PIPE ---
+            # Hum poora batch nahi bhej rahe, sirf single tick bypass kar rahe hain.
+            # 'to=token' ka matlab hai sirf wahi users receive karenge jo is token ke room mein hain.
+            
+            payload = {
                 "t": token,
-                "p": "{:.2f}".format(ltp),
-                "h": "{:.2f}".format(state.live_ohlc[token]["h"]),
-                "l": "{:.2f}".format(state.live_ohlc[token]["l"])
+                "p": "{:.2f}".format(ltp)
             }
+            
+            # Direct Emit (Bypass)
+            socketio.emit('live_tick', payload, to=token)
+            
+            # Agar Level-1 Master hai toh unhe bhi bhej do (P2P logic ke liye)
+            socketio.emit('master_tick', payload, to='level_1_masters')
 
     except Exception as e:
-        logger.error(f"⚠️ [Tick Engine Error]: {e}")
+        logger.error(f"⚠️ [Pipe Crash]: {e}")
 
 # ==============================================================================
-# --- 3. THE PULSE BROADCASTER (No-Clear Batch Logic) ---
+# --- 3. PULSE BROADCASTER (REMOVED / COMMENTED OUT) ---
 # ==============================================================================
+# Iski ab zarurat nahi hai. Pulse loop hi CPU aur RAM khaata hai. 
+# Ab data 'Event-Driven' chalega (Jaise hi tick aayega, bypass ho jayega).
 def pulse_broadcaster():
-    """
-    Har pulse (500ms) par puri watchlist ka latest data ek sath bhejta hai.
-    Isse scrolling ke waqt symbols 'offline' nahi honge.
-    """
-    while True:
-        try:
-            # Agar koi token subscribed hai, tabhi kaam karo
-            active_tokens = state.subscribed_tokens_set
-            
-            if active_tokens:
-                # 1. Pura Batch Taiyar Karo (Sirf active tokens ka latest price)
-                # Hum 'clear()' nahi kar rahe, isliye hamesha last known price rahega
-                snap = {
-                    t: state.global_market_cache[t] 
-                    for t in active_tokens 
-                    if t in state.global_market_cache
-                }
-                
-                if snap:
-                    # 2. Android APK ko Pura Batch bhejo
-                    socketio.emit('live_update_batch', snap)
-                    
-                    # 3. Master Dashboard ko bhejo
-                    socketio.emit('master_tick_batch', snap, to='level_1_masters')
-                    
-                    # logger.info(f"📤 Sent Batch: {len(snap)} symbols")
-
-            # Render stability ke liye 0.5s best hai
-            eventlet.sleep(0.5) 
-            
-        except Exception as e:
-            logger.error(f"❌ [Broadcaster Error]: {e}")
-            eventlet.sleep(1)
+    logger.info("ℹ️ [Broadcaster] Disabled. System running on Direct Pipe Mode.")
+    return
