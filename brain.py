@@ -1,6 +1,3 @@
-# brain.py
-# File 1: All Imports, Global Keys, and System State
-
 import eventlet
 eventlet.monkey_patch(all=True)
 
@@ -35,18 +32,19 @@ BUCKET_NAME = "Myt"
 
 # Flask & SocketIO Instance Creation
 app = Flask(__name__)
+# Bypass mode ke liye buffer size ko chota rakha hai taaki RAM reserve na ho
 socketio = SocketIO(
     app, 
     cors_allowed_origins="*", 
     async_mode='eventlet', 
-    ping_timeout=120, 
-    ping_interval=40,
+    ping_timeout=60, 
+    ping_interval=25,
     manage_session=False, 
-    max_http_buffer_size=100000000
+    max_http_buffer_size=1000000 # Reduced to 1MB for Zero-RAM
 )
 
 # ==============================================================================
-# --- GLOBAL SYSTEM STATE (THE BRAIN ENGINE) ---
+# --- GLOBAL SYSTEM STATE (THE ZERO-RAM BYPASS ENGINE) ---
 # ==============================================================================
 class MunhEngineState:
     def __init__(self):
@@ -56,31 +54,29 @@ class MunhEngineState:
         self.is_ws_ready = False
         self.reconnect_count = 0
         
-        # Market Data & Subscriptions
-        self.subscribed_tokens_set = set()      # Unique tokens currently in Angel feed
-        self.token_metadata = {}                # Token to Etype mapping (1, 2, 3, 5)
-        self.global_market_cache = {}           # Snapshot for batching
-        self.previous_price = {}                
-        self.live_ohlc = {}                     
+        # --- BYPASS MODE: NO CACHE, NO OHLC ---
+        # Sirf wahi cheezein rakhi hain jo connections manage karne ke liye zaruri hain
+        self.subscribed_tokens_set = set()      # AngelOne subscription manage karne ke liye
+        self.token_metadata = {}                # Token to Etype mapping (Zaruri hai pipe ke liye)
         
-        # --- FIXED: MISSING FIELDS FOR SOCKET MANAGER ---
-        self.token_ref_count = {}               # Tracks how many users watching 1 token
-        self.user_subscriptions = {}            # Tracks what each SID has subscribed
+        # Tracker for Room Management (Direct Pipe Logic)
+        self.token_ref_count = {}               # Kitne log ek token room mein hain
         
-        # P2P & User Management
-        self.user_levels = {}                   # SID to LEVEL mapping
+        # User & Score Management
+        self.user_levels = {}                   
         self.user_p2p_scores = {}               
-        self.active_users_pool = {}             # SID based active users
+        self.active_users_pool = {}             
+        self.score = 0                          # Global score tracker
         
         # System Monitoring
         self.dns_status = False                 
         self.last_master_update = None
-        self.total_packets = 0
         self.start_time = datetime.datetime.now(IST)
         self.db_path = None
-        self.heartbeat_gap = 0.5 
+        
+        # Removed: global_market_cache, previous_price, live_ohlc (RAM Bachers!)
 
 # Shared Global State Instance
 state = MunhEngineState()
 
-logger.info("🧠 [Brain] File 1 initialized. Global State & Imports Ready.")
+logger.info("🧠 [Brain] File 1 Updated for ZERO-RAM BYPASS Mode.")
