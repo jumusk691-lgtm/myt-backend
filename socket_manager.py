@@ -2,35 +2,35 @@ from brain import state, logger, socketio, request, join_room, leave_room, event
 import p2p_distributor
 
 # ==============================================================================
-# --- 1. CONNECTION HANDLER (Stable Connection) ---
+# --- 1. CONNECTION HANDLER (Lightweight) ---
 # ==============================================================================
 @socketio.on('connect')
 def handle_connect(auth=None): 
     try:
         sid = request.sid
-        # Level assigning logic
+        # P2P Leveling: Isse server ka load nodes mein divide hota hai
         level = p2p_distributor.assign_node_level(sid)
         state.user_levels[sid] = level 
         state.active_users_pool[sid] = True
         
-        # Initialize user subscription set if not exists
+        # Zero-RAM: User ki list initialize karo par data save mat karo
         if sid not in state.user_subscriptions:
             state.user_subscriptions[sid] = set()
 
+        # Room Join based on Level
         if level == "LEVEL_1":
             join_room("level_1_masters") 
-            logger.info(f"💎 [Master] {sid} connected to LEVEL_1")
         else:
             join_room("peer_nodes") 
-            logger.info(f"👥 [Peer] {sid} connected to {level}")
-
+            
+        logger.info(f"🚀 [Socket] New {level} Connected: {sid}")
         return True
     except Exception as e:
-        logger.error(f"❌ [Socket Connect Error]: {e}")
+        logger.error(f"❌ [Connect Error]: {e}")
         return False
 
 # ==============================================================================
-# --- 2. SMART SUBSCRIPTION (Memory-Aware Logic) ---
+# --- 2. BYPASS SUBSCRIPTION (Room Focus) ---
 # ==============================================================================
 @socketio.on('subscribe')
 def handle_incoming_subscription(data):
@@ -42,20 +42,23 @@ def handle_incoming_subscription(data):
 
     for instrument in watchlist:
         token = str(instrument.get('token'))
-        exch = str(instrument.get('exch', 'NSE')).upper()
-        symbol = str(instrument.get('symbol', '')).upper()
-        
         if not token or token == "None": continue
 
-        # 1. Room Join: User ko live updates milne shuru honge
+        # 🔥 BYPASS LOGIC: User ko us token ke room mein daal do.
+        # Ab jo bhi tick is token ka aayega, wo is room mein 'emit' hoga.
         join_room(token)
-        state.user_subscriptions[sid].add(token)
+        
+        if sid in state.user_subscriptions:
+            state.user_subscriptions[sid].add(token)
 
-        # 2. Ref Count: Track users per token
+        # Ref Count: Sirf ye dekhne ke liye ki kya humein Angel se unsub karna hai
         state.token_ref_count[token] = state.token_ref_count.get(token, 0) + 1
         
-        # 3. New Token Check: Agar server ke paas ye token naya hai
+        # Agar ye token naya hai, toh AngelOne se subscribe karo
         if token not in state.subscribed_tokens_set:
+            exch = str(instrument.get('exch', 'NSE')).upper()
+            symbol = str(instrument.get('symbol', '')).upper()
+            
             if "MCX" in exch: etype = 5
             elif any(x in symbol for x in ["FUT", "CE", "PE"]) or "NFO" in exch: etype = 2
             elif "BFO" in exch or ("BSE" in exch and any(x in symbol for x in ["CE", "PE", "FUT"])): etype = 3
@@ -65,75 +68,44 @@ def handle_incoming_subscription(data):
             batch_registry[etype].append(token)
             state.subscribed_tokens_set.add(token)
 
-    # AngelOne API Call (Batching)
+    # AngelOne API Call (Optimized Batching)
     if state.is_ws_ready and state.sws:
         for etype, tokens in batch_registry.items():
             if not tokens: continue
-            # Split into batches of 500 (API Limit)
             for i in range(0, len(tokens), 500):
-                final_batch = tokens[i:i+500]
-                state.sws.subscribe("myt_unlimited", 1, [{"exchangeType": etype, "tokens": final_batch}])
-                eventlet.sleep(0.05) 
-                logger.info(f"📡 [AngelOne] Subscribed: {len(final_batch)} tokens for Etype: {etype}")
+                state.sws.subscribe("myt_unlimited", 1, [{"exchangeType": etype, "tokens": tokens[i:i+500]}])
+                eventlet.sleep(0.02) # Fast Relay
 
 # ==============================================================================
-# --- 3. AUTO-CLEANUP (Selective Flush Ready) ---
+# --- 3. DISCONNECT & CLEANUP (RAM Reclaimer) ---
 # ==============================================================================
-
-def perform_unsubscribe_logic(sid, tokens):
-    """
-    Logic: User ko room se nikalo, par AngelOne se tabhi hatao 
-    jab koi bhi dusra user use na dekh raha ho.
-    """
-    unsub_batch = {1: [], 2: [], 3: [], 5: []}
-
-    for token in tokens:
-        leave_room(token)
-        if token in state.token_ref_count:
-            state.token_ref_count[token] -= 1
-            
-            # Agar counts 0 ho gaye (No one watching)
-            if state.token_ref_count[token] <= 0:
-                etype = state.token_metadata.get(token, 1)
-                unsub_batch[etype].append(token)
-                
-                # Cleaning internal tracking (NOT state.subscribed_tokens_set)
-                # Hum subscribed_tokens_set ko tick_engine ke cleaner se manage karenge
-                if token in state.token_metadata: del state.token_metadata[token]
-                if token in state.token_ref_count: del state.token_ref_count[token]
-
-    # AngelOne Unsubscribe (Bandwidth Saver)
-    if state.is_ws_ready and state.sws:
-        for etype, tokens in unsub_batch.items():
-            if tokens:
-                state.sws.unsubscribe("myt_unlimited", 1, [{"exchangeType": etype, "tokens": tokens}])
-
-@socketio.on('unsubscribe')
-def handle_unsubscribe(data):
-    sid = request.sid
-    tokens = data.get('tokens', [])
-    perform_unsubscribe_logic(sid, tokens)
-    for t in tokens: 
-        if sid in state.user_subscriptions:
-            state.user_subscriptions[sid].discard(t)
-
 @socketio.on('disconnect')
 def handle_disconnect():
     sid = request.sid
     try:
-        # Jab user jaye, uske rooms khali karo par main list zinda rakho
         if sid in state.user_subscriptions:
             tokens = list(state.user_subscriptions[sid])
             for token in tokens:
-                leave_room(token)
+                leave_room(token) # Room se nikalo
                 if token in state.token_ref_count:
                     state.token_ref_count[token] -= 1
-            # Hum sid ki subscription list delete nahi karenge, 
-            # bas clean up karenge room membership
+                    
+                    # Agar koi nahi dekh raha, toh Angel se bhi hatao (Bandwidth Saver)
+                    if state.token_ref_count[token] <= 0:
+                        etype = state.token_metadata.get(token, 1)
+                        if state.sws:
+                            state.sws.unsubscribe("myt_unlimited", 1, [{"exchangeType": etype, "tokens": [token]}])
+                        
+                        # Memory Cleanup
+                        state.subscribed_tokens_set.discard(token)
+                        state.token_metadata.pop(token, None)
+                        state.token_ref_count.pop(token, None)
+            
             del state.user_subscriptions[sid]
             
-        if sid in state.active_users_pool: del state.active_users_pool[sid]
-        if sid in state.user_levels: del state.user_levels[sid]
-        logger.info(f"🔌 [Socket] Sid Cleaned: {sid}")
+        state.active_users_pool.pop(sid, None)
+        state.user_levels.pop(sid, None)
+        logger.info(f"🔌 [Socket] Cleaned SID: {sid}")
+        gc.collect() # Force RAM release
     except Exception as e:
         logger.error(f"⚠️ [Disconnect Error]: {e}")
