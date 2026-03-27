@@ -30,9 +30,11 @@ SUPABASE_URL = "https://tnrhlvibaeiwhlrxdxnm.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRucmhsdmliYWVpd2hscnhkeG5tIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjY0NzQ0NywiZXhwIjoyMDg4MjIzNDQ3fQ.epYmt7sxhZRhEQWoj0doCHAbfOTHOjSurBbLss5a4Pk"
 BUCKET_NAME = "Myt"
 
-# Flask & SocketIO Instance Creation
+# ==============================================================================
+# --- FLASK & SOCKETIO (BYPASS OPTIMIZED) ---
+# ==============================================================================
 app = Flask(__name__)
-# Bypass mode ke liye buffer size ko chota rakha hai taaki RAM reserve na ho
+# Max buffer ko 1MB rakha hai taaki RAM leak na ho
 socketio = SocketIO(
     app, 
     cors_allowed_origins="*", 
@@ -40,43 +42,45 @@ socketio = SocketIO(
     ping_timeout=60, 
     ping_interval=25,
     manage_session=False, 
-    max_http_buffer_size=1000000 # Reduced to 1MB for Zero-RAM
+    max_http_buffer_size=1048576 
 )
 
 # ==============================================================================
-# --- GLOBAL SYSTEM STATE (THE ZERO-RAM BYPASS ENGINE) ---
+# --- GLOBAL SYSTEM STATE (ZERO-RAM ENGINE) ---
 # ==============================================================================
 class MunhEngineState:
     def __init__(self):
-        # API & WebSocket
+        # API & WebSocket Management
         self.smart_api = None
         self.sws = None
         self.is_ws_ready = False
         self.reconnect_count = 0
         
-        # --- BYPASS MODE: NO CACHE, NO OHLC ---
-        # Sirf wahi cheezein rakhi hain jo connections manage karne ke liye zaruri hain
-        self.subscribed_tokens_set = set()      # AngelOne subscription manage karne ke liye
-        self.token_metadata = {}                # Token to Etype mapping (Zaruri hai pipe ke liye)
+        # --- THE BYPASS CORE ---
+        # Sirf metadata aur count rakh rahe hain, tick data NAHI
+        self.subscribed_tokens_set = set()      
+        self.token_metadata = {}                # mapping: {token: etype}
+        self.token_ref_count = {}               # mapping: {token: user_count}
+        self.user_subscriptions = {}            # mapping: {sid: set(tokens)}
         
-        # Tracker for Room Management (Direct Pipe Logic)
-        self.token_ref_count = {}               # Kitne log ek token room mein hain
-        
-        # User & Score Management
+        # User & Level Management
         self.user_levels = {}                   
-        self.user_p2p_scores = {}               
         self.active_users_pool = {}             
-        self.score = 0                          # Global score tracker
         
-        # System Monitoring
+        # Score System (Track & Add logic ready)
+        self.score = 0                          
+        self.user_p2p_scores = {}               
+        
+        # System Health
         self.dns_status = False                 
         self.last_master_update = None
         self.start_time = datetime.datetime.now(IST)
         self.db_path = None
         
-        # Removed: global_market_cache, previous_price, live_ohlc (RAM Bachers!)
+        # REMOVED: global_market_cache, previous_price, live_ohlc
+        # Inhe remove karne se Render ki RAM hamesha khali rahegi.
 
 # Shared Global State Instance
 state = MunhEngineState()
 
-logger.info("🧠 [Brain] File 1 Updated for ZERO-RAM BYPASS Mode.")
+logger.info("🧠 [Brain] System State Initialized in Zero-RAM Bypass Mode.")
