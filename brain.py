@@ -19,7 +19,7 @@ logging.basicConfig(
 logger = logging.getLogger("MunhTitan_V3")
 
 # Credentials & Timezone
-API_KEY = "85HE4VA1"
+API_KEY = "Z80WG5Sg"
 CLIENT_CODE = "S52638556"
 MPIN = "0000"
 TOTP_STR = "XFTXZ2445N4V2UMB7EWUCBDRMU"
