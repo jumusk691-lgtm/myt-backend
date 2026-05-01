@@ -28,7 +28,7 @@ IST = pytz.timezone('Asia/Kolkata')
 # Supabase Infrastructure
 SUPABASE_URL = "https://fnfynhgkdevxytxtfzrk.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZuZnluaGdrZGV2eHl0eHRmenJrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc0OTAwMjgsImV4cCI6MjA5MzA2NjAyOH0.Tgr8kB6KGeAsAbXzH8a2wlLStqMFS3fnFPcowbL4Di8"
-BUCKET_NAME = "Myt"
+BUCKET_NAME = "myt"
 
 # ==============================================================================
 # --- FLASK & SOCKETIO (BYPASS OPTIMIZED) ---
