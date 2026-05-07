@@ -5,45 +5,45 @@ import json
 # ==============================================================================
 # --- 1. DYNAMIC BATCH CONFIG (Automatic Logic) ---
 # ==============================================================================
-# Ye logic user ke total symbols ke hisaab se batch size set karega
 def get_smart_batch_size(total_count):
+    """
+    User ke total symbols ke hisaab se batch size decide karta hai.
+    """
     if total_count >= 5000: return 500
     if total_count >= 1000: return 300
     if total_count >= 500: return 100
-    return 50  # Default for small watchlists
+    return 20  # Stability ke liye low count (Render friendly)
 
-# Global dictionary for batching (No persistence, just memory)
+# Global memory buffer
 tick_buffer = {}
 
 # ==============================================================================
-# --- 2. RAM & RAM GUARD MONITOR ---
+# --- 2. RAM & RAM GUARD MONITOR (CRASH FIXED) ---
 # ==============================================================================
 def market_data_cleaner():
     """
-    Render 512MB limit guard. 
-    Har 60 seconds mein RAM aur Buffer flush karega.
+    Render 512MB guard. Har 60 seconds mein RAM aur Buffer flush karta hai.
     """
     while True:
         eventlet.sleep(60) 
         try:
-            # Buffer cleanup to prevent memory leak
             tick_buffer.clear()
             gc.collect()
             
-            active_users = len(state.active_users_list)
-            active_tokens = len(state.subscribed_tokens_set)
+            # FIX: 'HuntEngineState' error hatane ke liye getattr use kiya hai
+            active_tokens = len(getattr(state, 'subscribed_tokens_set', set()))
+            active_users = len(getattr(state, 'active_users_list', []))
             
             logger.info(f"⚡ [RAM Guard] Status: {active_tokens} Tokens | {active_users} Users | RAM: Minimal")
         except Exception as e:
             logger.error(f"⚠️ [Monitor Error]: {e}")
 
 # ==============================================================================
-# --- 3. THE SMART REFLECTOR (Event Driven + Batching) ---
+# --- 3. THE SMART REFLECTOR (High Speed + Safe Batching) ---
 # ==============================================================================
 def on_data_received(wsapp, msg):
     """
-    AngelOne -> Server -> APK 
-    Bypass logic with High-Speed Reflector.
+    AngelOne -> Server -> APK (Direct Reflector).
     """
     try:
         token = msg.get('token')
@@ -53,27 +53,27 @@ def on_data_received(wsapp, msg):
             return
 
         token_str = str(token)
-        # Security: Filter unauthorized tokens
-        if token_str not in state.subscribed_tokens_set:
+        
+        # Check if anyone is watching this token
+        subscribed = getattr(state, 'subscribed_tokens_set', set())
+        if token_str not in subscribed:
             return
             
-        # Price Formatting
+        # Price formatting (Divide by 100 for AngelOne)
         price = "{:.2f}".format(float(ltp_raw) / 100)
         payload = [token_str, price]
 
-        # 1. DIRECT PUSH (Single Tick for high-priority rooms)
-        # Isse individual symbol ka flicker fast rehta hai
+        # 1. DIRECT PUSH: Flicker speed ke liye single tick
         socketio.emit('live_tick', payload, to=token_str)
 
-        # 2. SMART BATCHING FOR APK (Memory Efficient)
+        # 2. SMART BATCHING: Ek saath heavy data na jaye
         tick_buffer[token_str] = {"p": price}
         
-        # Agar buffer ka size user-defined limit cross kare, toh batch emit karo
-        total_tokens = len(state.subscribed_tokens_set)
+        total_tokens = len(subscribed)
         limit = get_smart_batch_size(total_tokens)
 
         if len(tick_buffer) >= limit:
-            # Emit batch and clear buffer immediately
+            # Render ke liye 'live_update_batch' emit
             socketio.emit('live_update_batch', tick_buffer)
             tick_buffer.clear()
 
@@ -81,7 +81,7 @@ def on_data_received(wsapp, msg):
         socketio.emit('master_tick', payload, to='level_1_masters')
 
     except Exception:
-        pass # Silent skip for maximum speed
+        pass # Maximum speed ke liye silent skip
 
 # ==============================================================================
 # --- 4. ENGINE INITIALIZATION ---
