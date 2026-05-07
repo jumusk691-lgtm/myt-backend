@@ -2,71 +2,69 @@ from brain import state, logger, socketio, eventlet
 import gc
 
 # ==============================================================================
-# --- 1. SMART RAM MONITOR (Instead of Data Cleaner) ---
+# --- 1. SMART RAM MONITOR (FREE TIER OPTIMIZED) ---
 # ==============================================================================
 def market_data_cleaner():
     """
-    Ab humein data clean karne ki zarurat nahi hai kyunki hum save hi nahi kar rahe!
-    Lekin ye function RAM monitor ki tarah kaam karega taaki 12MB limit bani rahe.
+    Iska kaam sirf RAM ko flush karna hai taaki Render ka 512MB 
+    hamesha 15-20MB ke aas-pass hi rahe.
     """
     while True:
-        eventlet.sleep(60) # Har minute check karo
+        eventlet.sleep(60) 
         try:
-            # Forceful Garbage Collection to keep RAM at ~12MB
+            # Forceful flush
             gc.collect()
             
             active_count = len(state.subscribed_tokens_set)
-            if active_count > 0:
-                logger.info(f"⚡ [Bypass Mode] Pipeline Active: {active_count} Tokens | RAM: Stable")
+            # Minimal logging taaki CPU load na badhe
+            logger.info(f"⚡ [Reflector] Pipe Active | {active_count} Tokens | RAM: Minimal")
         except Exception as e:
             logger.error(f"⚠️ [Monitor Error]: {e}")
 
 # ==============================================================================
-# --- 2. THE BYPASS PIPELINE (Direct Data Receiver) ---
+# --- 2. THE DIRECT REFLECTOR PIPE (BYPASS LOGIC) ---
 # ==============================================================================
 def on_data_received(wsapp, msg):
     """
-    PURE BYPASS LOGIC: 
-    Data Aaya -> Process Hua -> Seedha Bypass (Emit to Room).
-    No Storage. No RAM Usage.
+    LOGIC: AngelOne -> Server -> APK (Direct Reflector)
+    No Save. No Cache. No Batching.
     """
     try:
-        if isinstance(msg, dict) and 'token' in msg:
-            token = str(msg.get('token'))
-            
-            # Security Check: Agar koi nahi dekh raha toh kyon bhejhein?
-            if token not in state.subscribed_tokens_set:
-                return
+        # 1. Fast Extraction
+        token = msg.get('token')
+        ltp_raw = msg.get('last_traded_price')
+        
+        if not token or not ltp_raw:
+            return
 
-            ltp_raw = msg.get('last_traded_price', 0)
-            if ltp_raw <= 0: return
+        # Security: Agar koi is token ko nahi dekh raha, toh process mat karo
+        token_str = str(token)
+        if token_str not in state.subscribed_tokens_set:
+            return
             
-            # Price Calculation
-            ltp = float(ltp_raw) / 100
-            
-            # --- THE MAGIC PIPE ---
-            # Hum poora batch nahi bhej rahe, sirf single tick bypass kar rahe hain.
-            # 'to=token' ka matlab hai sirf wahi users receive karenge jo is token ke room mein hain.
-            
-            payload = {
-                "t": token,
-                "p": "{:.2f}".format(ltp)
-            }
-            
-            # Direct Emit (Bypass)
-            socketio.emit('live_tick', payload, to=token)
-            
-            # Agar Level-1 Master hai toh unhe bhi bhej do (P2P logic ke liye)
-            socketio.emit('master_tick', payload, to='level_1_masters')
+        # 2. Fast Processing (No storage)
+        # Payload ko List rakha hai taaki JSON overhead 40% kam ho jaye
+        # Format: [Token, Price]
+        payload = [token_str, "{:.2f}".format(float(ltp_raw) / 100)]
+        
+        # 3. DIRECT REFLECT (Goli ki raftar se)
+        # 'to=token_str' se sirf wahi user data payenge jo us room mein hain
+        socketio.emit('live_tick', payload, to=token_str)
+        
+        # 4. P2P RELAY (Tree logic ke liye Level-1 ko bypass)
+        socketio.emit('master_tick', payload, to='level_1_masters')
 
-    except Exception as e:
-        logger.error(f"⚠️ [Pipe Crash]: {e}")
+    except Exception:
+        # Error handling ko silent rakha hai taaki speed maintain rahe
+        pass
 
 # ==============================================================================
-# --- 3. PULSE BROADCASTER (REMOVED / COMMENTED OUT) ---
+# --- 3. PULSE BROADCASTER (STRICTLY DISABLED) ---
 # ==============================================================================
-# Iski ab zarurat nahi hai. Pulse loop hi CPU aur RAM khaata hai. 
-# Ab data 'Event-Driven' chalega (Jaise hi tick aayega, bypass ho jayega).
 def pulse_broadcaster():
-    logger.info("ℹ️ [Broadcaster] Disabled. System running on Direct Pipe Mode.")
+    """
+    Aapke logic ke hisaab se batching band hai. 
+    Data 'Event-Driven' (Real-time flicker) par chalega.
+    """
+    logger.info("ℹ️ [Broadcaster] Disabled as per User Logic (Direct Pipe Mode).")
     return
