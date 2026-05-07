@@ -43,7 +43,7 @@ socketio = SocketIO(
     ping_interval=25,
     manage_session=False,
     max_decode_packets=1000, 
-    max_http_buffer_size=1048576 
+    max_http_buffer_size=1048400
 )
 
 # ==============================================================================
