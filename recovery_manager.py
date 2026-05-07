@@ -6,23 +6,29 @@ from tick_engine import on_data_received
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 
 # ==============================================================================
-# --- 1. TOKEN RE-SYNC (APK Trigger Logic) ---
+# --- 1. TOKEN RE-SYNC (Improved Signal) ---
 # ==============================================================================
 def re_subscribe_all_tokens():
     """
-    Logic: Restart hone par APK ko signal bhejna taaki wo tokens re-send kare.
-    Isse database ki dependency khatam ho jati hai.
+    Logic: Restart ke baad signal bhejta hai. 
+    Added 3 retry attempts taaki APK signal miss na kare.
     """
     if not state.sws or not state.is_ws_ready: return
     
-    # 1. APK ko signal bhejo: "Bhai server restart hua hai, tokens refresh karo"
-    logger.info("📡 [Recovery] Signaling APK to re-sync all active tokens...")
-    socketio.emit('server_restarted_sync_needed', {'status': 'ready'})
-    
-    # 2. Jo tokens RAM mein bache hain unhe turant subscribe karo
+    # --- FIXED SIGNAL LOGIC ---
+    # Signal ko 3 baar bhejenge 2-2 second ke gap mein taaki APK sun le
+    def broadcast_sync():
+        for i in range(3): 
+            logger.info(f"📡 [Recovery] Signaling APK to re-sync (Attempt {i+1})...")
+            socketio.emit('server_restarted_sync_needed', {'status': 'ready'})
+            eventlet.sleep(2) 
+
+    eventlet.spawn(broadcast_sync) # Background mein bhejta rahega
+
+    # Baaki RAM wala logic as it is
     active_tokens = list(state.subscribed_tokens_set)
     if not active_tokens: 
-        logger.info("ℹ️ [Recovery] RAM is empty. Waiting for APK to push tokens via URL.")
+        logger.info("ℹ️ [Recovery] RAM Empty. Waiting for APK Push via URL.")
         return
 
     logger.info(f"🚀 [Direct Pipe] Resubscribing {len(active_tokens)} tokens from RAM...")
@@ -37,9 +43,8 @@ def re_subscribe_all_tokens():
         for i in range(0, len(tokens), 500):
             batch = tokens[i:i+500]
             try:
-                # Direct Push to AngelOne Pipe
                 state.sws.subscribe("myt_pipe", 1, [{"exchangeType": seg, "tokens": batch}])
-                eventlet.sleep(0.1) # 429 Rate limit safety
+                eventlet.sleep(0.1) 
             except Exception as e:
                 logger.error(f"❌ [Pipe Error]: {e}")
 
@@ -47,9 +52,6 @@ def re_subscribe_all_tokens():
 # --- 2. ENGINE LIFECYCLE (The Guardian) ---
 # ==============================================================================
 def engine_lifecycle_manager():
-    """
-    Har 25s mein connection health check karta hai.
-    """
     while True:
         try:
             if not state.is_ws_ready:
@@ -66,25 +68,22 @@ def engine_lifecycle_manager():
                     def on_open(ws):
                         state.is_ws_ready = True
                         logger.info("💎 [Pipe] Live & Connected!")
-                        # Restart ke baad turant APK se tokens mangwao
+                        # 5 second wait taaki APK ke socket connect ho sakein
+                        eventlet.sleep(5) 
                         re_subscribe_all_tokens()
 
+                    # Fix Arguments for SmartApi WebSocket V2
                     def on_close(ws, code, reason):
                         state.is_ws_ready = False
-                        logger.warning(f"🔌 [Pipe] Broken: {reason} | Auto-Healing...")
+                        logger.warning(f"🔌 [Pipe] Broken: {reason}")
                         gc.collect()
 
-                    # Direct callbacks
                     state.sws.on_data = on_data_received
                     state.sws.on_open = on_open
                     state.sws.on_close = on_close
                     
                     eventlet.spawn(state.sws.connect)
                     eventlet.sleep(5)
-            
-            # Health check: RAM mein kitne tokens zinda hain
-            token_count = len(state.subscribed_tokens_set)
-            logger.info(f"⚡ [RAM Guard] Status: {token_count} Tokens | RAM: OK")
             
             gc.collect()
             
