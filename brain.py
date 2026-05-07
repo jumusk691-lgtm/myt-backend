@@ -42,9 +42,8 @@ socketio = SocketIO(
     ping_timeout=60, 
     ping_interval=25,
     manage_session=False,
-    max_decode_packets=1000, 
-    max_http_buffer_size=1048400
-)
+    max_decode_packets=10000, 
+    max_http_buffer_size=5242880
 
 # ==============================================================================
 # --- GLOBAL SYSTEM STATE (ZERO-RAM ENGINE) ---
