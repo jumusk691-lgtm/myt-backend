@@ -4,34 +4,28 @@ from brain import state, logger, API_KEY, CLIENT_CODE, socketio
 from auth_manager import start_angel_session, verify_dns_resilience
 from tick_engine import on_data_received
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
-# Database se sirf active tokens ki list uthane ke liye
-from master_db import get_active_watchlist_tokens 
 
 # ==============================================================================
-# --- 1. TOKEN RE-SYNC (The Memory Fix) ---
+# --- 1. TOKEN RE-SYNC (APK Trigger Logic) ---
 # ==============================================================================
 def re_subscribe_all_tokens():
     """
-    Logic: Restart ke baad agar RAM khali hai, toh DB se sirf Tokens ki list uthao
-    aur AngelOne ko 'Direct Push' ke liye bolo.
+    Logic: Restart hone par APK ko signal bhejna taaki wo tokens re-send kare.
+    Isse database ki dependency khatam ho jati hai.
     """
     if not state.sws or not state.is_ws_ready: return
     
-    # 1. RAM check karo, agar 0 tokens hain toh DB se list bharo
-    if not state.subscribed_tokens_set:
-        logger.info("📂 [Memory] RAM khali hai. Supabase se tokens ki list mangwa raha hoon...")
-        db_tokens = get_active_watchlist_tokens() 
-        if db_tokens:
-            state.subscribed_tokens_set.update(db_tokens)
-            logger.info(f"✅ [Memory] {len(db_tokens)} Tokens yaad aa gaye!")
-
+    # 1. APK ko signal bhejo: "Bhai server restart hua hai, tokens refresh karo"
+    logger.info("📡 [Recovery] Signaling APK to re-sync all active tokens...")
+    socketio.emit('server_restarted_sync_needed', {'status': 'ready'})
+    
+    # 2. Jo tokens RAM mein bache hain unhe turant subscribe karo
     active_tokens = list(state.subscribed_tokens_set)
     if not active_tokens: 
-        logger.info("ℹ️ [Recovery] List abhi bhi khali hai. APK se add karna padega.")
+        logger.info("ℹ️ [Recovery] RAM is empty. Waiting for APK to push tokens via URL.")
         return
 
-    # 2. Direct AngelOne Subscription
-    logger.info(f"🚀 [Direct Pipe] Resubscribing {len(active_tokens)} tokens...")
+    logger.info(f"🚀 [Direct Pipe] Resubscribing {len(active_tokens)} tokens from RAM...")
     
     seg_map = {1: [], 2: [], 3: [], 5: []}
     for t in active_tokens:
@@ -43,7 +37,7 @@ def re_subscribe_all_tokens():
         for i in range(0, len(tokens), 500):
             batch = tokens[i:i+500]
             try:
-                # Direct Hit to AngelOne
+                # Direct Push to AngelOne Pipe
                 state.sws.subscribe("myt_pipe", 1, [{"exchangeType": seg, "tokens": batch}])
                 eventlet.sleep(0.1) # 429 Rate limit safety
             except Exception as e:
@@ -54,7 +48,7 @@ def re_subscribe_all_tokens():
 # ==============================================================================
 def engine_lifecycle_manager():
     """
-    Har 25s mein connection check aur automatic recovery.
+    Har 25s mein connection health check karta hai.
     """
     while True:
         try:
@@ -72,15 +66,15 @@ def engine_lifecycle_manager():
                     def on_open(ws):
                         state.is_ws_ready = True
                         logger.info("💎 [Pipe] Live & Connected!")
-                        # Connect hote hi tokens mangwao
+                        # Restart ke baad turant APK se tokens mangwao
                         re_subscribe_all_tokens()
 
                     def on_close(ws, code, reason):
                         state.is_ws_ready = False
-                        logger.warning(f"🔌 [Pipe] Broken: {reason}")
+                        logger.warning(f"🔌 [Pipe] Broken: {reason} | Auto-Healing...")
                         gc.collect()
 
-                    # Direct on_data callback to tick_engine
+                    # Direct callbacks
                     state.sws.on_data = on_data_received
                     state.sws.on_open = on_open
                     state.sws.on_close = on_close
@@ -88,7 +82,10 @@ def engine_lifecycle_manager():
                     eventlet.spawn(state.sws.connect)
                     eventlet.sleep(5)
             
-            # Monitoring Health
+            # Health check: RAM mein kitne tokens zinda hain
+            token_count = len(state.subscribed_tokens_set)
+            logger.info(f"⚡ [RAM Guard] Status: {token_count} Tokens | RAM: OK")
+            
             gc.collect()
             
         except Exception as e:
