@@ -1,95 +1,72 @@
 from brain import state, logger, socketio, eventlet
 import gc
-import json
 
 # ==============================================================================
-# --- 1. SMART BATCH CONFIG (Matching APK logic) ---
-# ==============================================================================
-def get_smart_batch_size(total_count):
-    """
-    Render bandwidth aur APK stability ke liye size.
-    """
-    if total_count >= 5000: return 500
-    if total_count >= 1000: return 300
-    if total_count >= 500: return 100
-    return 15  # APK batch size 15 ke saath match kiya hai
-
-# Memory buffer for binary stream
-tick_buffer = {}
-
-# ==============================================================================
-# --- 2. RAM & BUFFER GUARD ---
+# --- 1. SMART RAM MONITOR (Instead of Data Cleaner) ---
 # ==============================================================================
 def market_data_cleaner():
     """
-    Har 60s mein memory flush aur health monitoring.
+    Ab humein data clean karne ki zarurat nahi hai kyunki hum save hi nahi kar rahe!
+    Lekin ye function RAM monitor ki tarah kaam karega taaki 12MB limit bani rahe.
     """
     while True:
-        eventlet.sleep(60) 
+        eventlet.sleep(60) # Har minute check karo
         try:
-            tick_buffer.clear()
+            # Forceful Garbage Collection to keep RAM at ~12MB
             gc.collect()
             
-            # Attribute safety check
-            subs = getattr(state, 'subscribed_tokens_set', set())
-            users = getattr(state, 'active_users_pool', set())
-            
-            logger.info(f"⚡ [RAM Guard] Status: {len(subs)} Tokens | {len(users)} Users")
+            active_count = len(state.subscribed_tokens_set)
+            if active_count > 0:
+                logger.info(f"⚡ [Bypass Mode] Pipeline Active: {active_count} Tokens | RAM: Stable")
         except Exception as e:
             logger.error(f"⚠️ [Monitor Error]: {e}")
 
 # ==============================================================================
-# --- 3. PURE BINARY BATCH REFLECTOR ---
+# --- 2. THE BYPASS PIPELINE (Direct Data Receiver) ---
 # ==============================================================================
 def on_data_received(wsapp, msg):
     """
-    AngelOne -> Server -> Binary Batch -> APK.
-    APK handler: 'live_update_batch' (Binary Frame)
+    PURE BYPASS LOGIC: 
+    Data Aaya -> Process Hua -> Seedha Bypass (Emit to Room).
+    No Storage. No RAM Usage.
     """
     try:
-        token = msg.get('token')
-        ltp_raw = msg.get('last_traded_price')
-        
-        if not token or ltp_raw is None:
-            return
-
-        token_str = str(token)
-        subscribed = getattr(state, 'subscribed_tokens_set', set())
-
-        # Filter: Sirf wo tokens jo APK ne mangwaye hain
-        if token_str not in subscribed:
-            return
+        if isinstance(msg, dict) and 'token' in msg:
+            token = str(msg.get('token'))
             
-        # Price Formatting (AngelOne sends price * 100)
-        price = "{:.2f}".format(float(ltp_raw) / 100)
-        
-        # 1. BUFFER UPDATE
-        tick_buffer[token_str] = {"p": price}
-        
-        # 2. BATCH SIZE CHECK
-        limit = get_smart_batch_size(len(subscribed))
+            # Security Check: Agar koi nahi dekh raha toh kyon bhejhein?
+            if token not in state.subscribed_tokens_set:
+                return
 
-        # 3. BINARY EMIT (Jab buffer limit tak pahunche)
-        if len(tick_buffer) >= limit:
-            # IMPORTANT: APK 'ByteArray' check karta hai, isliye UTF-8 encode zaroori hai
-            binary_payload = json.dumps(tick_buffer).encode('utf-8')
+            ltp_raw = msg.get('last_traded_price', 0)
+            if ltp_raw <= 0: return
             
-            socketio.emit(
-                'live_update_batch', 
-                binary_payload, 
-                binary=True 
-            )
+            # Price Calculation
+            ltp = float(ltp_raw) / 100
             
-            # Flush
-            tick_buffer.clear()
+            # --- THE MAGIC PIPE ---
+            # Hum poora batch nahi bhej rahe, sirf single tick bypass kar rahe hain.
+            # 'to=token' ka matlab hai sirf wahi users receive karenge jo is token ke room mein hain.
+            
+            payload = {
+                "t": token,
+                "p": "{:.2f}".format(ltp)
+            }
+            
+            # Direct Emit (Bypass)
+            socketio.emit('live_tick', payload, to=token)
+            
+            # Agar Level-1 Master hai toh unhe bhi bhej do (P2P logic ke liye)
+            socketio.emit('master_tick', payload, to='level_1_masters')
 
-    except Exception:
-        # High-frequency data mein logs avoid karein performance ke liye
-        pass
+    except Exception as e:
+        logger.error(f"⚠️ [Pipe Crash]: {e}")
 
 # ==============================================================================
-# --- 4. ENGINE START ---
+# --- 3. PULSE BROADCASTER (REMOVED / COMMENTED OUT) ---
 # ==============================================================================
-# Background worker for memory cleanup
-eventlet.spawn(market_data_cleaner)
-logger.info("🚀 [Reflector] Binary Batching Pipeline: READY")
+# Iski ab zarurat nahi hai. Pulse loop hi CPU aur RAM khaata hai. 
+# Ab data 'Event-Driven' chalega (Jaise hi tick aayega, bypass ho jayega).
+def pulse_broadcaster():
+    logger.info("ℹ️ [Broadcaster] Disabled. System running on Direct Pipe Mode.")
+    return
