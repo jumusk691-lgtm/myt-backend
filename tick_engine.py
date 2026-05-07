@@ -3,16 +3,16 @@ import gc
 import json
 
 # ==============================================================================
-# --- 1. SMART BATCH CONFIG ---
+# --- 1. SMART BATCH CONFIG (Matching APK logic) ---
 # ==============================================================================
 def get_smart_batch_size(total_count):
     """
-    Render stability ke liye batch size define karta hai.
+    Render bandwidth aur APK stability ke liye size.
     """
     if total_count >= 5000: return 500
     if total_count >= 1000: return 300
     if total_count >= 500: return 100
-    return 25  # Default batch size for small watchlists
+    return 15  # APK batch size 15 ke saath match kiya hai
 
 # Memory buffer for binary stream
 tick_buffer = {}
@@ -22,20 +22,19 @@ tick_buffer = {}
 # ==============================================================================
 def market_data_cleaner():
     """
-    Har 60 seconds mein memory flush karta hai taaki RAM leak na ho.
+    Har 60s mein memory flush aur health monitoring.
     """
     while True:
         eventlet.sleep(60) 
         try:
-            # Buffer cleanup agar threshold hit nahi hua
             tick_buffer.clear()
             gc.collect()
             
-            # Safe attribute check to prevent 'HuntEngineState' error
-            active_tokens = len(getattr(state, 'subscribed_tokens_set', set()))
-            active_users = len(getattr(state, 'active_users_list', []))
+            # Attribute safety check
+            subs = getattr(state, 'subscribed_tokens_set', set())
+            users = getattr(state, 'active_users_pool', set())
             
-            logger.info(f"⚡ [RAM Guard] Status: {active_tokens} Tokens | {active_users} Users | RAM: OK")
+            logger.info(f"⚡ [RAM Guard] Status: {len(subs)} Tokens | {len(users)} Users")
         except Exception as e:
             logger.error(f"⚠️ [Monitor Error]: {e}")
 
@@ -44,7 +43,8 @@ def market_data_cleaner():
 # ==============================================================================
 def on_data_received(wsapp, msg):
     """
-    AngelOne -> Server -> Binary Buffer -> APK (Reflect Only)
+    AngelOne -> Server -> Binary Batch -> APK.
+    APK handler: 'live_update_batch' (Binary Frame)
     """
     try:
         token = msg.get('token')
@@ -54,48 +54,42 @@ def on_data_received(wsapp, msg):
             return
 
         token_str = str(token)
-        
-        # Unauthorized token filter
         subscribed = getattr(state, 'subscribed_tokens_set', set())
+
+        # Filter: Sirf wo tokens jo APK ne mangwaye hain
         if token_str not in subscribed:
             return
             
-        # Price formatting (AngelOne factor 100)
+        # Price Formatting (AngelOne sends price * 100)
         price = "{:.2f}".format(float(ltp_raw) / 100)
         
-        # 1. ADD TO BUFFER (Wait for batch)
+        # 1. BUFFER UPDATE
         tick_buffer[token_str] = {"p": price}
         
-        # 2. BATCH SIZE LOGIC
-        total_tokens = len(subscribed)
-        limit = get_smart_batch_size(total_tokens)
+        # 2. BATCH SIZE CHECK
+        limit = get_smart_batch_size(len(subscribed))
 
-        # 3. BINARY EMIT (Jab limit hit ho)
+        # 3. BINARY EMIT (Jab buffer limit tak pahunche)
         if len(tick_buffer) >= limit:
-            # 'binary=True' forces the payload into a binary frame for speed
+            # IMPORTANT: APK 'ByteArray' check karta hai, isliye UTF-8 encode zaroori hai
+            binary_payload = json.dumps(tick_buffer).encode('utf-8')
+            
             socketio.emit(
                 'live_update_batch', 
-                tick_buffer, 
-                namespace='/', 
+                binary_payload, 
                 binary=True 
             )
             
-            # P2P Relay for Masters in Binary format
-            socketio.emit(
-                'master_tick_batch', 
-                tick_buffer, 
-                to='level_1_masters', 
-                binary=True
-            )
-            
-            # Flush immediately after emit
+            # Flush
             tick_buffer.clear()
 
     except Exception:
+        # High-frequency data mein logs avoid karein performance ke liye
         pass
 
 # ==============================================================================
 # --- 4. ENGINE START ---
 # ==============================================================================
+# Background worker for memory cleanup
 eventlet.spawn(market_data_cleaner)
-logger.info("🚀 [Reflector] Pure Binary Batching Mode Active.")
+logger.info("🚀 [Reflector] Binary Batching Pipeline: READY")
