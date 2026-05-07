@@ -3,47 +3,48 @@ import gc
 import json
 
 # ==============================================================================
-# --- 1. DYNAMIC BATCH CONFIG (Automatic Logic) ---
+# --- 1. SMART BATCH CONFIG ---
 # ==============================================================================
 def get_smart_batch_size(total_count):
     """
-    User ke total symbols ke hisaab se batch size decide karta hai.
+    Render stability ke liye batch size define karta hai.
     """
     if total_count >= 5000: return 500
     if total_count >= 1000: return 300
     if total_count >= 500: return 100
-    return 20  # Stability ke liye low count (Render friendly)
+    return 25  # Default batch size for small watchlists
 
-# Global memory buffer
+# Memory buffer for binary stream
 tick_buffer = {}
 
 # ==============================================================================
-# --- 2. RAM & RAM GUARD MONITOR (CRASH FIXED) ---
+# --- 2. RAM & BUFFER GUARD ---
 # ==============================================================================
 def market_data_cleaner():
     """
-    Render 512MB guard. Har 60 seconds mein RAM aur Buffer flush karta hai.
+    Har 60 seconds mein memory flush karta hai taaki RAM leak na ho.
     """
     while True:
         eventlet.sleep(60) 
         try:
+            # Buffer cleanup agar threshold hit nahi hua
             tick_buffer.clear()
             gc.collect()
             
-            # FIX: 'HuntEngineState' error hatane ke liye getattr use kiya hai
+            # Safe attribute check to prevent 'HuntEngineState' error
             active_tokens = len(getattr(state, 'subscribed_tokens_set', set()))
             active_users = len(getattr(state, 'active_users_list', []))
             
-            logger.info(f"⚡ [RAM Guard] Status: {active_tokens} Tokens | {active_users} Users | RAM: Minimal")
+            logger.info(f"⚡ [RAM Guard] Status: {active_tokens} Tokens | {active_users} Users | RAM: OK")
         except Exception as e:
             logger.error(f"⚠️ [Monitor Error]: {e}")
 
 # ==============================================================================
-# --- 3. THE SMART REFLECTOR (High Speed + Safe Batching) ---
+# --- 3. PURE BINARY BATCH REFLECTOR ---
 # ==============================================================================
 def on_data_received(wsapp, msg):
     """
-    AngelOne -> Server -> APK (Direct Reflector).
+    AngelOne -> Server -> Binary Buffer -> APK (Reflect Only)
     """
     try:
         token = msg.get('token')
@@ -54,38 +55,47 @@ def on_data_received(wsapp, msg):
 
         token_str = str(token)
         
-        # Check if anyone is watching this token
+        # Unauthorized token filter
         subscribed = getattr(state, 'subscribed_tokens_set', set())
         if token_str not in subscribed:
             return
             
-        # Price formatting (Divide by 100 for AngelOne)
+        # Price formatting (AngelOne factor 100)
         price = "{:.2f}".format(float(ltp_raw) / 100)
-        payload = [token_str, price]
-
-        # 1. DIRECT PUSH: Flicker speed ke liye single tick
-        socketio.emit('live_tick', payload, to=token_str)
-
-        # 2. SMART BATCHING: Ek saath heavy data na jaye
+        
+        # 1. ADD TO BUFFER (Wait for batch)
         tick_buffer[token_str] = {"p": price}
         
+        # 2. BATCH SIZE LOGIC
         total_tokens = len(subscribed)
         limit = get_smart_batch_size(total_tokens)
 
+        # 3. BINARY EMIT (Jab limit hit ho)
         if len(tick_buffer) >= limit:
-            # Render ke liye 'live_update_batch' emit
-            socketio.emit('live_update_batch', tick_buffer)
+            # 'binary=True' forces the payload into a binary frame for speed
+            socketio.emit(
+                'live_update_batch', 
+                tick_buffer, 
+                namespace='/', 
+                binary=True 
+            )
+            
+            # P2P Relay for Masters in Binary format
+            socketio.emit(
+                'master_tick_batch', 
+                tick_buffer, 
+                to='level_1_masters', 
+                binary=True
+            )
+            
+            # Flush immediately after emit
             tick_buffer.clear()
 
-        # 3. P2P RELAY
-        socketio.emit('master_tick', payload, to='level_1_masters')
-
     except Exception:
-        pass # Maximum speed ke liye silent skip
+        pass
 
 # ==============================================================================
-# --- 4. ENGINE INITIALIZATION ---
+# --- 4. ENGINE START ---
 # ==============================================================================
-# Background worker for RAM Management
 eventlet.spawn(market_data_cleaner)
-logger.info("✅ [Smart Engine] Reflector Pipe & RAM Guard Active.")
+logger.info("🚀 [Reflector] Pure Binary Batching Mode Active.")
