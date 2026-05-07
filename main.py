@@ -2,78 +2,93 @@
 import os, eventlet, gc, json
 eventlet.monkey_patch(all=True)
 
-from brain import app, socketio, logger, state
+from brain import app, socketio, logger, state, request, jsonify
 import auth_manager, master_db, tick_engine, socket_manager, recovery_manager
 
 # ==============================================================================
-# --- 1. COMPATIBILITY & MEMORY LAYER ---
+# --- 1. ATTRIBUTE & MEMORY ALIGNMENT ---
 # ==============================================================================
-# Logs mein 'active_users_list' error na aaye isliye legacy support
+# APK ke 'active_users_pool' aur existing logic ko sync karne ke liye
 state.active_users_pool = getattr(state, 'active_users_pool', set())
 state.active_users_list = state.active_users_pool 
 
 def aggressive_memory_protector():
-    """Har 60s mein RAM saaf karta hai aur health log dikhata hai."""
+    """Har 60s mein RAM aur stale connections saaf karta hai."""
     while True:
         eventlet.sleep(60)
         try:
             gc.collect()
-            subs = len(getattr(state, 'subscribed_tokens_set', []))
+            subs = len(getattr(state, 'subscribed_tokens_set', set()))
             users = len(state.active_users_pool)
-            logger.info(f"⚡ [Health] Tokens: {subs} | Users: {users} | RAM Cleaned")
+            logger.info(f"⚡ [RAM Guard] Tokens: {subs} | Active Users: {users}")
             
-            # Anti-Crash: Agar users bahut zyada badh jayein Render par
-            if users > 1000:
+            if users > 500: # Render Free Tier safety
                 state.active_users_pool.clear()
         except Exception as e:
             logger.error(f"⚠️ [RAM Guard Error]: {e}")
 
 # ==============================================================================
-# --- 2. DATA EMITTER (Binary Compression) ---
+# --- 2. APK-MATCHED DATA EMITTER ---
 # ==============================================================================
 def emit_binary_batch(event, data, room=None):
-    """'Too many packets' error fix karne ke liye binary emit."""
+    """
+    APK ke 'live_update_batch' handler ke saath match karta hai.
+    Data ko UTF-8 Binary mein convert karta hai.
+    """
     try:
+        # APK side par data is ByteArray check laga hai, isliye encode zaroori hai
         binary_payload = json.dumps(data).encode('utf-8')
         if room:
             socketio.emit(event, binary_payload, room=room)
         else:
             socketio.emit(event, binary_payload)
     except Exception as e:
-        logger.error(f"❌ [Emit Error]: {e}")
+        logger.error(f"❌ [Binary Emit Error]: {e}")
+
+# Global mapping taaki tick_engine binary use kare
+socket_manager.emit_binary_batch = emit_binary_batch
 
 # ==============================================================================
-# --- 3. RE-SYNC ENDPOINT (Direct Push URL) ---
+# --- 3. DIRECT TOKEN SYNC (APK Support) ---
 # ==============================================================================
 @app.route('/api/add_token', methods=['POST'])
 def add_new_token_direct():
-    """APK se direct token receive karke subscribe karta hai."""
+    """
+    Jab APK ka HealthCheck ya Re-sync trigger ho, tab ye endpoint use hoga.
+    """
     try:
         data = request.json
         token = str(data.get('token'))
         exch = int(data.get('exch', 1))
         
-        if token:
-            state.subscribed_tokens_set.add(token)
-            state.token_metadata[token] = exch
+        if not token:
+            return jsonify({"status": "error", "msg": "No token"}), 400
+
+        # RAM update
+        state.subscribed_tokens_set.add(token)
+        state.token_metadata[token] = exch
+        
+        # Immediate Subscription if Engine is Live
+        if getattr(state, 'sws', None) and getattr(state, 'is_ws_ready', False):
+            state.sws.subscribe("myt_direct", 1, [{"exchangeType": exch, "tokens": [token]}])
+            logger.info(f"✅ [Direct Sync] Token {token} Active")
+            return jsonify({"status": "success", "token": token})
             
-            if state.sws and state.is_ws_ready:
-                state.sws.subscribe("myt_direct", 1, [{"exchangeType": exch, "tokens": [token]}])
-                return jsonify({"status": "success", "token": token})
-        return jsonify({"status": "error", "msg": "Failed"}), 400
+        return jsonify({"status": "pending", "msg": "WS Not Ready, Token Saved"}), 202
     except Exception as e:
+        logger.error(f"❌ [API Error]: {e}")
         return jsonify({"status": "error", "msg": str(e)}), 500
 
 # ==============================================================================
-# --- 4. EXECUTION ---
+# --- 4. LAUNCHER ---
 # ==============================================================================
 if __name__ == '__main__':
     try:
-        # Step 1: Master Sync
-        logger.info("📡 [Master DB] Syncing from Supabase...")
+        # Step 1: Initialize Database
+        logger.info("📡 [Master DB] Syncing Scrip Master...")
         master_db.sync_master_data()
         
-        # Step 2: Background Tasks Launch
+        # Step 2: Start Background Workers
         socketio.start_background_task(aggressive_memory_protector)
         
         if hasattr(recovery_manager, 'engine_lifecycle_manager'):
@@ -82,9 +97,9 @@ if __name__ == '__main__':
         if hasattr(tick_engine, 'market_data_cleaner'):
             socketio.start_background_task(tick_engine.market_data_cleaner)
 
-        # Step 3: Run Server
+        # Step 3: Deployment
         port = int(os.environ.get("PORT", 10000))
-        logger.info(f"🚀 [Munh V3 Titan] LIVE | Port: {port} | Zero-RAM Mode")
+        logger.info(f"🚀 [Munh V3 Titan] LIVE | Port: {port} | Binary Pipeline: ON")
         
         socketio.run(
             app, 
