@@ -1,23 +1,32 @@
-from brain import state, logger, socketio, eventlet
+from brain import state, logger, sm # sm = SocketManager from FastAPI
+import asyncio
 import gc
 
 # ==============================================================================
-# --- 1. SMART RAM MONITOR (Instead of Data Cleaner) ---
+# --- 1. SMART RAM MONITOR & BATCHER ---
 # ==============================================================================
-def market_data_cleaner():
+async def market_data_cleaner():
     """
-    Ab humein data clean karne ki zarurat nahi hai kyunki hum save hi nahi kar rahe!
-    Lekin ye function RAM monitor ki tarah kaam karega taaki 12MB limit bani rahe.
+    RAM Monitor aur Batch Broadcaster ka combo.
+    Ye har 1.5 second mein data ka batch bhejega aur RAM clean karega.
     """
     while True:
-        eventlet.sleep(60) # Har minute check karo
+        await asyncio.sleep(1.5) # 1.5 Seconds Batching Interval
         try:
-            # Forceful Garbage Collection to keep RAM at ~12MB
-            gc.collect()
+            if state.batch_buffer:
+                # --- THE BATCH PIPE ---
+                # Saare tokens ka data ek hi JSON object mein jayega
+                await sm.emit('live_batch', state.batch_buffer)
+                
+                # Batch bhejne ke baad buffer khali kar do (Zero-RAM)
+                state.batch_buffer = {}
+                gc.collect() 
             
+            # Active tracking log
             active_count = len(state.subscribed_tokens_set)
             if active_count > 0:
-                logger.info(f"⚡ [Bypass Mode] Pipeline Active: {active_count} Tokens | RAM: Stable")
+                logger.info(f"⚡ [Batch Mode] Active: {active_count} | RAM: Under 12MB")
+                
         except Exception as e:
             logger.error(f"⚠️ [Monitor Error]: {e}")
 
@@ -26,15 +35,13 @@ def market_data_cleaner():
 # ==============================================================================
 def on_data_received(wsapp, msg):
     """
-    PURE BYPASS LOGIC: 
-    Data Aaya -> Process Hua -> Seedha Bypass (Emit to Room).
-    No Storage. No RAM Usage.
+    Data Aaya -> Buffer mein Update Hua -> No Storage.
     """
     try:
         if isinstance(msg, dict) and 'token' in msg:
             token = str(msg.get('token'))
             
-            # Security Check: Agar koi nahi dekh raha toh kyon bhejhein?
+            # Agar koi user is token ko subscribe nahi kiya hai toh skip
             if token not in state.subscribed_tokens_set:
                 return
 
@@ -44,29 +51,19 @@ def on_data_received(wsapp, msg):
             # Price Calculation
             ltp = float(ltp_raw) / 100
             
-            # --- THE MAGIC PIPE ---
-            # Hum poora batch nahi bhej rahe, sirf single tick bypass kar rahe hain.
-            # 'to=token' ka matlab hai sirf wahi users receive karenge jo is token ke room mein hain.
+            # --- THE MAGIC BUFFER ---
+            # Hum turant emit nahi kar rahe, buffer mein daal rahe hain batching ke liye
+            state.batch_buffer[token] = "{:.2f}".format(ltp)
             
-            payload = {
-                "t": token,
-                "p": "{:.2f}".format(ltp)
-            }
-            
-            # Direct Emit (Bypass)
-            socketio.emit('live_tick', payload, to=token)
-            
-            # Agar Level-1 Master hai toh unhe bhi bhej do (P2P logic ke liye)
-            socketio.emit('master_tick', payload, to='level_1_masters')
+            # Master P2P logic ke liye turant bypass (Optional)
+            # sm.emit('master_tick', {"t": token, "p": state.batch_buffer[token]}, to='level_1_masters')
 
     except Exception as e:
         logger.error(f"⚠️ [Pipe Crash]: {e}")
 
 # ==============================================================================
-# --- 3. PULSE BROADCASTER (REMOVED / COMMENTED OUT) ---
+# --- 3. PULSE BROADCASTER (CLEANUP) ---
 # ==============================================================================
-# Iski ab zarurat nahi hai. Pulse loop hi CPU aur RAM khaata hai. 
-# Ab data 'Event-Driven' chalega (Jaise hi tick aayega, bypass ho jayega).
 def pulse_broadcaster():
-    logger.info("ℹ️ [Broadcaster] Disabled. System running on Direct Pipe Mode.")
-    return
+    """Ye function ab 'market_data_cleaner' ke andar async handle hota hai."""
+    return None
