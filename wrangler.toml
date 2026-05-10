@@ -1,6 +1,6 @@
 name = "myt-backend"
-main = "index.js" # Aapki main file ka naam (check karlo index.js hai ya kuch aur)
+main = "main.py"  # index.js ki jagah main.py karo
 compatibility_date = "2026-05-10"
 
 [vars]
-# Yahan variables ki jagah khali chhod do, hum dashboard se bharenge
+# Apne variables yahan ya dashboard mein rehne do
