@@ -1,114 +1,105 @@
-# main.py
-import os, eventlet, gc, json
-eventlet.monkey_patch(all=True)
-
-from brain import app, socketio, logger, state, request, jsonify
+import os, gc, json, asyncio
+from brain import app, sm, logger, state, cleanup_memory
+from fastapi import Request, Response
+from fastapi.responses import JSONResponse
 import auth_manager, master_db, tick_engine, socket_manager, recovery_manager
 
 # ==============================================================================
-# --- 1. ATTRIBUTE & MEMORY ALIGNMENT ---
+# --- 1. ATTRIBUTE & MEMORY ALIGNMENT (ZERO-RAM) ---
 # ==============================================================================
-# APK ke 'active_users_pool' aur existing logic ko sync karne ke liye
-state.active_users_pool = getattr(state, 'active_users_pool', set())
+state.active_users_pool = getattr(state, 'active_users_pool', {})
 state.active_users_list = state.active_users_pool 
 
-def aggressive_memory_protector():
-    """Har 60s mein RAM aur stale connections saaf karta hai."""
+async def aggressive_memory_protector():
+    """Har 60s mein RAM saaf karta hai - Optimized for Cloudflare"""
     while True:
-        eventlet.sleep(60)
+        await asyncio.sleep(60)
         try:
-            gc.collect()
-            subs = len(getattr(state, 'subscribed_tokens_set', set()))
+            cleanup_memory() # From brain.py
+            subs = len(state.subscribed_tokens_set)
             users = len(state.active_users_pool)
-            logger.info(f"⚡ [RAM Guard] Tokens: {subs} | Active Users: {users}")
+            logger.info(f"⚡ [RAM Guard] Tokens: {subs} | Users: {users} | RAM: Stable")
             
-            if users > 500: # Render Free Tier safety
+            # 12MB Limit Safety
+            if users > 300:
                 state.active_users_pool.clear()
+                cleanup_memory()
         except Exception as e:
             logger.error(f"⚠️ [RAM Guard Error]: {e}")
 
 # ==============================================================================
-# --- 2. APK-MATCHED DATA EMITTER ---
+# --- 2. APK-MATCHED BINARY EMITTER ---
 # ==============================================================================
-def emit_binary_batch(event, data, room=None):
+async def emit_binary_batch(event, data, room=None):
     """
-    APK ke 'live_update_batch' handler ke saath match karta hai.
-    Data ko UTF-8 Binary mein convert karta hai.
+    Data ko UTF-8 Binary mein convert karke emit karta hai.
+    Cloudflare Optimized: Uses sm.emit (FastAPI-SocketIO)
     """
     try:
-        # APK side par data is ByteArray check laga hai, isliye encode zaroori hai
+        # JSON to Binary (APK Expectation)
         binary_payload = json.dumps(data).encode('utf-8')
         if room:
-            socketio.emit(event, binary_payload, room=room)
+            await sm.emit(event, binary_payload, to=room)
         else:
-            socketio.emit(event, binary_payload)
+            await sm.emit(event, binary_payload)
     except Exception as e:
         logger.error(f"❌ [Binary Emit Error]: {e}")
 
-# Global mapping taaki tick_engine binary use kare
+# Global mapping injection
 socket_manager.emit_binary_batch = emit_binary_batch
 
 # ==============================================================================
-# --- 3. DIRECT TOKEN SYNC (APK Support) ---
+# --- 3. DIRECT TOKEN SYNC (API ENDPOINT) ---
 # ==============================================================================
-@app.route('/api/add_token', methods=['POST'])
-def add_new_token_direct():
-    """
-    Jab APK ka HealthCheck ya Re-sync trigger ho, tab ye endpoint use hoga.
-    """
+@app.post('/api/add_token')
+async def add_new_token_direct(request: Request):
+    """APK side HealthCheck/Re-sync endpoint"""
     try:
-        data = request.json
+        data = await request.json()
         token = str(data.get('token'))
         exch = int(data.get('exch', 1))
         
         if not token:
-            return jsonify({"status": "error", "msg": "No token"}), 400
+            return JSONResponse(content={"status": "error", "msg": "No token"}, status_code=400)
 
-        # RAM update
         state.subscribed_tokens_set.add(token)
         state.token_metadata[token] = exch
         
-        # Immediate Subscription if Engine is Live
-        if getattr(state, 'sws', None) and getattr(state, 'is_ws_ready', False):
+        if state.sws and state.is_ws_ready:
             state.sws.subscribe("myt_direct", 1, [{"exchangeType": exch, "tokens": [token]}])
             logger.info(f"✅ [Direct Sync] Token {token} Active")
-            return jsonify({"status": "success", "token": token})
+            return {"status": "success", "token": token}
             
-        return jsonify({"status": "pending", "msg": "WS Not Ready, Token Saved"}), 202
+        return JSONResponse(content={"status": "pending", "msg": "WS Not Ready"}, status_code=202)
     except Exception as e:
         logger.error(f"❌ [API Error]: {e}")
-        return jsonify({"status": "error", "msg": str(e)}), 500
+        return JSONResponse(content={"status": "error", "msg": str(e)}, status_code=500)
 
 # ==============================================================================
-# --- 4. LAUNCHER ---
+# --- 4. CLOUDFLARE LIFECYCLE (STARTUP) ---
 # ==============================================================================
-if __name__ == '__main__':
+@app.on_event("startup")
+async def startup_event():
+    """Backend start hote hi background tasks shuru karega"""
     try:
-        # Step 1: Initialize Database
-        logger.info("📡 [Master DB] Syncing Scrip Master...")
+        # Step 1: Master DB Sync
+        logger.info("📡 [Master DB] Initializing...")
         master_db.sync_master_data()
         
-        # Step 2: Start Background Workers
-        socketio.start_background_task(aggressive_memory_protector)
+        # Step 2: Background Tasks Launch
+        asyncio.create_task(aggressive_memory_protector())
         
         if hasattr(recovery_manager, 'engine_lifecycle_manager'):
-            socketio.start_background_task(recovery_manager.engine_lifecycle_manager)
+            # lifecycle_manager ko async loop mein chalana zaroori hai
+            asyncio.create_task(asyncio.to_thread(recovery_manager.engine_lifecycle_manager))
             
         if hasattr(tick_engine, 'market_data_cleaner'):
-            socketio.start_background_task(tick_engine.market_data_cleaner)
+            asyncio.create_task(asyncio.to_thread(tick_engine.market_data_cleaner))
 
-        # Step 3: Deployment
-        port = int(os.environ.get("PORT", 10000))
-        logger.info(f"🚀 [Munh V3 Titan] LIVE | Port: {port} | Binary Pipeline: ON")
-        
-        socketio.run(
-            app, 
-            host='0.0.0.0', 
-            port=port, 
-            debug=False, 
-            use_reloader=False,
-            log_output=False
-        )
+        logger.info("🚀 [Munh V3 Titan] Cloudflare Python Worker Ready")
 
     except Exception as fatal:
-        logger.critical(f"💀 [Fatal Crash]: {fatal}")
+        logger.critical(f"💀 [Fatal Startup Error]: {fatal}")
+
+# Note: Cloudflare Workers ko 'if __name__ == "__main__"' ki zaroorat nahi hoti.
+# Woh 'app' object ko directly serve karta hai.
