@@ -1,6 +1,4 @@
 name = "myt-backend"
-main = "main.py"  # index.js ki jagah main.py karo
+main = "main.py"  # Aapka entry point Python file
 compatibility_date = "2026-05-10"
-
-[vars]
-# Apne variables yahan ya dashboard mein rehne do
+compatibility_flags = ["python_workers"] # Ye line zaroori hai Python ke liye
