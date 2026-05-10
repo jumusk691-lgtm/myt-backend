@@ -1,9 +1,6 @@
-import eventlet
-eventlet.monkey_patch(all=True)
-
-import os, pyotp, time, datetime, pytz, requests, sqlite3, tempfile, json, gc, socket, sys, logging, threading, traceback
-from flask import Flask, send_file, request, after_this_request, jsonify
-from flask_socketio import SocketIO, join_room, emit, leave_room
+import os, pyotp, datetime, pytz, sqlite3, tempfile, json, gc, socket, sys, logging, asyncio
+from fastapi import FastAPI, Request, jsonify
+from fastapi_socketio import SocketManager
 from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 from supabase import create_client
@@ -31,18 +28,11 @@ SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJ
 BUCKET_NAME = "myt"
 
 # ==============================================================================
-# --- FLASK & SOCKETIO (BYPASS OPTIMIZED) ---
+# --- FASTAPI & SOCKET ENGINE (CLOUDFLARE BYPASS) ---
 # ==============================================================================
-app = Flask(__name__)
-# Max buffer ko 1MB rakha hai taaki RAM leak na ho
-socketio = SocketIO(
-    app, 
-    cors_allowed_origins="*", 
-    async_mode='eventlet', 
-    ping_timeout=60, 
-    ping_interval=25,
-    manage_session=False,
-    max_http_buffer_size=5242880) 
+app = FastAPI()
+# SocketManager Cloudflare ke environment mein optimized chalta hai
+sm = SocketManager(app=app, cors_allowed_origins="*")
 
 # ==============================================================================
 # --- GLOBAL SYSTEM STATE (ZERO-RAM ENGINE) ---
@@ -56,30 +46,46 @@ class MunhEngineState:
         self.reconnect_count = 0
         
         # --- THE BYPASS CORE ---
-        # Sirf metadata aur count rakh rahe hain, tick data NAHI
         self.subscribed_tokens_set = set()      
-        self.token_metadata = {}                # mapping: {token: etype}
-        self.token_ref_count = {}               # mapping: {token: user_count}
-        self.user_subscriptions = {}            # mapping: {sid: set(tokens)}
+        self.token_metadata = {}                
+        self.token_ref_count = {}               
+        self.user_subscriptions = {}            
+        
+        # --- BATCHING BUFFER (The Magic Pipe) ---
+        # Data yahan jama hoga aur pipeline.py ise broadcast karega
+        self.batch_buffer = {} 
         
         # User & Level Management
         self.user_levels = {}                   
         self.active_users_pool = {}             
         
-        # Score System (Track & Add logic ready)
-        self.score = 0                          
-        self.user_p2p_scores = {}               
-        
-        # System Health
+        # Health & Persistence
         self.dns_status = False                 
         self.last_master_update = None
         self.start_time = datetime.datetime.now(IST)
         self.db_path = None
         
-        # REMOVED: global_market_cache, previous_price, live_ohlc
-        # Inhe remove karne se Render ki RAM hamesha khali rahegi.
+        logger.info("🧠 [Brain] State Initialized for Cloudflare (Python Worker).")
 
 # Shared Global State Instance
 state = MunhEngineState()
 
-logger.info("🧠 [Brain] System State Initialized in Zero-RAM Bypass Mode.")
+# ==============================================================================
+# --- MEMORY GUARDIAN ---
+# ==============================================================================
+def cleanup_memory():
+    """Manual trigger to stay under 12MB"""
+    gc.collect()
+
+# ==============================================================================
+# --- FASTAPI ADAPTERS (For Search & Option Chain) ---
+# ==============================================================================
+@app.post("/api/search")
+async def api_search(request: Request):
+    from master_db import handle_search
+    return await handle_search()
+
+@app.post("/api/option_chain")
+async def api_option_chain(request: Request):
+    from master_db import get_chain
+    return await get_chain()
