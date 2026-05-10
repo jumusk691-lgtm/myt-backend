@@ -26,7 +26,7 @@ def handle_connect(auth=None):
         return False
 
 # ==============================================================================
-# --- 2. BYPASS SUBSCRIPTION (1000 Symbols Optimized) ---
+# --- 2. BATCHING & BYPASS SUBSCRIPTION ---
 # ==============================================================================
 @socketio.on('subscribe')
 def handle_incoming_subscription(data):
@@ -36,27 +36,24 @@ def handle_incoming_subscription(data):
     sid = request.sid
     batch_to_angel = {1: [], 2: [], 3: [], 5: []}
     
-    # Fast filtering and room joining
     for instrument in watchlist:
         token = str(instrument.get('token'))
         if not token or token == "None": continue
 
-        # 1. Join Room (Direct Pipe)
+        # --- BYPASS ROOM JOINING ---
+        # Room joining asan rakhi hai taaki direct pipe bani rahe
         join_room(token)
         
-        # 2. Update state memory
         if sid in state.user_subscriptions:
             state.user_subscriptions[sid].add(token)
 
-        # 3. Ref Count (Bandwidth optimization)
         state.token_ref_count[token] = state.token_ref_count.get(token, 0) + 1
         
-        # 4. Check if we need to call AngelOne
         if token not in state.subscribed_tokens_set:
             exch = str(instrument.get('exch', 'NSE')).upper()
             symbol = str(instrument.get('symbol', '')).upper()
             
-            # Logic for Segment Selection
+            # Segment Selection
             if "MCX" in exch: etype = 5
             elif any(x in symbol for x in ["FUT", "CE", "PE"]) or "NFO" in exch: etype = 2
             elif "BFO" in exch: etype = 3
@@ -66,42 +63,37 @@ def handle_incoming_subscription(data):
             batch_to_angel[etype].append(token)
             state.subscribed_tokens_set.add(token)
 
-    # 🚀 STEP 5: AngelOne Subscribe (Non-Blocking)
+    # AngelOne Subscribe (Batching used for stability)
     def angel_trigger():
         if state.is_ws_ready and state.sws:
             for etype, tokens in batch_to_angel.items():
                 if not tokens: continue
-                # Split in 500 batches
                 for i in range(0, len(tokens), 500):
                     chunk = tokens[i:i+500]
                     state.sws.subscribe("myt_unlimited", 1, [{"exchangeType": etype, "tokens": chunk}])
-                    eventlet.sleep(0.05) # Delay for stability
+                    eventlet.sleep(0.05) 
     
     eventlet.spawn(angel_trigger)
 
 # ==============================================================================
-# --- 3. FETCH CURRENT LTP (The "Zero" Price Fix) ---
+# --- 3. BATCHED LTP RESPONSE (Fix for Zero Price) ---
 # ==============================================================================
 @socketio.on('get_last_known_prices')
 def handle_ltp_request():
-    """
-    Jab user app khole, wo ye call karega. Hum state se (jo tick_engine 
-    save kar raha hai) turant prices bhej denge.
-    """
     sid = request.sid
     if sid not in state.user_subscriptions: return
     
-    # Iske liye tick_engine ko 'state.last_known_prices' update karni hogi
-    # Hum ek batch reply bhejenge
+    # BATCHING: Ek hi object mein saare prices bhej rahe hain
     response = {}
     for token in state.user_subscriptions[sid]:
-        price = state.token_metadata.get(token, {}).get('last_price', '0.00')
+        # state.batch_buffer se latest price uthayega
+        price = state.batch_buffer.get(token, '0.00')
         response[token] = price
     
-    socketio.emit('initial_prices', response, room=sid)
+    socketio.emit('live_batch', response, room=sid)
 
 # ==============================================================================
-# --- 4. DISCONNECT & CLEANUP ---
+# --- 4. DISCONNECT & CLEANUP (Zero-RAM) ---
 # ==============================================================================
 @socketio.on('disconnect')
 def handle_disconnect():
@@ -114,13 +106,14 @@ def handle_disconnect():
                 if token in state.token_ref_count:
                     state.token_ref_count[token] -= 1
                     if state.token_ref_count[token] <= 0:
-                        # Unsubscribe only if NO ONE is watching
                         etype = state.token_metadata.get(token, 1)
                         if state.sws:
                             state.sws.unsubscribe("myt_unlimited", 1, [{"exchangeType": etype, "tokens": [token]}])
                         state.subscribed_tokens_set.discard(token)
                         state.token_metadata.pop(token, None)
                         state.token_ref_count.pop(token, None)
+                        # RAM se buffer bhi saaf karo
+                        state.batch_buffer.pop(token, None)
             del state.user_subscriptions[sid]
         
         state.active_users_pool.pop(sid, None)
