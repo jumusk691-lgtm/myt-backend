@@ -1,4 +1,19 @@
- to Binary (APK Expectation)
+import json
+import asyncio
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+# Note: Yahan app, sm, state, logger, master_db, etc. pehle se defined hone chahiye.
+# Agar nahi hain, toh unke imports zaroori hain.
+
+# ==============================================================================
+# --- 2. BINARY EMIT FUNCTION ---
+# ==============================================================================
+
+# To Binary (APK Expectation)
+async def emit_binary_batch(event, data, room=None):
+    try:
+        # Data ko binary mein convert kar raha hai
         binary_payload = json.dumps(data).encode('utf-8')
         if room:
             await sm.emit(event, binary_payload, to=room)
@@ -13,6 +28,7 @@ socket_manager.emit_binary_batch = emit_binary_batch
 # ==============================================================================
 # --- 3. DIRECT TOKEN SYNC (API ENDPOINT) ---
 # ==============================================================================
+
 @app.post('/api/add_token')
 async def add_new_token_direct(request: Request):
     """APK side HealthCheck/Re-sync endpoint"""
@@ -38,8 +54,9 @@ async def add_new_token_direct(request: Request):
         return JSONResponse(content={"status": "error", "msg": str(e)}, status_code=500)
 
 # ==============================================================================
-# --- 4. CLOUDFLARE LIFECYCLE (STARTUP) ---
+# --- 4. LIFECYCLE (STARTUP) ---
 # ==============================================================================
+
 @app.on_event("startup")
 async def startup_event():
     """Backend start hote hi background tasks shuru karega"""
@@ -58,10 +75,10 @@ async def startup_event():
         if hasattr(tick_engine, 'market_data_cleaner'):
             asyncio.create_task(asyncio.to_thread(tick_engine.market_data_cleaner))
 
-        logger.info("🚀 [Munh V3 Titan] Cloudflare Python Worker Ready")
+        logger.info("🚀 [Munh V3 Titan] Server Ready")
 
     except Exception as fatal:
         logger.critical(f"💀 [Fatal Startup Error]: {fatal}")
 
-# Note: Cloudflare Workers ko 'if __name__ == "__main__"' ki zaroorat nahi hoti.
-# Woh 'app' object ko directly serve karta hai.
+# Back4App ya Northflank ke liye uvicorn startup command:
+# uvicorn main:app --host 0.0.0.0 --port 8080
