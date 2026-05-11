@@ -1,42 +1,4 @@
-import os, gc, json, asyncio
-from brain import app, sm, logger, state, cleanup_memory
-from fastapi import Request, Response
-from fastapi.responses import JSONResponse
-import auth_manager, master_db, tick_engine, socket_manager, recovery_manager
-
-# ==============================================================================
-# --- 1. ATTRIBUTE & MEMORY ALIGNMENT (ZERO-RAM) ---
-# ==============================================================================
-state.active_users_pool = getattr(state, 'active_users_pool', {})
-state.active_users_list = state.active_users_pool 
-
-async def aggressive_memory_protector():
-    """Har 60s mein RAM saaf karta hai - Optimized for Cloudflare"""
-    while True:
-        await asyncio.sleep(60)
-        try:
-            cleanup_memory() # From brain.py
-            subs = len(state.subscribed_tokens_set)
-            users = len(state.active_users_pool)
-            logger.info(f"⚡ [RAM Guard] Tokens: {subs} | Users: {users} | RAM: Stable")
-            
-            # 12MB Limit Safety
-            if users > 300:
-                state.active_users_pool.clear()
-                cleanup_memory()
-        except Exception as e:
-            logger.error(f"⚠️ [RAM Guard Error]: {e}")
-
-# ==============================================================================
-# --- 2. APK-MATCHED BINARY EMITTER ---
-# ==============================================================================
-async def emit_binary_batch(event, data, room=None):
-    """
-    Data ko UTF-8 Binary mein convert karke emit karta hai.
-    Cloudflare Optimized: Uses sm.emit (FastAPI-SocketIO)
-    """
-    try:
-        # JSON to Binary (APK Expectation)
+ to Binary (APK Expectation)
         binary_payload = json.dumps(data).encode('utf-8')
         if room:
             await sm.emit(event, binary_payload, to=room)
