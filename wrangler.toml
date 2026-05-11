@@ -1,4 +1,0 @@
-name = "myt-backend"
-main = "main.py"  # Aapka entry point Python file
-compatibility_date = "2026-05-10"
-compatibility_flags = ["python_workers"] # Ye line zaroori hai Python ke liye
