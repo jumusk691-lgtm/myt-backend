@@ -1,84 +1,93 @@
+import time
 import json
+import threading
 import asyncio
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+import websockets
+import pyotp
+import firebase_admin
+from firebase_admin import credentials, db
+from SmartApi import SmartConnect
+from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 
-# Note: Yahan app, sm, state, logger, master_db, etc. pehle se defined hone chahiye.
-# Agar nahi hain, toh unke imports zaroori hain.
+# ==========================================================
+# 🛑 CONFIGURATION
+# ==========================================================
+API_KEY = "Z80WG5Sg"
+CLIENT_CODE = "S52638556"
+MPIN = "0000"
+TOTP_STR = "XFTXZ2445N4V2UMB7EWUCBDRMU"
 
-# ==============================================================================
-# --- 2. BINARY EMIT FUNCTION ---
-# ==============================================================================
+# Firebase Setup
+cred = credentials.Certificate("serviceAccountKey.json") # File path ensure karein
+firebase_admin.initialize_app(cred, {'databaseURL': 'https://trade-f600a-default-rtdb.firebaseio.com/'})
+ref = db.reference('central_watchlist')
 
-# To Binary (APK Expectation)
-async def emit_binary_batch(event, data, room=None):
-    try:
-        # Data ko binary mein convert kar raha hai
-        binary_payload = json.dumps(data).encode('utf-8')
-        if room:
-            await sm.emit(event, binary_payload, to=room)
-        else:
-            await sm.emit(event, binary_payload)
-    except Exception as e:
-        logger.error(f"❌ [Binary Emit Error]: {e}")
+# ==========================================================
+# 🚀 CORE ENGINE
+# ==========================================================
+class MunhTitanEngine:
+    def __init__(self):
+        self.obj = SmartConnect(api_key=API_KEY)
+        self.sws = None
+        self.jwt_token = None
+        self.feed_token = None
+        self.is_running = True
+        self.is_ws_connected = False
+        self.exchange_map = {"NSE": 1, "NFO": 2, "BSE": 3, "BFO": 4, "MCX": 5}
 
-# Global mapping injection
-socket_manager.emit_binary_batch = emit_binary_batch
+    def login(self):
+        try:
+            totp = pyotp.TOTP(TOTP_STR).now()
+            data = self.obj.generateSession(CLIENT_CODE, MPIN, totp)
+            if data['status']:
+                self.jwt_token = data['data']['jwtToken']
+                self.feed_token = self.obj.feed_token
+                return True
+            return False
+        except Exception as e:
+            print(f"Login Error: {e}")
+            return False
 
-# ==============================================================================
-# --- 3. DIRECT TOKEN SYNC (API ENDPOINT) ---
-# ==============================================================================
+    def on_data(self, wsapp, msg):
+        token = str(msg.get('token') or msg.get('tk'))
+        lp = msg.get('last_traded_price') or msg.get('lp')
+        if token and lp:
+            price = float(lp) / 100.0
+            # LIVE FIREBASE UPDATE
+            db.reference(f'live_prices/{token}').set({
+                'price': price,
+                'timestamp': time.time()
+            })
 
-@app.post('/api/add_token')
-async def add_new_token_direct(request: Request):
-    """APK side HealthCheck/Re-sync endpoint"""
-    try:
-        data = await request.json()
-        token = str(data.get('token'))
-        exch = int(data.get('exch', 1))
-        
-        if not token:
-            return JSONResponse(content={"status": "error", "msg": "No token"}, status_code=400)
+    def sync_and_subscribe(self):
+        # Central Watchlist se data read karna
+        watchlist = ref.get()
+        if not watchlist: return
 
-        state.subscribed_tokens_set.add(token)
-        state.token_metadata[token] = exch
-        
-        if state.sws and state.is_ws_ready:
-            state.sws.subscribe("myt_direct", 1, [{"exchangeType": exch, "tokens": [token]}])
-            logger.info(f"✅ [Direct Sync] Token {token} Active")
-            return {"status": "success", "token": token}
-            
-        return JSONResponse(content={"status": "pending", "msg": "WS Not Ready"}, status_code=202)
-    except Exception as e:
-        logger.error(f"❌ [API Error]: {e}")
-        return JSONResponse(content={"status": "error", "msg": str(e)}, status_code=500)
+        subs = {}
+        for key, val in watchlist.items():
+            token = val.get('token')
+            exch = val.get('exch')
+            exch_type = self.exchange_map.get(exch, 1)
+            subs.setdefault(exch_type, []).append(token)
 
-# ==============================================================================
-# --- 4. LIFECYCLE (STARTUP) ---
-# ==============================================================================
+        # Subscribe
+        if self.sws and self.is_ws_connected:
+            sub_params = [{"exchangeType": et, "tokens": t} for et, t in subs.items()]
+            self.sws.subscribe("munh_batch", 1, sub_params)
+            print("✅ [Sync]: Watchlist synced and subscribed successfully.")
 
-@app.on_event("startup")
-async def startup_event():
-    """Backend start hote hi background tasks shuru karega"""
-    try:
-        # Step 1: Master DB Sync
-        logger.info("📡 [Master DB] Initializing...")
-        master_db.sync_master_data()
-        
-        # Step 2: Background Tasks Launch
-        asyncio.create_task(aggressive_memory_protector())
-        
-        if hasattr(recovery_manager, 'engine_lifecycle_manager'):
-            # lifecycle_manager ko async loop mein chalana zaroori hai
-            asyncio.create_task(asyncio.to_thread(recovery_manager.engine_lifecycle_manager))
-            
-        if hasattr(tick_engine, 'market_data_cleaner'):
-            asyncio.create_task(asyncio.to_thread(tick_engine.market_data_cleaner))
+    def start_websocket(self):
+        self.sws = SmartWebSocketV2(self.jwt_token, API_KEY, CLIENT_CODE, self.feed_token)
+        self.sws.on_data = self.on_data
+        self.sws.on_open = lambda ws: [setattr(self, 'is_ws_connected', True), self.sync_and_subscribe()]
+        self.sws.on_close = lambda *args: setattr(self, 'is_ws_connected', False)
+        threading.Thread(target=self.sws.connect, daemon=True).start()
 
-        logger.info("🚀 [Munh V3 Titan] Server Ready")
+    def run(self):
+        if self.login():
+            self.start_websocket()
+            while True: time.sleep(1)
 
-    except Exception as fatal:
-        logger.critical(f"💀 [Fatal Startup Error]: {fatal}")
-
-# Back4App ya Northflank ke liye uvicorn startup command:
-# uvicorn main:app --host 0.0.0.0 --port 8080
+if __name__ == "__main__":
+    MunhTitanEngine().run()
