@@ -1,4 +1,3 @@
-# File Name: main.py (Internal Reference Name: Munh)
 import eventlet
 eventlet.monkey_patch()  # 🔥 CRITICAL FIX: Sockets, Threads, aur Requests ko Eventlet compatible banane ke liye sabse upar anivarya hai!
 
@@ -341,14 +340,14 @@ class MunhTitanEngine:
                             self.last_known_prices[t_str] = f_price
                             self.send_delayed_price(t_str, f_price)
                             
-            elif isinstance(msg, dict):
-                token = msg.get('token') or msg.get('tk')
-                lp = msg.get('last_traded_price') or msg.get('lp')
-                if token and lp:
-                    token_str = str(token)
-                    formatted_price = "{:.2f}".format(float(lp) / 100.0)
-                    self.last_known_prices[token_str] = formatted_price
-                    self.send_delayed_price(token_str, formatted_price)
+                elif isinstance(msg, dict):
+                    token = msg.get('token') or msg.get('tk')
+                    lp = msg.get('last_traded_price') or msg.get('lp')
+                    if token and lp:
+                        token_str = str(token)
+                        formatted_price = "{:.2f}".format(float(lp) / 100.0)
+                        self.last_known_prices[token_str] = formatted_price
+                        self.send_delayed_price(token_str, formatted_price)
         except Exception:
             pass
 
@@ -430,4 +429,5 @@ if __name__ == "__main__":
     threading.Thread(target=sync_url_to_firebase, daemon=True).start()
     
     port = int(os.environ.get('PORT', 5000))
-    eventlet.wsgi.server(eventlet.listen(('', port)), wsgi_app, log_output=False)
+    # 🔥 FIXED BINDING: Changed from '' to '0.0.0.0' so Render can detect and map the internal port correctly!
+    eventlet.wsgi.server(eventlet.listen(('0.0.0.0', port)), wsgi_app, log_output=False)
