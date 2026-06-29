@@ -29,33 +29,8 @@ def add_to_score(points):
     return user_score
 
 # ==========================================================
-# 🛑 FIREBASE REST SYNCER LOGIC (SMART CACHE UPGRADE)
-# ==========================================================
-def sync_url_to_firebase():
-    log_file = "tunnel_log.txt"
-    endpoint_url = f"{FIREBASE_DB_URL.rstrip('/')}/server_config/socket_url.json"
-    last_synced_url = ""
-    
-    while True:
-        try:
-            if os.path.exists(log_file):
-                with open(log_file, "r") as f:
-                    content = f.read()
-                    match = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", content)
-                    if match:
-                        new_url = match.group(0)
-                        if new_url != last_synced_url:
-                            response = requests.put(endpoint_url, json=new_url)
-                            if response.status_code == 200:
-                                print(f"🚀 [Firebase Sync Success]: Target URL Updated -> {new_url}")
-                                last_synced_url = new_url
-        except Exception:
-            # 🔥 SILENT RECONNECT: Internet na hone par terminal par kachra print nahi karega
-            time.sleep(10)
-            continue
-        time.sleep(10)
-
 # ⚡ Web Server Matrix Engine Integrations
+# ==========================================================
 from flask import Flask, redirect, url_for, request, jsonify
 import socketio
 
@@ -158,7 +133,6 @@ class MunhTitanEngine:
                     print("🔑 [Login Manager]: Session Generated Successfully.")
                     return True
             except Exception:
-                # 🔥 SILENT AUTO-RETRY: Offline hone par bina chillaye chupchaap 5 sec wait karega
                 time.sleep(5)
                 return False
 
@@ -194,25 +168,30 @@ class MunhTitanEngine:
             except Exception: 
                 pass
 
-    def send_delayed_price(self, token, price_str):
+    def send_batch_binary_to_apk(self, updates_list):
+        """🔥 PURE BATCH BINARY PACKET EMITTER (Combines multiple symbols into one single chunk)"""
+        if not updates_list:
+            return
         try:
-            token_str = str(token)
-            exch_name = self.token_exchange_cache.get(token_str)
-            if not exch_name:
-                exch_name = self.detect_exchange_by_token(token_str)
-                self.token_exchange_cache[token_str] = exch_name
-                
-            exch_type = self.exchange_map.get(exch_name, nse)
+            batch_buffer = bytearray()
+            symbols_counted = 0
             
-            json_packet = {
-                'exchangeType': exch_type, 
-                'token': token_str, 
-                'ltp': float(price_str),
-                't': token_str,
-                'price': str(price_str)
-            }
-            sio.emit('live_data', json_packet)
-            sio.emit('price_update', json_packet)
+            for token, price_str in updates_list:
+                token_int = int(token)
+                raw_float = float(price_str)
+                
+                if token == self.REQ_NIFTY_TOKEN:
+                    price_int = int(round(raw_float * 100.0 * 100.0))
+                else:
+                    price_int = int(round(raw_float * 100.0))
+                    
+                # 8 Bytes block append (4 bytes Token + 4 bytes Price) Big-Endian
+                batch_buffer.extend(struct.pack('>ii', token_int, price_int))
+                symbols_counted += 1
+                
+            if batch_buffer:
+                sio.emit('live_data', bytes(batch_buffer))
+                print(f"⚡ [Batch Emit]: Sent {symbols_counted} symbols simultaneously in a single binary chunk!")
         except Exception: 
             pass
 
@@ -222,7 +201,10 @@ class MunhTitanEngine:
                 return
             grouped_subs = {}
             for token in self.active_subscribed_tokens:
-                exch_name = self.token_exchange_cache.get(token, "NSE")
+                exch_name = self.token_exchange_cache.get(token)
+                if not exch_name:
+                    exch_name = self.detect_exchange_by_token(token)
+                    self.token_exchange_cache[token] = exch_name
                 exch_type = self.exchange_map.get(exch_name, nse)
                 if exch_type not in grouped_subs: 
                     grouped_subs[exch_type] = []
@@ -231,9 +213,14 @@ class MunhTitanEngine:
             if grouped_subs and self.sws and self.is_ws_connected:
                 sub_params = [{"exchangeType": k, "tokens": v} for k, v in grouped_subs.items()]
                 self.sws.subscribe("munh_batch", 1, sub_params)
+                
+                # Resubscription cache sync in batch
+                sync_updates = []
                 for t in self.active_subscribed_tokens:
                     if t in self.last_known_prices:
-                        self.send_delayed_price(t, self.last_known_prices[t])
+                        sync_updates.append((t, self.last_known_prices[t]))
+                if sync_updates:
+                    self.send_batch_binary_to_apk(sync_updates)
         except Exception: 
             pass
 
@@ -246,41 +233,36 @@ class MunhTitanEngine:
                 return
 
             action = payload.get("action", "sub")
-            global_exchange = payload.get("exchangeType") or payload.get("exchange")
-            
-            if isinstance(global_exchange, int):
-                reverse_map = {nse: "NSE", nfo: "NFO", bse: "BSE", bfo: "BFO", mcx: "MCX"}
-                global_exchange = reverse_map.get(global_exchange, "NSE")
-                
             input_tokens = payload.get("tokens", [])
-            tokens_to_sub = []
+            tokens_to_process = []
 
+            # 🔥 AUTO DETECT EXCHANGE FROM PYTHON SIDE (No APK reliance)
             if isinstance(input_tokens, list):
                 for item in input_tokens:
-                    token_str = str(item)
+                    token_str = str(item).strip()
                     if token_str and token_str != "None":
-                        if action == "sub":
-                            tokens_to_sub.append((token_str, global_exchange if global_exchange else self.detect_exchange_by_token(token_str)))
+                        detected_exch = self.detect_exchange_by_token(token_str)
+                        tokens_to_process.append((token_str, detected_exch))
                         if action == "sub" and token_str not in self.active_subscribed_tokens:
                             self.active_subscribed_tokens.add(token_str)
-                        elif action == "unsub":
-                            tokens_to_sub.append((token_str, global_exchange if global_exchange else self.detect_exchange_by_token(token_str)))
+                        elif action == "unsub" and token_str in self.active_subscribed_tokens:
+                            self.active_subscribed_tokens.remove(token_str)
             else:
-                token_str = str(input_tokens)
+                token_str = str(input_tokens).strip()
                 if token_str and token_str != "None":
-                    if action == "sub":
-                        tokens_to_sub.append((token_str, global_exchange if global_exchange else self.detect_exchange_by_token(token_str)))
+                    detected_exch = self.detect_exchange_by_token(token_str)
+                    tokens_to_process.append((token_str, detected_exch))
                     if action == "sub" and token_str not in self.active_subscribed_tokens:
                         self.active_subscribed_tokens.add(token_str)
-                    elif action == "unsub":
-                        tokens_to_sub.append((token_str, global_exchange if global_exchange else self.detect_exchange_by_token(token_str)))
+                    elif action == "unsub" and token_str in self.active_subscribed_tokens:
+                        self.active_subscribed_tokens.remove(token_str)
 
-            if not tokens_to_sub: 
+            if not tokens_to_process: 
                 return
 
             if action == "sub":
                 seg_groups = {}
-                for token, exch in tokens_to_sub:
+                for token, exch in tokens_to_process:
                     self.token_exchange_cache[token] = exch
                     exch_type = self.exchange_map.get(exch, nse)
                     if exch_type not in seg_groups:
@@ -290,35 +272,54 @@ class MunhTitanEngine:
                 if self.sws and self.is_ws_connected:
                     sub_params = [{"exchangeType": exch_type, "tokens": tokens} for exch_type, tokens in seg_groups.items()]
                     self.sws.subscribe("munh_batch", 1, sub_params)
-                    for token, _ in tokens_to_sub:
+                    
+                    immediate_updates = []
+                    for token, _ in tokens_to_process:
                         if token in self.last_known_prices:
-                            self.send_delayed_price(token, self.last_known_prices[token])
+                            immediate_updates.append((token, self.last_known_prices[token]))
+                    if immediate_updates:
+                        self.send_batch_binary_to_apk(immediate_updates)
                             
             elif action == "unsub":
-                for token, _ in tokens_to_sub:
+                seg_unsub_groups = {}
+                for token, exch in tokens_to_process:
                     if token in self.token_exchange_cache:
                         del self.token_exchange_cache[token]
-                    if token in self.active_subscribed_tokens:
-                        self.active_subscribed_tokens.remove(token)
+                    exch_type = self.exchange_map.get(exch, nse)
+                    if exch_type not in seg_unsub_groups:
+                        seg_unsub_groups[exch_type] = []
+                    seg_unsub_groups[exch_type].append(token)
+                    
+                if self.sws and self.is_ws_connected and seg_unsub_groups:
+                    unsub_params = [{"exchangeType": exch_type, "tokens": tokens} for exch_type, tokens in seg_unsub_groups.items()]
+                    self.sws.unsubscribe("munh_batch", 1, unsub_params)
 
         except Exception: 
             pass
 
     def detect_exchange_by_token(self, token, symbol=""):
+        """⚡ MASTER AUTO DETECTOR FOR NSE, BSE, MCX, NFO, BFO"""
         symbol = str(symbol).upper()
+        token_str = str(token).strip()
+        
+        if token_str == self.REQ_NIFTY_TOKEN:
+            return "NSE"
+        if token_str == self.REQ_SENSEX_TOKEN:
+            return "BSE"
+            
         if "GOLD" in symbol or "SILVER" in symbol or "CRUDEOIL" in symbol or "COPPER" in symbol:
             return "MCX"
         if "NIFTY" in symbol or "BANKNIFTY" in symbol:
             return "NFO" if ("CE" in symbol or "PE" in symbol or "FUT" in symbol) else "NSE"
         
         try:
-            token_int = int(token)
-            if token_int in [99926000, 99919012]: 
-                return "NSE" if token_int == 99926000 else "BSE"
+            token_int = int(token_str)
             if 10000 <= token_int <= 90000:
                 return "NFO"
             if token_int >= 210000:
                 return "MCX"
+            if 500000 <= token_int <= 600000:
+                return "BSE"
         except ValueError:
             pass
         return "NSE" 
@@ -329,6 +330,8 @@ class MunhTitanEngine:
                 try: msg = json.loads(msg)
                 except Exception: pass
 
+            batch_updates = []
+
             if isinstance(msg, list):
                 for single_tick in msg:
                     if isinstance(single_tick, dict):
@@ -338,16 +341,21 @@ class MunhTitanEngine:
                             t_str = str(t_)
                             f_price = "{:.2f}".format(float(l_) / 100.0)
                             self.last_known_prices[t_str] = f_price
-                            self.send_delayed_price(t_str, f_price)
+                            batch_updates.append((t_str, f_price))
                             
-                elif isinstance(msg, dict):
-                    token = msg.get('token') or msg.get('tk')
-                    lp = msg.get('last_traded_price') or msg.get('lp')
-                    if token and lp:
-                        token_str = str(token)
-                        formatted_price = "{:.2f}".format(float(lp) / 100.0)
-                        self.last_known_prices[token_str] = formatted_price
-                        self.send_delayed_price(token_str, formatted_price)
+            elif isinstance(msg, dict):
+                token = msg.get('token') or msg.get('tk')
+                lp = msg.get('last_traded_price') or msg.get('lp')
+                if token and lp:
+                    token_str = str(token)
+                    formatted_price = "{:.2f}".format(float(lp) / 100.0)
+                    self.last_known_prices[token_str] = formatted_price
+                    batch_updates.append((token_str, formatted_price))
+
+            # 🔥 FULL BATCH EMIT TRIGGER
+            if batch_updates:
+                self.send_batch_binary_to_apk(batch_updates)
+
         except Exception:
             pass
 
@@ -426,8 +434,6 @@ def update_score():
 
 if __name__ == "__main__":
     threading.Thread(target=engine.start_engine, daemon=True).start()
-    threading.Thread(target=sync_url_to_firebase, daemon=True).start()
     
     port = int(os.environ.get('PORT', 5000))
-    # 🔥 FIXED BINDING: Changed from '' to '0.0.0.0' so Render can detect and map the internal port correctly!
     eventlet.wsgi.server(eventlet.listen(('0.0.0.0', port)), wsgi_app, log_output=False)
