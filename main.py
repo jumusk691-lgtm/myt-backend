@@ -7,52 +7,10 @@ import struct
 import pyotp
 import threading
 import os
-import requests
-from datetime import datetime
 from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
-from flask import Flask, redirect, url_for, request, jsonify
+from flask import Flask
 import socketio
-
-# ⚡ Firebase Realtime Database URL
-FIREBASE_DB_URL = "https://trade-f600a-default-rtdb.firebaseio.com/"
-
-# ==========================================================
-# 🛑 SCORE TRACKER LOGIC
-# ==========================================================
-user_score = 0
-score_lock = threading.Lock()
-
-def add_to_score(points):
-    global user_score
-    with score_lock:
-        user_score += points
-    return user_score
-
-# ==========================================================
-# ⚡ Web Server Matrix Engine Integrations
-# ==========================================================
-sio = socketio.Server(cors_allowed_origins='*', async_mode='eventlet')
-flask_app = Flask(__name__)
-wsgi_app = socketio.WSGIApp(sio, flask_app)
-connected_clients = set()
-
-# ==========================================================
-# 🔥 24/7 UNLIMITED ALIVE TRICK
-# ==========================================================
-def keep_alive_audio():
-    os.environ['SDL_VIDEODRIVER'] = 'dummy'
-    try:
-        import pygame
-        pygame.mixer.init()
-        if os.path.exists("silent.mp3"):
-            pygame.mixer.music.load("silent.mp3")
-            while True:
-                if not pygame.mixer.music.get_busy(): 
-                    pygame.mixer.music.play()
-                time.sleep(1)
-    except: pass
-threading.Thread(target=keep_alive_audio, daemon=True).start()
 
 # ==========================================================
 # 🛑 CONFIGURATION & GLOBALS
@@ -61,10 +19,20 @@ API_KEY = "Z80WG5Sg"
 CLIENT_CODE = "S52638556"
 MPIN = "0000"
 TOTP_STR = "XFTXZ2445N4V2UMB7EWUCBDRMU"
-nse, nfo, bse, bfo, mcx = 1, 2, 3, 4, 5
+
+# Permanent Indices (Nifty 50, Bank Nifty - NSE)
+# Token 26000 = Nifty, 26009 = BankNifty
+PERMANENT_TOKENS = [{"exchangeType": 1, "tokens": ["26000", "26009"]}]
 
 # ==========================================================
-# 2. TITAN ENGINE SYSTEM LOGIC (ZERO-LATENCY MODE)
+# ⚡ Web Server Engine
+# ==========================================================
+sio = socketio.Server(cors_allowed_origins='*', async_mode='eventlet')
+flask_app = Flask(__name__)
+wsgi_app = socketio.WSGIApp(sio, flask_app)
+
+# ==========================================================
+# ⚡ TITAN ENGINE (ZERO-LATENCY / FIREHOSE MODE)
 # ==========================================================
 class MunhTitanEngine:
     def __init__(self):
@@ -73,138 +41,89 @@ class MunhTitanEngine:
         self.is_running = True
         self.jwt_token = None
         self.feed_token = None
-        self.is_ws_connected = False 
-        
-        self.token_exchange_cache = {} 
-        self.active_subscribed_tokens = set() 
-        
-        self.session_lock = threading.Lock()
-        self.exchange_map = {"NSE": nse, "NFO": nfo, "BSE": bse, "BFO": bfo, "MCX": mcx}
+        self.is_ws_connected = False
+        self.active_subscriptions = {} # Stores {token: exchange}
 
     def login_manager(self):
-        with self.session_lock:
-            try:
-                self.obj = SmartConnect(api_key=API_KEY)
-                totp = pyotp.TOTP(TOTP_STR).now()
-                data = self.obj.generateSession(CLIENT_CODE, MPIN, totp)
-                if data.get('status'):
-                    self.jwt_token = data['data']['jwtToken']
-                    self.feed_token = data['data']['feedToken']
-                    self.obj.setAccessToken(self.jwt_token)
-                    print("🔑 [Login Manager]: Session Generated.")
-                    return True
-            except Exception as e:
-                print(f"❌ Login Failed: {e}")
-                time.sleep(5)
-                return False
-
-    def session_watchdog_loop(self):
-        while self.is_running:
-            time.sleep(60)
-            if not self.is_ws_connected:
-                print("🔄 [Watchdog]: Connection lost. Re-authenticating...")
-                self.login_manager()
-                self.start_websocket()
+        try:
+            totp = pyotp.TOTP(TOTP_STR).now()
+            data = self.obj.generateSession(CLIENT_CODE, MPIN, totp)
+            if data and data.get('status'):
+                self.jwt_token = data['data']['jwtToken']
+                self.feed_token = data['data']['feedToken']
+                self.obj.setAccessToken(self.jwt_token)
+                return True
+        except Exception as e:
+            print(f"❌ Login Failed: {e}")
+            return False
 
     def on_data(self, wsapp, msg):
-        """⚡ ZERO-LATENCY DATA HANDLING: Direct Emit"""
+        """⚡ PURE FIREHOSE: Instant Pass-through"""
         try:
             data = msg if isinstance(msg, list) else [msg]
             for tick in data:
                 tk = str(tick.get('token') or tick.get('tk'))
                 lp = tick.get('last_traded_price') or tick.get('lp')
                 if tk and lp:
-                    # Conversion to integer for APK binary processing
-                    token_int = int(tk)
-                    price_int = int(round(float(lp) / 100.0 * 100.0))
-                    
-                    # DIRECT EMIT: No Queue, No Batching, Instant Update
-                    payload = struct.pack('>ii', token_int, price_int)
-                    sio.emit('live_data', bytes(payload))
+                    # No processing, just emit
+                    price_val = int(round(float(lp) / 100.0 * 100.0))
+                    sio.emit('live_data', struct.pack('>ii', int(tk), price_val))
         except: pass
 
-    def trigger_smart_resubscription(self):
-        """Batch subscription to avoid API limits (API requirement, not display lag)"""
-        if not self.active_subscribed_tokens or not self.sws or not self.is_ws_connected: return
+    def resubscribe_all(self):
+        """Subscribe Permanent Indices + Current Watchlist"""
+        if not self.sws or not self.is_ws_connected: return
         
-        grouped_subs = {}
-        for token in self.active_subscribed_tokens:
-            exch = self.token_exchange_cache.get(token, "NSE")
-            exch_type = self.exchange_map.get(exch, nse)
-            if exch_type not in grouped_subs: grouped_subs[exch_type] = []
-            grouped_subs[exch_type].append(token)
+        # 1. Subscribe Permanent Indices
+        self.sws.subscribe("munh_batch", 1, PERMANENT_TOKENS)
         
-        for exch_type, tokens in grouped_subs.items():
-            # Subscribe in chunks
-            for i in range(0, len(tokens), 500):
-                self.sws.subscribe("munh_batch", 1, [{"exchangeType": exch_type, "tokens": tokens[i:i+500]}])
-                time.sleep(0.05) 
+        # 2. Subscribe User Watchlist
+        grouped = {}
+        for token, exch in self.active_subscriptions.items():
+            if exch not in grouped: grouped[exch] = []
+            grouped[exch].append(token)
+        
+        for exch, tokens in grouped.items():
+            self.sws.subscribe("munh_batch", 1, [{"exchangeType": exch, "tokens": tokens}])
 
-    def process_incoming_ui_payload(self, raw_payload_str):
+    def process_incoming_ui_payload(self, data):
         try:
-            payload = json.loads(raw_payload_str) if isinstance(raw_payload_str, str) else raw_payload_str
+            payload = json.loads(data) if isinstance(data, str) else data
             action = payload.get("action", "sub")
-            tokens = payload.get("tokens", [])
-            token_list = tokens if isinstance(tokens, list) else [tokens]
-            
-            for t in token_list:
-                token_str = str(t).strip()
-                if not token_str or token_str == "None": continue
-                
-                if action == "sub":
-                    self.active_subscribed_tokens.add(token_str)
-                    exch = self.detect_exchange_by_token(token_str)
-                    self.token_exchange_cache[token_str] = exch
-                    if self.sws and self.is_ws_connected:
-                        self.sws.subscribe("munh_batch", 1, [{"exchangeType": self.exchange_map[exch], "tokens": [token_str]}])
-                elif action == "unsub":
-                    self.active_subscribed_tokens.discard(token_str)
-        except: pass
+            token = str(payload.get("token", "")).strip()
+            # Expecting APK to send exchange correctly
+            exch = int(payload.get("exchange", 1)) 
 
-    def detect_exchange_by_token(self, token):
-        try:
-            t = int(token)
-            if 10000 <= t <= 90000: return "NFO"
-            if t >= 210000: return "MCX"
-            if 500000 <= t <= 600000: return "BSE"
+            if action == "sub" and token:
+                self.active_subscriptions[token] = exch
+                if self.sws and self.is_ws_connected:
+                    self.sws.subscribe("munh_batch", 1, [{"exchangeType": exch, "tokens": [token]}])
+            elif action == "unsub" and token:
+                self.active_subscriptions.pop(token, None)
         except: pass
-        return "NSE"
 
     def start_websocket(self):
-        if not self.jwt_token: self.login_manager()
+        if not self.login_manager(): return
         try:
             self.sws = SmartWebSocketV2(self.jwt_token, API_KEY, CLIENT_CODE, self.feed_token)
             self.sws.on_data = self.on_data
-            self.sws.on_open = lambda ws: [setattr(self, 'is_ws_connected', True), self.trigger_smart_resubscription()]
-            self.sws.on_close = lambda ws, code, msg: setattr(self, 'is_ws_connected', False)
-            self.sws.on_error = lambda ws, error: setattr(self, 'is_ws_connected', False)
+            self.sws.on_open = lambda ws: [setattr(self, 'is_ws_connected', True), self.resubscribe_all()]
+            self.sws.on_close = lambda ws, c, m: setattr(self, 'is_ws_connected', False)
+            self.sws.on_error = lambda ws, e: setattr(self, 'is_ws_connected', False)
             threading.Thread(target=self.sws.connect, daemon=True).start()
         except:
             threading.Timer(5.0, self.start_websocket).start()
 
     def start_engine(self):
-        self.login_manager()
-        threading.Thread(target=self.session_watchdog_loop, daemon=True).start()
-        # Removed flush_and_purge_loop entirely
-        self.start_websocket()
+        threading.Thread(target=self.start_websocket, daemon=True).start()
 
 engine = MunhTitanEngine()
-
-@sio.event
-def connect(sid, environ): 
-    connected_clients.add(sid)
 
 @sio.event
 def subscribe_request(sid, data): 
     engine.process_incoming_ui_payload(data)
 
-@flask_app.route('/')
-def health_check(): return {"status": "alive", "score": user_score}, 200
-
-@flask_app.route('/sign')
-def sign_page(): return {"status": "success"}, 200
-
 if __name__ == "__main__":
-    threading.Thread(target=engine.start_engine, daemon=True).start()
+    engine.start_engine()
     port = int(os.environ.get('PORT', 5000))
     eventlet.wsgi.server(eventlet.listen(('0.0.0.0', port)), wsgi_app, log_output=False)
