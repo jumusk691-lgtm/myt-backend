@@ -14,3 +14,4 @@ fastapi
 fastapi-socketio
 uvicorn
 eventlet
+aiohttp
