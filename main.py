@@ -64,7 +64,7 @@ TOTP_STR = "XFTXZ2445N4V2UMB7EWUCBDRMU"
 nse, nfo, bse, bfo, mcx = 1, 2, 3, 4, 5
 
 # ==========================================================
-# 2. TITAN ENGINE SYSTEM LOGIC
+# 2. TITAN ENGINE SYSTEM LOGIC (ZERO-LATENCY MODE)
 # ==========================================================
 class MunhTitanEngine:
     def __init__(self):
@@ -76,22 +76,10 @@ class MunhTitanEngine:
         self.is_ws_connected = False 
         
         self.token_exchange_cache = {} 
-        self.last_known_prices = {} 
         self.active_subscribed_tokens = set() 
         
         self.session_lock = threading.Lock()
         self.exchange_map = {"NSE": nse, "NFO": nfo, "BSE": bse, "BFO": bfo, "MCX": mcx}
-        
-        # Buffer Config for "Live" Performance
-        self.buffered_ticks = {}
-        self.buffer_lock = threading.Lock()
-        self.BATCH_WINDOW_SECONDS = 0.1  # 100ms Flush Window
-        self.DATA_PURGE_SECONDS = 60.0
-
-    def chunk_list(self, l, n):
-        """Split subscription list into chunks of size n"""
-        for i in range(0, len(l), n):
-            yield l[i:i + n]
 
     def login_manager(self):
         with self.session_lock:
@@ -113,43 +101,30 @@ class MunhTitanEngine:
     def session_watchdog_loop(self):
         while self.is_running:
             time.sleep(60)
-            # Simple health check
             if not self.is_ws_connected:
                 print("🔄 [Watchdog]: Connection lost. Re-authenticating...")
                 self.login_manager()
                 self.start_websocket()
 
-    def send_batch_binary_to_apk(self, updates_list):
-        if not updates_list: return
+    def on_data(self, wsapp, msg):
+        """⚡ ZERO-LATENCY DATA HANDLING: Direct Emit"""
         try:
-            batch_buffer = bytearray()
-            for token, price_str in updates_list:
-                token_int = int(token)
-                price_int = int(round(float(price_str) * 100.0))
-                batch_buffer.extend(struct.pack('>ii', token_int, price_int))
-            if batch_buffer:
-                sio.emit('live_data', bytes(batch_buffer))
+            data = msg if isinstance(msg, list) else [msg]
+            for tick in data:
+                tk = str(tick.get('token') or tick.get('tk'))
+                lp = tick.get('last_traded_price') or tick.get('lp')
+                if tk and lp:
+                    # Conversion to integer for APK binary processing
+                    token_int = int(tk)
+                    price_int = int(round(float(lp) / 100.0 * 100.0))
+                    
+                    # DIRECT EMIT: No Queue, No Batching, Instant Update
+                    payload = struct.pack('>ii', token_int, price_int)
+                    sio.emit('live_data', bytes(payload))
         except: pass
 
-    def add_tick_to_batch_buffer(self, token, price_str):
-        with self.buffer_lock:
-            self.buffered_ticks[token] = (price_str, time.time())
-
-    def start_1sec_flush_and_purge_loop(self):
-        while self.is_running:
-            time.sleep(self.BATCH_WINDOW_SECONDS)
-            updates_to_send = []
-            
-            with self.buffer_lock:
-                for token, (price_str, ts) in list(self.buffered_ticks.items()):
-                    updates_to_send.append((token, price_str))
-                self.buffered_ticks.clear()
-            
-            if updates_to_send:
-                self.send_batch_binary_to_apk(updates_to_send)
-
     def trigger_smart_resubscription(self):
-        """Batch subscription to avoid API limits"""
+        """Batch subscription to avoid API limits (API requirement, not display lag)"""
         if not self.active_subscribed_tokens or not self.sws or not self.is_ws_connected: return
         
         grouped_subs = {}
@@ -160,10 +135,10 @@ class MunhTitanEngine:
             grouped_subs[exch_type].append(token)
         
         for exch_type, tokens in grouped_subs.items():
-            # Subscribe in chunks of 500 to prevent errors
-            for chunk in self.chunk_list(tokens, 500):
-                self.sws.subscribe("munh_batch", 1, [{"exchangeType": exch_type, "tokens": chunk}])
-                time.sleep(0.05) # Prevent socket flood
+            # Subscribe in chunks
+            for i in range(0, len(tokens), 500):
+                self.sws.subscribe("munh_batch", 1, [{"exchangeType": exch_type, "tokens": tokens[i:i+500]}])
+                time.sleep(0.05) 
 
     def process_incoming_ui_payload(self, raw_payload_str):
         try:
@@ -180,7 +155,6 @@ class MunhTitanEngine:
                     self.active_subscribed_tokens.add(token_str)
                     exch = self.detect_exchange_by_token(token_str)
                     self.token_exchange_cache[token_str] = exch
-                    # Immediate single sub if connected
                     if self.sws and self.is_ws_connected:
                         self.sws.subscribe("munh_batch", 1, [{"exchangeType": self.exchange_map[exch], "tokens": [token_str]}])
                 elif action == "unsub":
@@ -195,18 +169,6 @@ class MunhTitanEngine:
             if 500000 <= t <= 600000: return "BSE"
         except: pass
         return "NSE"
-
-    def on_data(self, wsapp, msg):
-        try:
-            data = msg if isinstance(msg, list) else [msg]
-            for tick in data:
-                tk = str(tick.get('token') or tick.get('tk'))
-                lp = tick.get('last_traded_price') or tick.get('lp')
-                if tk and lp:
-                    price = "{:.2f}".format(float(lp) / 100.0)
-                    self.last_known_prices[tk] = price
-                    self.add_tick_to_batch_buffer(tk, price)
-        except: pass
 
     def start_websocket(self):
         if not self.jwt_token: self.login_manager()
@@ -223,7 +185,7 @@ class MunhTitanEngine:
     def start_engine(self):
         self.login_manager()
         threading.Thread(target=self.session_watchdog_loop, daemon=True).start()
-        threading.Thread(target=self.start_1sec_flush_and_purge_loop, daemon=True).start()
+        # Removed flush_and_purge_loop entirely
         self.start_websocket()
 
 engine = MunhTitanEngine()
