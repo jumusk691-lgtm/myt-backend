@@ -20,8 +20,7 @@ CLIENT_CODE = "S52638556"
 MPIN = "0000"
 TOTP_STR = "XFTXZ2445N4V2UMB7EWUCBDRMU"
 
-# Permanent Indices (Nifty 50, Bank Nifty - NSE)
-# Token 26000 = Nifty, 26009 = BankNifty
+# Permanent Indices
 PERMANENT_TOKENS = [{"exchangeType": 1, "tokens": ["26000", "26009"]}]
 
 # ==========================================================
@@ -32,7 +31,7 @@ flask_app = Flask(__name__)
 wsgi_app = socketio.WSGIApp(sio, flask_app)
 
 # ==========================================================
-# ⚡ TITAN ENGINE (ZERO-LATENCY / FIREHOSE MODE)
+# ⚡ TITAN ENGINE (DEBUG-ENABLED MODE)
 # ==========================================================
 class MunhTitanEngine:
     def __init__(self):
@@ -42,7 +41,7 @@ class MunhTitanEngine:
         self.jwt_token = None
         self.feed_token = None
         self.is_ws_connected = False
-        self.active_subscriptions = {} # Stores {token: exchange}
+        self.active_subscriptions = {} 
 
     def login_manager(self):
         try:
@@ -52,32 +51,43 @@ class MunhTitanEngine:
                 self.jwt_token = data['data']['jwtToken']
                 self.feed_token = data['data']['feedToken']
                 self.obj.setAccessToken(self.jwt_token)
+                print("✅ Session Generated Successfully")
                 return True
+            else:
+                print(f"❌ Login Error: {data}")
+                return False
         except Exception as e:
-            print(f"❌ Login Failed: {e}")
+            print(f"❌ Login Exception: {e}")
             return False
 
     def on_data(self, wsapp, msg):
-        """⚡ PURE FIREHOSE: Instant Pass-through"""
+        """⚡ FIREHOSE: Instant Pass-through with Debug"""
         try:
             data = msg if isinstance(msg, list) else [msg]
             for tick in data:
                 tk = str(tick.get('token') or tick.get('tk'))
                 lp = tick.get('last_traded_price') or tick.get('lp')
+                
+                # Debug: Print first few ticks to see if data is arriving
+                # print(f"DEBUG: Received Tick - Token: {tk}, Price: {lp}") 
+                
                 if tk and lp:
-                    # No processing, just emit
                     price_val = int(round(float(lp) / 100.0 * 100.0))
                     sio.emit('live_data', struct.pack('>ii', int(tk), price_val))
-        except: pass
+        except Exception as e:
+            print(f"❌ Data Error: {e}")
 
     def resubscribe_all(self):
-        """Subscribe Permanent Indices + Current Watchlist"""
+        """Subscribe Permanent Indices + Watchlist with Logs"""
         if not self.sws or not self.is_ws_connected: return
         
-        # 1. Subscribe Permanent Indices
-        self.sws.subscribe("munh_batch", 1, PERMANENT_TOKENS)
+        print("🔄 Resubscribing all tokens...")
         
-        # 2. Subscribe User Watchlist
+        # 1. Permanent Indices
+        self.sws.subscribe("munh_batch", 1, PERMANENT_TOKENS)
+        print(f"✅ Subscribed Indices: {PERMANENT_TOKENS}")
+        
+        # 2. Watchlist
         grouped = {}
         for token, exch in self.active_subscriptions.items():
             if exch not in grouped: grouped[exch] = []
@@ -85,33 +95,40 @@ class MunhTitanEngine:
         
         for exch, tokens in grouped.items():
             self.sws.subscribe("munh_batch", 1, [{"exchangeType": exch, "tokens": tokens}])
+            print(f"✅ Subscribed Watchlist Tokens: {tokens} for Exchange: {exch}")
 
     def process_incoming_ui_payload(self, data):
         try:
             payload = json.loads(data) if isinstance(data, str) else data
             action = payload.get("action", "sub")
             token = str(payload.get("token", "")).strip()
-            # Expecting APK to send exchange correctly
             exch = int(payload.get("exchange", 1)) 
 
             if action == "sub" and token:
                 self.active_subscriptions[token] = exch
                 if self.sws and self.is_ws_connected:
                     self.sws.subscribe("munh_batch", 1, [{"exchangeType": exch, "tokens": [token]}])
+                    print(f"➕ Added & Subscribed: {token}")
             elif action == "unsub" and token:
                 self.active_subscriptions.pop(token, None)
-        except: pass
+                print(f"➖ Unsubscribed: {token}")
+        except Exception as e:
+            print(f"❌ Payload Error: {e}")
 
     def start_websocket(self):
-        if not self.login_manager(): return
+        if not self.login_manager(): 
+            threading.Timer(5.0, self.start_websocket).start()
+            return
+            
         try:
             self.sws = SmartWebSocketV2(self.jwt_token, API_KEY, CLIENT_CODE, self.feed_token)
             self.sws.on_data = self.on_data
-            self.sws.on_open = lambda ws: [setattr(self, 'is_ws_connected', True), self.resubscribe_all()]
-            self.sws.on_close = lambda ws, c, m: setattr(self, 'is_ws_connected', False)
-            self.sws.on_error = lambda ws, e: setattr(self, 'is_ws_connected', False)
+            self.sws.on_open = lambda ws: [setattr(self, 'is_ws_connected', True), print("🌐 WebSocket Opened"), self.resubscribe_all()]
+            self.sws.on_close = lambda ws, c, m: [setattr(self, 'is_ws_connected', False), print("⚠️ WebSocket Closed")]
+            self.sws.on_error = lambda ws, e: [setattr(self, 'is_ws_connected', False), print(f"❌ WebSocket Error: {e}")]
             threading.Thread(target=self.sws.connect, daemon=True).start()
-        except:
+        except Exception as e:
+            print(f"❌ Start WS Error: {e}")
             threading.Timer(5.0, self.start_websocket).start()
 
     def start_engine(self):
