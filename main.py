@@ -30,7 +30,7 @@ LTP_LAST_UPDATE_TIME = {}    # रैम क्लीनर के लिए ट
 SUBSCRIBED_TOKENS_REGISTRY = set() # एक्टिवली ट्रैक्ड टोकन्स की लिस्ट (रीकनेक्शन के लिए)
 
 # भाई के रिक्वेस्ट के मुताबिक स्कोर ट्रैकिंग वेरिएबल
-USER_SCORE = 0 [cite: 2026-01-14]
+USER_SCORE = 0
 
 # JWT टोकन मैनेजमेंट
 JWT_SECRET = "MUNH_TITAN_SUPER_SECRET_KEY_2026"
