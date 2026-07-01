@@ -112,10 +112,10 @@ class MunhTitanEngine:
         self.token_exchange_cache[self.REQ_SENSEX_TOKEN] = "BSE"
 
         # 🔥 SMART 1-SECOND BATCH & STORAGE PURGE MATRIX
-        self.buffered_ticks = {}        
+        self.buffered_ticks = {}        # Structure: {token: (price_str, timestamp)}
         self.buffer_lock = threading.Lock()
-        self.BATCH_WINDOW_SECONDS = 1.0  
-        self.DATA_PURGE_SECONDS = 60.0   
+        self.BATCH_WINDOW_SECONDS = 1.0  # Exactly 1 Second Batching Interval
+        self.DATA_PURGE_SECONDS = 60.0   # Clear data older than 1 minute
 
     def login_manager(self):
         with self.session_lock:
@@ -138,17 +138,13 @@ class MunhTitanEngine:
                     self.obj.setAccessToken(self.jwt_token)
                     print("🔑 [Login Manager]: Session Generated Successfully.")
                     return True
-                else:
-                    print(f"❌ [Login Manager]: Login Failed. Message: {data.get('message')}")
-                    return False
-            except Exception as e:
-                print(f"⚠️ [Login Manager]: Error generating session -> {e}")
+            except Exception:
                 time.sleep(5)
                 return False
 
     def session_watchdog_loop(self):
         while self.is_running:
-            time.sleep(300) # Har 5 minute me check karega
+            time.sleep(300) 
             if not self.is_running: 
                 break
             if MANUAL_JWT_TOKEN != "": 
@@ -156,43 +152,30 @@ class MunhTitanEngine:
             
             try:
                 now_dt = datetime.now()
-                # Subah 8:15 baje daily reset
                 if now_dt.hour == 8 and now_dt.minute >= 15 and self.last_daily_reset_date != now_dt.strftime("%Y-%m-%d"):
                     self.is_refreshing_session = True
                     if self.login_manager(): 
                         self.last_daily_reset_date = now_dt.strftime("%Y-%m-%d")
-                        self.restart_websocket_with_new_token()
+                        if self.sws and self.is_ws_connected: 
+                            threading.Thread(target=self.trigger_smart_resubscription, daemon=True).start()
                     self.is_refreshing_session = False
                     continue
                 
-                # Agar WebSocket disconnect ho gaya hai ya token verify karna hai
-                if self.obj and self.jwt_token and not self.is_refreshing_session:
+                if self.obj and self.jwt_token and not self.is_refreshing_session and not self.is_ws_connected:
                     token_to_verify = self.refresh_token if self.refresh_token else ""
                     profile_res = self.obj.getProfile(token_to_verify)
                     
-                    # Agar Token Expire ho gaya (AG8001 Error)
                     if not profile_res or not profile_res.get("status") or profile_res.get("errorCode") == "AG8001":
-                        print("🔄 [Watchdog]: Token Expired (AG8001) ya Invalid. Naya Token laa raha hu...")
                         self.is_refreshing_session = True
                         if self.login_manager():
-                            self.restart_websocket_with_new_token()
+                            if self.sws and self.is_ws_connected: 
+                                threading.Thread(target=self.trigger_smart_resubscription, daemon=True).start()
                         self.is_refreshing_session = False
-            except Exception as e: 
-                print(f"⚠️ [Watchdog Error]: {e}")
-
-    def restart_websocket_with_new_token(self):
-        """🔥 FIX: Naya token milne ke baad purana websocket band karke naya chalu karega"""
-        print("🔌 [WebSocket Engine]: Purana connection disconnect kar raha hu naye tokens ke liye...")
-        try:
-            if self.sws:
-                self.sws.close()
-        except Exception:
-            pass
-        self.is_ws_connected = False
-        self.start_websocket()
+            except Exception: 
+                pass
 
     def send_batch_binary_to_apk(self, updates_list):
-        """🔥 PURE BATCH BINARY PACKET EMITTER"""
+        """🔥 PURE BATCH BINARY PACKET EMITTER (Combines multiple symbols into one single chunk)"""
         if not updates_list:
             return
         try:
@@ -208,18 +191,20 @@ class MunhTitanEngine:
                 else:
                     price_int = int(round(raw_float * 100.0))
                     
+                # 8 Bytes block append (4 bytes Token + 4 bytes Price) Big-Endian
                 batch_buffer.extend(struct.pack('>ii', token_int, price_int))
                 symbols_counted += 1
                 
             if batch_buffer:
                 sio.emit('live_data', bytes(batch_buffer))
-                # print(f"⚡ [Batch Emit]: Sent {symbols_counted} symbols simultaneously!") # Uncomment for heavy logging
+                print(f"⚡ [Batch Emit]: Sent {symbols_counted} symbols simultaneously in a single 1-second binary chunk!")
         except Exception: 
             pass
 
     def add_tick_to_batch_buffer(self, token, price_str):
-        """🔥 RAM STABILIZED BUFFER CONTROL"""
+        """🔥 RAM STABILIZED BUFFER CONTROL (Saves inside volatile memory with time logs)"""
         with self.buffer_lock:
+            # Overwrite/Add token with current timestamp
             self.buffered_ticks[token] = (price_str, time.time())
 
     def start_1sec_flush_and_purge_loop(self):
@@ -232,15 +217,20 @@ class MunhTitanEngine:
             expired_tokens = []
             
             with self.buffer_lock:
+                # 1. Prepare current batch to transmit
                 for token, (price_str, ts) in list(self.buffered_ticks.items()):
                     updates_to_send.append((token, price_str))
+                    
+                    # 2. Check if data timestamp is older than 60 seconds to clear storage
                     if current_time - ts > self.DATA_PURGE_SECONDS:
                         expired_tokens.append(token)
                 
+                # 3. Clean up expired elements to keep storage empty
                 for token in expired_tokens:
                     if token in self.buffered_ticks:
                         del self.buffered_ticks[token]
                         
+            # Emit batch to APK instantly
             if updates_to_send:
                 self.send_batch_binary_to_apk(updates_to_send)
 
@@ -262,8 +252,14 @@ class MunhTitanEngine:
             if grouped_subs and self.sws and self.is_ws_connected:
                 sub_params = [{"exchangeType": k, "tokens": v} for k, v in grouped_subs.items()]
                 self.sws.subscribe("munh_batch", 1, sub_params)
-                print(f"📡 [Re-Subscription]: {len(self.active_subscribed_tokens)} tokens subscribed on new session.")
                 
+                # Resubscription cache sync in batch
+                sync_updates = []
+                for t in self.active_subscribed_tokens:
+                    if t in self.last_known_prices:
+                        sync_updates.append((t, self.last_known_prices[t]))
+                if sync_updates:
+                    self.send_batch_binary_to_apk(sync_updates)
         except Exception: 
             pass
 
@@ -279,21 +275,26 @@ class MunhTitanEngine:
             input_tokens = payload.get("tokens", [])
             tokens_to_process = []
 
+            # 🔥 AUTO DETECT EXCHANGE FROM PYTHON SIDE (No APK reliance)
             if isinstance(input_tokens, list):
                 for item in input_tokens:
                     token_str = str(item).strip()
                     if token_str and token_str != "None":
                         detected_exch = self.detect_exchange_by_token(token_str)
                         tokens_to_process.append((token_str, detected_exch))
-                        if action == "sub": self.active_subscribed_tokens.add(token_str)
-                        elif action == "unsub" and token_str in self.active_subscribed_tokens: self.active_subscribed_tokens.remove(token_str)
+                        if action == "sub" and token_str not in self.active_subscribed_tokens:
+                            self.active_subscribed_tokens.add(token_str)
+                        elif action == "unsub" and token_str in self.active_subscribed_tokens:
+                            self.active_subscribed_tokens.remove(token_str)
             else:
                 token_str = str(input_tokens).strip()
                 if token_str and token_str != "None":
                     detected_exch = self.detect_exchange_by_token(token_str)
                     tokens_to_process.append((token_str, detected_exch))
-                    if action == "sub": self.active_subscribed_tokens.add(token_str)
-                    elif action == "unsub" and token_str in self.active_subscribed_tokens: self.active_subscribed_tokens.remove(token_str)
+                    if action == "sub" and token_str not in self.active_subscribed_tokens:
+                        self.active_subscribed_tokens.add(token_str)
+                    elif action == "unsub" and token_str in self.active_subscribed_tokens:
+                        self.active_subscribed_tokens.remove(token_str)
 
             if not tokens_to_process: 
                 return
@@ -303,19 +304,29 @@ class MunhTitanEngine:
                 for token, exch in tokens_to_process:
                     self.token_exchange_cache[token] = exch
                     exch_type = self.exchange_map.get(exch, nse)
-                    if exch_type not in seg_groups: seg_groups[exch_type] = []
+                    if exch_type not in seg_groups:
+                        seg_groups[exch_type] = []
                     seg_groups[exch_type].append(token)
 
                 if self.sws and self.is_ws_connected:
                     sub_params = [{"exchangeType": exch_type, "tokens": tokens} for exch_type, tokens in seg_groups.items()]
                     self.sws.subscribe("munh_batch", 1, sub_params)
+                    
+                    immediate_updates = []
+                    for token, _ in tokens_to_process:
+                        if token in self.last_known_prices:
+                            immediate_updates.append((token, self.last_known_prices[token]))
+                    if immediate_updates:
+                        self.send_batch_binary_to_apk(immediate_updates)
                             
             elif action == "unsub":
                 seg_unsub_groups = {}
                 for token, exch in tokens_to_process:
-                    if token in self.token_exchange_cache: del self.token_exchange_cache[token]
+                    if token in self.token_exchange_cache:
+                        del self.token_exchange_cache[token]
                     exch_type = self.exchange_map.get(exch, nse)
-                    if exch_type not in seg_unsub_groups: seg_unsub_groups[exch_type] = []
+                    if exch_type not in seg_unsub_groups:
+                        seg_unsub_groups[exch_type] = []
                     seg_unsub_groups[exch_type].append(token)
                     
                 if self.sws and self.is_ws_connected and seg_unsub_groups:
@@ -330,18 +341,24 @@ class MunhTitanEngine:
         symbol = str(symbol).upper()
         token_str = str(token).strip()
         
-        if token_str == self.REQ_NIFTY_TOKEN: return "NSE"
-        if token_str == self.REQ_SENSEX_TOKEN: return "BSE"
+        if token_str == self.REQ_NIFTY_TOKEN:
+            return "NSE"
+        if token_str == self.REQ_SENSEX_TOKEN:
+            return "BSE"
             
-        if "GOLD" in symbol or "SILVER" in symbol or "CRUDEOIL" in symbol or "COPPER" in symbol: return "MCX"
+        if "GOLD" in symbol or "SILVER" in symbol or "CRUDEOIL" in symbol or "COPPER" in symbol:
+            return "MCX"
         if "NIFTY" in symbol or "BANKNIFTY" in symbol:
             return "NFO" if ("CE" in symbol or "PE" in symbol or "FUT" in symbol) else "NSE"
         
         try:
             token_int = int(token_str)
-            if 10000 <= token_int <= 90000: return "NFO"
-            if token_int >= 210000: return "MCX"
-            if 500000 <= token_int <= 600000: return "BSE"
+            if 10000 <= token_int <= 90000:
+                return "NFO"
+            if token_int >= 210000:
+                return "MCX"
+            if 500000 <= token_int <= 600000:
+                return "BSE"
         except ValueError:
             pass
         return "NSE" 
@@ -361,7 +378,7 @@ class MunhTitanEngine:
                             t_str = str(t_)
                             f_price = "{:.2f}".format(float(l_) / 100.0)
                             self.last_known_prices[t_str] = f_price
-                            # 🔥 Buffer me add kar rahe hain (Har 1 sec me APK ko bhejega)
+                            # 🔥 Add to 1-second batch queue buffer
                             self.add_tick_to_batch_buffer(t_str, f_price)
                             
             elif isinstance(msg, dict):
@@ -371,6 +388,7 @@ class MunhTitanEngine:
                     token_str = str(token)
                     formatted_price = "{:.2f}".format(float(lp) / 100.0)
                     self.last_known_prices[token_str] = formatted_price
+                    # 🔥 Add to 1-second batch queue buffer
                     self.add_tick_to_batch_buffer(token_str, formatted_price)
 
         except Exception:
@@ -378,13 +396,11 @@ class MunhTitanEngine:
 
     def on_close(self, wsapp, close_status_code, close_msg):
         self.is_ws_connected = False
-        print("🔴 [WebSocket Engine]: Connection Closed. Attempting reconnect...")
         if self.is_running: 
             threading.Timer(5.0, self.start_websocket).start()
 
     def on_error(self, wsapp, error): 
         self.is_ws_connected = False
-        print(f"⚠️ [WebSocket Engine]: Error Occurred -> {error}")
 
     def start_websocket(self):
         if not self.is_running: 
@@ -394,7 +410,6 @@ class MunhTitanEngine:
             
         if self.jwt_token:
             try:
-                # 🚀 Yahan humesha LATEST tokens inject honge!
                 self.sws = SmartWebSocketV2(self.jwt_token, API_KEY, CLIENT_CODE, self.feed_token)
                 self.sws.on_data = self.on_data
                 
@@ -407,18 +422,16 @@ class MunhTitanEngine:
                 self.sws.on_close = self.on_close
                 self.sws.on_error = self.on_error
                 threading.Thread(target=self.sws.connect, daemon=True).start()
-            except Exception as e:
-                print(f"⚠️ [WebSocket Engine]: Start Error -> {e}")
+            except Exception:
                 threading.Timer(5.0, self.start_websocket).start()
 
     def start_engine(self):
         print("⚙️ [Core Engine]: Booting up Munh Titan System...")
         while not self.login_manager(): 
             time.sleep(5)
-        
         threading.Thread(target=self.session_watchdog_loop, daemon=True).start()
+        # 🔥 Trigger background Flush & Purge loop
         threading.Thread(target=self.start_1sec_flush_and_purge_loop, daemon=True).start()
-        
         self.start_websocket()
 
 engine = MunhTitanEngine()
@@ -426,7 +439,7 @@ engine = MunhTitanEngine()
 @sio.event
 def connect(sid, environ): 
     connected_clients.add(sid)
-    print(f"🟢 [Client Connected to APK]: SID -> {sid}")
+    print(f"🟢 [Client Connected]: SID -> {sid}")
 
 @sio.event
 def subscribe_request(sid, data): 
@@ -436,7 +449,6 @@ def subscribe_request(sid, data):
 def disconnect(sid): 
     if sid in connected_clients: 
         connected_clients.remove(sid)
-    print(f"🔴 [Client Disconnected]: SID -> {sid}")
 
 @flask_app.route('/')
 def health_check(): 
@@ -444,7 +456,6 @@ def health_check():
 
 @flask_app.route('/register', methods=['GET', 'POST'])
 def register():
-    # 🔗 Logic: Register request seedha Sign page par redirect hogi
     return redirect(url_for('sign_page'))
 
 @flask_app.route('/sign', methods=['GET'])
@@ -462,5 +473,4 @@ if __name__ == "__main__":
     threading.Thread(target=engine.start_engine, daemon=True).start()
     
     port = int(os.environ.get('PORT', 5000))
-    print(f"🚀 [Server]: Starting SocketIO & Flask on port {port}")
     eventlet.wsgi.server(eventlet.listen(('0.0.0.0', port)), wsgi_app, log_output=False)
