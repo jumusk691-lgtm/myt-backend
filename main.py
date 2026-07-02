@@ -27,7 +27,18 @@ TOTP_STR = "XFTXZ2445N4V2UMB7EWUCBDRMU"
 # --- 🚀 GLOBAL REALTIME STATES & CACHE ---
 LTP_CACHE = {}               # केवल असली लाइव मार्केट प्राइस यहाँ स्टोर होंगे
 LTP_LAST_UPDATE_TIME = {}    # रैम क्लीनर के लिए टाइमस्टैम्प ट्रैकिंग
-SUBSCRIBED_TOKENS_REGISTRY = set() # एक्टिवली ट्रैक्ड टोकन्स की लिस्ट (रीकनेक्शन के लिए)
+
+# 💡 FIX: अब यह डिक्शनरी है ताकि एक्सचेंज कोड के साथ टोकन याद रख सके (रीकनेक्शन के लिए)
+SUBSCRIBED_TOKENS_REGISTRY = {
+    1: set(), # NSE
+    2: set(), # NFO
+    3: set(), # BSE
+    4: set(), # BFO
+    5: set()  # MCX
+}
+
+# 💡 FIX: सॉकेट का रियल-टाइम स्टेट ट्रैक करने के लिए फ्लैग
+BROKER_SOCKET_CONNECTED = False
 
 # भाई के रिक्वेस्ट के मुताबिक स्कोर ट्रैकिंग वेरिएबल
 USER_SCORE = 0
@@ -67,17 +78,27 @@ def generate_new_jwt_session():
         "iat": datetime.datetime.utcnow()
     }
     token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-    USER_SCORE += 15 # स्कोर में लॉजिक के अनुसार बढ़ोतरी [cite: 2026-01-14]
+    USER_SCORE += 15 # स्कोर में लॉजिक के अनुसार बढ़ोतरी
     logger.info(f"New App JWT Token Created. Current Code Score: {USER_SCORE}")
     return token
+
+def force_broker_socket_restart():
+    """री-लॉगिन के बाद नए टोकन के साथ वेबसॉकेट को रिफ्रेश करने का लॉजिक"""
+    global sws_client, BROKER_SOCKET_CONNECTED
+    logger.info("🔄 Forcing WebSocket restart with fresh broker tokens...")
+    if sws_client and BROKER_SOCKET_CONNECTED:
+        try:
+            sws_client.close() # यह क्लोज़ इवेंट ट्रिगर करेगा, जो ऑटो-रीकनेक्ट को चालू कर देगा
+        except Exception as e:
+            logger.error(f"Error while forcing socket close: {e}")
 
 async def broker_auto_login_task():
     """pyotp का उपयोग करके ऑटोमैटिक असली एंजेल वन सेशन लॉगिन और रिफ्रेश लॉजिक"""
     global BROKER_JWT_TOKEN, BROKER_FEED_TOKEN, LAST_BROKER_LOGIN_TIME
     while True:
         current_time = time.time()
-        # अगर पहला रन है या 24 घंटे बीत चुके हैं, तो रियल लॉगिन ट्रिगर करो
-        if current_time - LAST_BROKER_LOGIN_TIME >= 86400 or LAST_BROKER_LOGIN_TIME == 0:
+        # 💡 FIX: हर 12 घंटे (43200 सेकंड) में नया सेशन लाओ ताकि कभी एक्सपायर ना हो
+        if current_time - LAST_BROKER_LOGIN_TIME >= 43200 or LAST_BROKER_LOGIN_TIME == 0:
             logger.info("🔄 Initiating Real-time Angel One Login with TOTP Engine...")
             try:
                 # pyotp की मदद से लाइव TOTP जेनरेट करें
@@ -97,9 +118,8 @@ async def broker_auto_login_task():
                     logger.info("✅ [Login Manager]: Angel One Real Session Generated Successfully.")
                     generate_new_jwt_session()
                     
-                    # अगर लॉगिन रिफ्रेश हुआ है और पुराना क्लाइंट एक्टिव है, तो उसे अपडेट करें
-                    if sws_client:
-                        logger.info("🔄 Updating active live socket stream tokens...")
+                    # अगर लॉगिन रिफ्रेश हुआ है, तो सॉकेट को नए टोकन के साथ रिबूट करो
+                    force_broker_socket_restart()
                 else:
                     logger.error(f"❌ Broker Login Failed! Response Message: {session_data.get('message')}")
             
@@ -134,7 +154,7 @@ async def ram_cleaner_task():
 
 # --- 🔇 LOGIC: ANTI-SLEEP MODE (SILENT MP3 & SELF PING) ---
 async def serve_silent_mp3(request):
-    """रेंडर को लाइव रखने के लिए 1 सेकंड का साइलेंट बाइटस्ट्रीम"""
+    """रेंडर को लाइव रखने के लिए 1 सेकंड का साइलेंट बाइटस्ट्रीम (24 Hour Uptime)"""
     silent_mp3_bytes = b'\xff\xfb\x90\x44\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
     return web.Response(body=silent_mp3_bytes, content_type="audio/mpeg")
 
@@ -151,6 +171,7 @@ async def render_self_ping_task():
         except Exception as e:
             logger.warning(f"Self-ping warning (Server initializing): {e}")
         
+        # हर 10 मिनट में पिंग करेगा
         await asyncio.sleep(600)
 
 # --- 🔌 SOCKET.IO EVENTS (REALTIME INCOMING / OUTGOING) ---
@@ -169,26 +190,22 @@ async def subscribe_request(sid, data):
     एंड्रॉइड ऐप से आने वाले रियल रिक्वेस्ट हैंडलर।
     एक्सचेंज टाइप (1-5) को पहचान कर एंजेल वन लाइव स्ट्रीम पर टोकन रजिस्टर करेगा।
     """
-    global sws_client
+    global sws_client, BROKER_SOCKET_CONNECTED
     try:
         if isinstance(data, str):
             payload = json.loads(data)
         else:
             payload = data
 
-        action = payload.get("action", "")       # 'sub' या 'unsub'
-        exchange_code = payload.get("exchange")   # न्यूमेरिक कोड (1, 2, 3, 4, 5) [cite: 2026-01-11]
-        tokens_list = payload.get("tokens", [])   # टोकन्स का एरे
+        action = payload.get("action", "")       
+        exchange_code = payload.get("exchange")   
+        tokens_list = payload.get("tokens", [])   
 
-        if not isinstance(exchange_code, int):
-            logger.error(f"❌ Invalid Exchange Format! Must be Integer. Got: {exchange_code}")
+        if not isinstance(exchange_code, int) or exchange_code not in SUBSCRIBED_TOKENS_REGISTRY:
+            logger.error(f"❌ Invalid Exchange Format! Must be valid Integer. Got: {exchange_code}")
             return
 
         exchange_name = EXCHANGE_MAPPING.get(exchange_code, "UNKNOWN")
-        if exchange_name == "UNKNOWN":
-            logger.error(f"⚠️ Exchange Code [{exchange_code}] Not Recognized by Munh Engine!")
-            return
-        
         logger.info(f"🎯 Recognized Exchange Request for [{exchange_name}] (Code: {exchange_code})")
 
         if action == "sub":
@@ -210,30 +227,34 @@ async def subscribe_request(sid, data):
                     }
                     await sio.emit("live_data", immediate_response, room=sid)
 
-                if str_token not in SUBSCRIBED_TOKENS_REGISTRY:
-                    SUBSCRIBED_TOKENS_REGISTRY.add(str_token)
+                # 💡 FIX: टोकन को सही एक्सचेंज कोड के सेट में रजिस्टर करें
+                if str_token not in SUBSCRIBED_TOKENS_REGISTRY[exchange_code]:
+                    SUBSCRIBED_TOKENS_REGISTRY[exchange_code].add(str_token)
                     tokens_to_subscribe_on_broker.append(str_token)
 
-            # 3️⃣ असली एंजेल वन वेबसॉकेट पर सब्सक्राइब रिक्वेस्ट फॉरवर्ड करें
-            if tokens_to_subscribe_on_broker and sws_client:
-                correlation_id = "munh_titan_live"
-                # mode=1 का मतलब है LTP फीड (मैक्सिमम परफॉरमेंस के लिए)
-                payload_broker = [
-                    {"exchangeType": exchange_code, "tokens": tokens_to_subscribe_on_broker}
-                ]
-                sws_client.subscribe(correlation_id, 1, payload_broker)
-                logger.info(f"📡 Real-time Subscription sent to Angel One for Tokens: {tokens_to_subscribe_on_broker}")
+            # 3️⃣ 💡 FIX: केवल तभी रिक्वेस्ट भेजें जब कनेक्शन एक्टिव हो
+            if tokens_to_subscribe_on_broker:
+                if BROKER_SOCKET_CONNECTED and sws_client:
+                    correlation_id = "munh_titan_live"
+                    payload_broker = [
+                        {"exchangeType": exchange_code, "tokens": tokens_to_subscribe_on_broker}
+                    ]
+                    sws_client.subscribe(correlation_id, 1, payload_broker)
+                    logger.info(f"📡 Real-time Subscription sent to Angel One for Tokens: {tokens_to_subscribe_on_broker}")
+                else:
+                    logger.warning(f"⏳ Broker socket not connected yet! Added {len(tokens_to_subscribe_on_broker)} tokens to registry for auto-subscribe once connection opens.")
 
         elif action == "unsub":
             tokens_to_unsubscribe = []
             for token in tokens_list:
                 str_token = str(token)
                 await sio.leave_room(sid, str_token)
-                if str_token in SUBSCRIBED_TOKENS_REGISTRY:
-                    SUBSCRIBED_TOKENS_REGISTRY.remove(str_token)
+                # 💡 FIX: सही एक्सचेंज कोड से अन-सब्सक्राइब करें
+                if str_token in SUBSCRIBED_TOKENS_REGISTRY[exchange_code]:
+                    SUBSCRIBED_TOKENS_REGISTRY[exchange_code].remove(str_token)
                     tokens_to_unsubscribe.append(str_token)
             
-            if tokens_to_unsubscribe and sws_client:
+            if tokens_to_unsubscribe and BROKER_SOCKET_CONNECTED and sws_client:
                 sws_client.unsubscribe("munh_titan_live", 1, [{"exchangeType": exchange_code, "tokens": tokens_to_unsubscribe}])
                 logger.info(f"🚫 Unsubscribed Real-Tokens from Stream: {tokens_to_unsubscribe}")
 
@@ -245,54 +266,71 @@ async def subscribe_request(sid, data):
 def on_data_received(wsapp, message):
     """
     एंजेल वन से आने वाला असली लाइव मार्केट डेटा का कोर कॉलबैक।
-    यहाँ कोई फेक जनरेशन नहीं है। सीधा रियल-टाइम टिक रूम में ब्लास्ट होगा!
     """
     global main_loop
     try:
         tick_data = json.loads(message) if isinstance(message, str) else message
 
-        # एंजेल वन API कॉन्ट्रैक्ट के मुताबिक टोकन और प्राइस एक्सट्रैक्ट करें
         token_str = str(tick_data.get("token", tick_data.get("t", "")))
         raw_ltp = tick_data.get("last_traded_price", tick_data.get("ltp", ""))
 
         if token_str and raw_ltp:
-            # अगर भाव पैसे (paise) में आ रहा है, तो उसे रुपये में कन्वर्ट करें
             if isinstance(raw_ltp, int) or isinstance(raw_ltp, float):
                 price_str = f"{float(raw_ltp) / 100:.2f}" if isinstance(raw_ltp, int) and raw_ltp > 100000 else f"{float(raw_ltp):.2f}"
             else:
                 price_str = str(raw_ltp)
 
-            # लाइव रैम कैश को तुरंत अपडेट करें
             LTP_CACHE[token_str] = price_str
             LTP_LAST_UPDATE_TIME[token_str] = time.time()
 
-            # एंड्रॉइड ऐप के लिए परफेक्ट पैकेट
             outgoing_packet = {
                 "t": token_str,
                 "ltp": price_str
             }
 
-            # ⚡ मुख्य एसिंक थ्रेड लूप के अंदर पैकेट ट्रांसफर करके सीधे रूम में ब्रॉडकास्ट करें
             if main_loop:
                 asyncio.run_coroutine_threadsafe(
                     sio.emit("live_data", outgoing_packet, room=token_str), 
                     main_loop
                 )
     except Exception as e:
-        # क्रैश से बचाने के लिए सेफ हैंडलिंग
         pass
 
 def on_websocket_open(wsapp):
+    global BROKER_SOCKET_CONNECTED, sws_client
+    BROKER_SOCKET_CONNECTED = True
     logger.info("🌐 [WebSocket Opened]: Successfully synced with Angel One Streaming Clusters.")
-    # कनेक्शन कटने के बाद दोबारा जुड़ने पर पुराने रजिस्टर्ड टोकन्स को ऑटो-सब्सक्राइब करना
-    if SUBSCRIBED_TOKENS_REGISTRY and sws_client:
-        logger.info("🔄 Re-subscribing active token registry to the stream...")
+    
+    # 💡 FIX: कनेक्शन खुलने पर रजिस्ट्री से सभी पुराने टोकन्स को फिर से ऑटो-सब्सक्राइब करना
+    if sws_client:
+        for exch_code, tokens_set in SUBSCRIBED_TOKENS_REGISTRY.items():
+            if tokens_set:
+                token_list = list(tokens_set)
+                payload_broker = [{"exchangeType": exch_code, "tokens": token_list}]
+                sws_client.subscribe("munh_titan_live", 1, payload_broker)
+                logger.info(f"🔄 Auto Re-subscribed {len(token_list)} active tokens for Exchange Code: {exch_code}")
 
 def on_websocket_error(wsapp, error):
     logger.error(f"⚠️ [Stream Error]: {error}")
 
 def on_websocket_close(wsapp, close_status_code, close_msg):
-    logger.warning(f"❌ [Stream Disconnected]: Code: {close_status_code} | Msg: {close_msg}. Reconnecting...")
+    global BROKER_SOCKET_CONNECTED, USER_SCORE
+    BROKER_SOCKET_CONNECTED = False
+    logger.warning(f"❌ [Stream Disconnected]: Code: {close_status_code} | Msg: {close_msg}. Reconnecting in 5 seconds...")
+    
+    # 💡 FIX: ऑटो-रीकनेक्ट लॉजिक (बिना थ्रेड ब्लॉक किये बैकग्राउंड में दोबारा जुड़ना)
+    def reconnect_worker():
+        global USER_SCORE
+        time.sleep(5)
+        logger.info("♻️ Attempting Auto-Reconnect to Broker Stream...")
+        if BROKER_JWT_TOKEN and BROKER_FEED_TOKEN:
+            USER_SCORE += 10 # स्कोर अपडेट लॉजिक रीकनेक्ट पर
+            logger.info(f"Auto-reconnect triggered. Code Score increased to: {USER_SCORE}")
+            start_angel_one_websocket_worker(BROKER_JWT_TOKEN, BROKER_FEED_TOKEN)
+        else:
+            logger.error("Cannot auto-reconnect, Broker tokens are missing!")
+            
+    threading.Thread(target=reconnect_worker, daemon=True).start()
 
 # --- 🏗️ REALTIME WEB STREAM WORKER THREAD ---
 def start_angel_one_websocket_worker(auth_token, feed_token):
@@ -306,7 +344,6 @@ def start_angel_one_websocket_worker(auth_token, feed_token):
         feed_token=feed_token
     )
     
-    # कॉलबैक्स बाइंडिंग
     sws_client.on_data = on_data_received
     sws_client.on_open = on_websocket_open
     sws_client.on_error = on_websocket_error
