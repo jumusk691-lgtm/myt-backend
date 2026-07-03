@@ -1,4 +1,3 @@
-# File Name: main.py
 import asyncio
 import json
 import logging
@@ -9,6 +8,7 @@ import jwt
 import socketio
 import pyotp
 from aiohttp import web
+from requests.exceptions import ReadTimeout
 
 from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
@@ -49,6 +49,23 @@ def update_user_score(points):
     USER_SCORE += points
     logger.info(f"📊 Current User Score: {USER_SCORE}")
     return USER_SCORE
+
+# --- 🛡️ ANGEL ONE LOGIN RETRY LOGIC ---
+def login_with_retry(smart_conn, client_code, mpin, totp_val):
+    """Angel One API में 7 सेकंड टाइमआउट को हैंडल करने के लिए रिट्राई लॉजिक"""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            session_data = smart_conn.generateSession(client_code, mpin, totp_val)
+            if session_data and session_data.get('status'):
+                return session_data
+        except ReadTimeout:
+            logger.warning(f"Timeout on login attempt {attempt + 1}. Retrying in 2 seconds...")
+            time.sleep(2)
+        except Exception as e:
+            logger.error(f"Login error on attempt {attempt + 1}: {e}")
+            time.sleep(2)
+    return None
 
 # --- 📡 CORE REALTIME ENGINE ---
 def on_data_received(wsapp, message):
@@ -121,8 +138,11 @@ async def broker_auto_login_task():
             if BROKER_JWT_TOKEN is None or (time.time() - LAST_BROKER_LOGIN_TIME >= 36000):
                 totp_crypto = pyotp.TOTP(TOTP_STR)
                 smart_conn = SmartConnect(api_key=API_KEY)
-                session_data = smart_conn.generateSession(CLIENT_CODE, MPIN, totp_crypto.now())
-                if session_data.get('status'):
+                
+                # नया रिट्राई लॉजिक इस्तेमाल किया गया
+                session_data = login_with_retry(smart_conn, CLIENT_CODE, MPIN, totp_crypto.now())
+                
+                if session_data and session_data.get('status'):
                     BROKER_JWT_TOKEN = session_data['data']['jwtToken']
                     BROKER_FEED_TOKEN = session_data['data']['feedToken']
                     LAST_BROKER_LOGIN_TIME = time.time()
@@ -161,14 +181,18 @@ async def start_background_tasks(app):
     try:
         totp_crypto = pyotp.TOTP(TOTP_STR)
         smart_conn = SmartConnect(api_key=API_KEY)
-        session_data = smart_conn.generateSession(CLIENT_CODE, MPIN, totp_crypto.now())
-        if session_data.get('status'):
+        
+        # नया रिट्राई लॉजिक इस्तेमाल किया गया
+        session_data = login_with_retry(smart_conn, CLIENT_CODE, MPIN, totp_crypto.now())
+        
+        if session_data and session_data.get('status'):
             global BROKER_JWT_TOKEN, BROKER_FEED_TOKEN, LAST_BROKER_LOGIN_TIME
             BROKER_JWT_TOKEN = session_data['data']['jwtToken']
             BROKER_FEED_TOKEN = session_data['data']['feedToken']
             LAST_BROKER_LOGIN_TIME = time.time()
             threading.Thread(target=start_angel_one_websocket_worker, args=(BROKER_JWT_TOKEN, BROKER_FEED_TOKEN), daemon=True).start()
     except: pass
+    
     app['auto_login'] = asyncio.create_task(broker_auto_login_task())
 
 app.on_startup.append(start_background_tasks)
