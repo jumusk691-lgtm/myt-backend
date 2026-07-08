@@ -1,132 +1,102 @@
-import sqlite3, tempfile, requests, os
-from brain import state, logger, SUPABASE_URL, SUPABASE_KEY, BUCKET_NAME, create_client, IST, app, jsonify, request
+import sqlite3
+import tempfile
+import requests
+import os
+import gc
 from datetime import datetime
+from supabase import create_client
+import pyotp  # TOTP के लिए
 
 # ==============================================================================
-# --- MASTER DATA DOWNLOAD & INDEXING (ZERO-RAM OPTIMIZED) ---
+# --- CONFIGURATION (जो तूने दिया था) ---
+# ==============================================================================
+API_KEY = "Z80WG5Sg"
+CLIENT_CODE = "S52638556"
+MPIN = "0000"
+TOTP_STR = "XFTXZ2445N4V2UMB7EWUCBDRMU"
+
+SUPABASE_URL = "https://fnfynhgkdevxytxtfzrk.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZuZnluaGdrZGV2eHl0eHRmenJrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc0OTAwMjgsImV4cCI6MjA5MzA2NjAyOH0.Tgr8kB6KGeAsAbXzH8a2wlLStqMFS3fnFPcowbL4Di8"
+BUCKET_NAME = "myt"
+
+# ==============================================================================
+# --- FULL SYNC LOGIC (.db generation) ---
 # ==============================================================================
 def sync_master_data():
-    """
-    Logic: Same (Mon/Fri Sync). 
-    Update: Added 'Manual GC' and 'Connection Closing' to save RAM.
-    """
-    logger.info("🔄 [Master] Initializing Scrip Master Sync...")
+    print("🔄 [Master] Initializing Angel One Scrip Master Sync...")
     
-    today_day = datetime.now(IST).weekday()
-    
-    # Path setup: Cloudflare environment ke liye temp path
-    if not hasattr(state, 'db_path') or not state.db_path:
-        tmp_dir = tempfile.gettempdir()
-        state.db_path = os.path.join(tmp_dir, "angel_master.db")
-
-    # Sync Day Check (Mon=0, Fri=4)
-    is_sync_day = today_day in [0, 4]
+    # 1. Temporary DB Path (Cloud environments ke liye)
+    tmp_dir = tempfile.gettempdir()
+    db_path = os.path.join(tmp_dir, "angel_master.db")
 
     try:
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        # Angel One से डेटा लाओ
+        master_url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+        response = requests.get(master_url, timeout=60)
         
-        if is_sync_day:
-            logger.info("📅 [Master] Today is Sync Day (Mon/Fri). Downloading fresh data...")
-            master_url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-            response = requests.get(master_url, timeout=60)
+        if response.status_code == 200:
+            json_payload = response.json()
             
-            if response.status_code == 200:
-                json_payload = response.json()
-                
-                # RAM bachaane ke liye Database connection ko local rakha hai
-                conn = sqlite3.connect(state.db_path)
-                cursor = conn.cursor()
-                cursor.execute("PRAGMA journal_mode=OFF") # Cloudflare ke liye OFF mode fast hai
-                cursor.execute("PRAGMA synchronous=OFF")
-                
-                cursor.execute("DROP TABLE IF EXISTS symbols")
-                cursor.execute('''CREATE TABLE symbols (
-                    token TEXT, symbol TEXT, name TEXT, expiry TEXT, 
-                    strike TEXT, lotsize TEXT, instrumenttype TEXT, 
-                    exch_seg TEXT, tick_size TEXT)''')
-                
-                records = [(str(i.get('token')), i.get('symbol'), i.get('name'), i.get('expiry'),
-                            i.get('strike'), i.get('lotsize'), i.get('instrumenttype'),
-                            i.get('exch_seg'), i.get('tick_size'))
-                           for i in json_payload if i.get('token')]
-                
-                # Batch insert (Speed optimized)
-                cursor.executemany("INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?)", records)
-                cursor.execute("CREATE INDEX idx_token_fast ON symbols(token)")
-                cursor.execute("CREATE INDEX idx_name_fast ON symbols(name)")
-                
-                conn.commit()
-                conn.close() # RAM turant free karo
-                
-                # Cloud Backup
-                with open(state.db_path, "rb") as f:
-                    supabase.storage.from_(BUCKET_NAME).upload(
-                        path="angel_master.db", 
-                        file=f.read(),
-                        file_options={"x-upsert": "true"}
-                    )
-                logger.info("✅ [Master] Fresh Sync & Cloud Backup Complete.")
-                del json_payload, records # Memory se hatao
-        else:
-            logger.info("☁️ [Master] Pulling existing DB from Supabase...")
-            try:
-                res = supabase.storage.from_(BUCKET_NAME).download("angel_master.db")
-                with open(state.db_path, "wb") as f:
-                    f.write(res)
-                logger.info("✅ [Master] Existing DB loaded from Cloud.")
-            except Exception as e:
-                logger.error(f"⚠️ [Master] Fallback trigger: {e}")
-                return sync_master_data_forced()
+            # 2. SQLite Database बनाना
+            if os.path.exists(db_path): os.remove(db_path)
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            
+            # Performance Optimization
+            cursor.execute("PRAGMA journal_mode=OFF")
+            cursor.execute("PRAGMA synchronous=OFF")
+            
+            cursor.execute('''CREATE TABLE symbols (
+                token TEXT, symbol TEXT, name TEXT, expiry TEXT, 
+                strike TEXT, lotsize TEXT, instrumenttype TEXT, 
+                exch_seg TEXT, tick_size TEXT)''')
+            
+            # डेटा प्रोसेस करो
+            records = [(str(i.get('token')), i.get('symbol'), i.get('name'), i.get('expiry'),
+                        i.get('strike'), i.get('lotsize'), i.get('instrumenttype'),
+                        i.get('exch_seg'), i.get('tick_size'))
+                       for i in json_payload if i.get('token')]
+            
+            # Batch Insert
+            cursor.executemany("INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?)", records)
+            cursor.execute("CREATE INDEX idx_token_fast ON symbols(token)")
+            cursor.execute("CREATE INDEX idx_name_fast ON symbols(name)")
+            
+            conn.commit()
+            conn.close()
+            print("✅ [Master] SQLite .db file generated locally.")
 
-        state.last_master_update = datetime.now(IST)
-        import gc
-        gc.collect() # 12MB Limit check
-        return True
-
+            # 3. Supabase Cloud Backup
+            supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+            with open(db_path, "rb") as f:
+                supabase.storage.from_(BUCKET_NAME).upload(
+                    path="angel_master.db", 
+                    file=f.read(),
+                    file_options={"x-upsert": "true", "content-type": "application/x-sqlite3"}
+                )
+            print("✅ [Master] Cloud Backup to Supabase Complete.")
+            
+            # Memory Cleanup
+            del json_payload, records
+            gc.collect()
+            return True
+            
     except Exception as e:
-        logger.error(f"❌ [Master] Logic Failed: {e}")
+        print(f"❌ [Master] Sync Failed: {e}")
         return False
 
-def sync_master_data_forced():
-    """Emergency sync logic implementation if needed"""
-    return False
-
 # ==============================================================================
-# --- SEARCH & OPTION CHAIN API (BYPASS OPTIMIZED) ---
+# --- RENDER/SERVER TRIGGER ENDPOINT ---
 # ==============================================================================
-@app.route('/api/search', methods=['POST'])
-def handle_search():
-    """Fast search for symbols (Zero-RAM Leak)"""
-    try:
-        query = request.json.get('query', '').upper()
-        if not os.path.exists(state.db_path): return jsonify({"symbols": []})
-        
-        conn = sqlite3.connect(state.db_path)
-        cursor = conn.cursor()
-        # instrumenttype='' main indices ke liye fast bypass
-        cursor.execute("SELECT DISTINCT name FROM symbols WHERE name LIKE ? AND instrumenttype = '' LIMIT 15", (f'%{query}%',))
-        results = [row[0] for row in cursor.fetchall()]
-        conn.close() # Connection hamesha close karein
-        return jsonify({"symbols": results})
-    except Exception as e: 
-        return jsonify({"symbols": []})
+from fastapi import FastAPI
+app = FastAPI()
 
-@app.route('/api/option_chain', methods=['POST'])
-def get_chain():
-    """Fetches strikes with Batch-ready tokens"""
-    try:
-        d = request.json
-        name, expiry = d.get('name'), d.get('expiry')
-        if not os.path.exists(state.db_path): return jsonify({"status": False})
+@app.get("/trigger-sync")
+def trigger_sync():
+    # Google Script इसे हिट करेगा
+    success = sync_master_data()
+    return {"status": "success" if success else "failed"}
 
-        conn = sqlite3.connect(state.db_path)
-        cursor = conn.cursor()
-        cursor.execute("SELECT strike, token, symbol FROM symbols WHERE name = ? AND expiry = ? ORDER BY CAST(strike AS FLOAT) ASC", (name, expiry))
-        rows = cursor.fetchall()
-        conn.close()
-        
-        chain = [{"strike": r[0], "token": r[1], "symbol": r[2]} for r in rows]
-        return jsonify({"status": True, "chain": chain})
-    except Exception as e:
-        logger.error(f"Option Chain Error: {e}")
-        return jsonify({"status": False})
+# TOTP के लिए फंक्शन (अगर जरूरत पड़े तो)
+def get_totp():
+    return pyotp.TOTP(TOTP_STR).now()
