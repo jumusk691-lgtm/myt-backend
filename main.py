@@ -29,6 +29,20 @@ SUBSCRIBED_TOKENS_REGISTRY = {1: set(), 2: set(), 3: set(), 4: set(), 5: set()}
 BROKER_SOCKET_CONNECTED = False
 USER_SCORE = 0  # भाई का स्कोर ट्रैकिंग वेरिएबल
 
+# --- 📊 CANDLE ENGINE CONFIGURATION (200 CANDLES MAX) ---
+TIMEFRAMES = {
+    "1M": 60,
+    "3M": 180,
+    "5M": 300,
+    "15M": 900,
+    "25M": 1500,
+    "30M": 1800,
+    "1H": 3600,
+    "1D": 86400
+}
+MAX_CANDLES_LIMIT = 200
+CANDLE_CACHE = {}  # Format: { token_str: { tf_key: [ {time, open, high, low, close}, ... ] } }
+
 # JWT Management
 JWT_SECRET = "MUNH_TITAN_SUPER_SECRET_KEY_2026"
 BROKER_JWT_TOKEN = None
@@ -50,6 +64,58 @@ def update_user_score(points):
     logger.info(f"📊 Current User Score: {USER_SCORE}")
     return USER_SCORE
 
+# --- 📈 MULTI-TIMEFRAME CANDLE AGGREGATOR ---
+def update_token_candles(token_str, price_val):
+    """
+    Ticks se real-time 1M, 3M, 5M, 15M, 25M, 30M, 1H, 1D timeframes ki exact 200 candles build karta hai.
+    """
+    if price_val <= 0:
+        return
+
+    now_sec = int(time.time())
+
+    if token_str not in CANDLE_CACHE:
+        CANDLE_CACHE[token_str] = {tf: [] for tf in TIMEFRAMES}
+
+    token_candles = CANDLE_CACHE[token_str]
+
+    for tf_key, interval_sec in TIMEFRAMES.items():
+        tf_list = token_candles[tf_key]
+        bucket_time = (now_sec // interval_sec) * interval_sec
+
+        if not tf_list:
+            # First candle initialization
+            new_candle = {
+                "time": bucket_time,
+                "open": price_val,
+                "high": price_val,
+                "low": price_val,
+                "close": price_val
+            }
+            tf_list.append(new_candle)
+        else:
+            last_candle = tf_list[-1]
+            if bucket_time > last_candle["time"]:
+                # New Candle boundary reached
+                new_candle = {
+                    "time": bucket_time,
+                    "open": last_candle["close"],
+                    "high": max(last_candle["close"], price_val),
+                    "low": min(last_candle["close"], price_val),
+                    "close": price_val
+                }
+                tf_list.append(new_candle)
+                # Keep maximum 200 candles only
+                if len(tf_list) > MAX_CANDLES_LIMIT:
+                    tf_list.pop(0)
+            else:
+                # Update existing candle in real-time
+                last_candle["close"] = price_val
+                if price_val > last_candle["high"]:
+                    last_candle["high"] = price_val
+                if price_val < last_candle["low"]:
+                    last_candle["low"] = price_val
+
 # --- 🛡️ ANGEL ONE LOGIN RETRY LOGIC ---
 def login_with_retry(smart_conn, client_code, mpin, totp_val):
     """Angel One API में 7 सेकंड टाइमआउट को हैंडल करने के लिए रिट्राई लॉजिक"""
@@ -70,7 +136,7 @@ def login_with_retry(smart_conn, client_code, mpin, totp_val):
 # --- 📡 CORE REALTIME ENGINE ---
 def on_data_received(wsapp, message):
     """
-    ULTRA-LOW LATENCY: डेटा आते ही बिना किसी देरी के रूम में एमिट करें।
+    ULTRA-LOW LATENCY: डेटा आते ही P&L/LTP Emit करें और 200 Candles Update करें।
     """
     global main_loop
     try:
@@ -81,14 +147,20 @@ def on_data_received(wsapp, message):
         # प्राइस डिवाइडर (एंजेल वन फॉर्मेट के लिए)
         try:
             val = float(raw_ltp)
-            price_str = f"{val / 100:.2f}"
+            price_val = val / 100 if val > 100000 else val
+            price_str = f"{price_val:.2f}"
         except:
+            price_val = 0.0
             price_str = str(raw_ltp)
 
         # Cache update
         LTP_CACHE[token_str] = price_str
 
-        # 🚀 ZERO DELAY EMIT: सीधा रूम में भेजो, कोई बफरिंग नहीं
+        # Update 200 candles engine across 1M, 3M, 5M, 15M, 25M, 30M, 1H, 1D
+        if price_val > 0:
+            update_token_candles(token_str, price_val)
+
+        # 🚀 ZERO DELAY EMIT: सीधा रूम में भेजो
         if main_loop:
             asyncio.run_coroutine_threadsafe(
                 sio.emit("live_data", {"token": token_str, "ltp": price_str}, room=token_str), 
@@ -115,13 +187,37 @@ async def subscribe_request(sid, data):
                 if str_token in LTP_CACHE:
                     await sio.emit("live_data", {"token": str_token, "ltp": LTP_CACHE[str_token]}, room=sid)
                 
-                if str_token not in SUBSCRIBED_TOKENS_REGISTRY[exchange_code]:
+                if exchange_code in SUBSCRIBED_TOKENS_REGISTRY and str_token not in SUBSCRIBED_TOKENS_REGISTRY[exchange_code]:
                     SUBSCRIBED_TOKENS_REGISTRY[exchange_code].add(str_token)
 
             # Bulk Subscribe to broker
             if BROKER_SOCKET_CONNECTED and sws_client:
                 sws_client.subscribe("munh_titan_live", 1, [{"exchangeType": exchange_code, "tokens": tokens_list}])
     except: pass
+
+@sio.event
+async def get_candles(sid, data):
+    """
+    Android App se request aane par 200 real calculated candles emit karta hai.
+    """
+    try:
+        payload = json.loads(data) if isinstance(data, str) else data
+        token_str = str(payload.get("token", ""))
+        tf_key = str(payload.get("timeframe", "5M")).upper()
+
+        update_user_score(1)
+
+        candles_response = []
+        if token_str in CANDLE_CACHE and tf_key in CANDLE_CACHE[token_str]:
+            candles_response = CANDLE_CACHE[token_str][tf_key]
+
+        await sio.emit("candles_response", {
+            "token": token_str,
+            "timeframe": tf_key,
+            "candles": candles_response
+        }, room=sid)
+    except Exception as e:
+        logger.error(f"Error fetching candles: {e}")
 
 # --- 🛠️ SESSION & CONNECTION HANDLING ---
 def force_broker_socket_restart():
