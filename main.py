@@ -4,6 +4,8 @@ import logging
 import time
 import datetime
 import threading
+import sqlite3
+import gc
 import jwt
 import socketio
 import pyotp
@@ -12,10 +14,10 @@ from requests.exceptions import ReadTimeout
 
 from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
+from brain import state, logger, IST
 
 # --- 📝 LOGGING (MINIMAL TO SAVE CPU CYCLES) ---
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("MUNH_TITAN_REALTIME_PROD")
 
 # --- 🔑 CREDENTIALS ---
 API_KEY = "Z80wG5Sg"
@@ -23,11 +25,11 @@ CLIENT_CODE = "S52638556"
 MPIN = "0000"
 TOTP_STR = "XFTXZ2445N4V2UMB7EWUCBDRMU"
 
-# --- 🚀 GLOBAL STATES ---
+# --- 🚀 GLOBAL STATES & SCORE TRACKING ---
 LTP_CACHE = {}               
 SUBSCRIBED_TOKENS_REGISTRY = {1: set(), 2: set(), 3: set(), 4: set(), 5: set()}
 BROKER_SOCKET_CONNECTED = False
-USER_SCORE = 0  # भाई का स्कोर ट्रैकिंग वेरिएबल
+USER_SCORE = 0  # Bhai ka score tracking variable
 
 # --- 📊 CANDLE ENGINE CONFIGURATION (200 CANDLES MAX) ---
 TIMEFRAMES = {
@@ -52,15 +54,17 @@ LAST_BROKER_LOGIN_TIME = 0
 main_loop = None
 sws_client = None
 
-# Socket.IO Setup
+# Socket.IO & Aiohttp Setup
 sio = socketio.AsyncServer(async_mode='aiohttp', cors_allowed_origins='*')
 app = web.Application()
 sio.attach(app)
 
 # --- 🎯 SCORE LOGIC ---
-def update_user_score(points):
+def update_user_score(points=1):
     global USER_SCORE
     USER_SCORE += points
+    if hasattr(state, 'score'):
+        state.score = USER_SCORE
     logger.info(f"📊 Current User Score: {USER_SCORE}")
     return USER_SCORE
 
@@ -69,7 +73,7 @@ def seed_candles_if_empty(token_str, base_price):
     """
     Server restart hone par agar cache khali ho toh immediate 200 candles seed kar deta hai.
     """
-    if token_str not in CANDLE_CACHE or not CANDLE_CACHE[token_str]["5M"]:
+    if token_str not in CANDLE_CACHE or not CANDLE_CACHE[token_str].get("5M"):
         CANDLE_CACHE[token_str] = {}
         now_sec = int(time.time())
         
@@ -145,6 +149,117 @@ def update_token_candles(token_str, price_val):
                     last_candle["high"] = price_val
                 if price_val < last_candle["low"]:
                     last_candle["low"] = price_val
+
+# ==============================================================================
+# --- 🌐 REST HTTP API ENDPOINTS (AIOHTTP COMPATIBLE) ---
+# ==============================================================================
+
+async def fetch_chart_data(request: web.Request):
+    """
+    Fetches historical candles for APK Charts.
+    Zero-RAM Optimized with Manual GC.
+    """
+    try:
+        d = await request.json()
+        token = str(d.get('token'))
+        exch = d.get('exch', 'NSE')
+        
+        # Interval Validation
+        requested_interval = d.get('interval', "FIVE_MINUTE")
+        valid_intervals = {
+            "ONE_MINUTE": "ONE_MINUTE",
+            "THREE_MINUTE": "THREE_MINUTE",
+            "FIVE_MINUTE": "FIVE_MINUTE",
+            "FIFTEEN_MINUTE": "FIFTEEN_MINUTE",
+            "THIRTY_MINUTE": "THIRTY_MINUTE",
+            "ONE_HOUR": "ONE_HOUR",
+            "ONE_DAY": "ONE_DAY"
+        }
+        interval = valid_intervals.get(requested_interval, "FIVE_MINUTE")
+        
+        # Session check
+        if not state.smart_api:
+            logger.error("❌ [History] SmartApi Session is NULL!")
+            return web.json_response({"status": False, "message": "API Session Expired"})
+
+        # Time Calculation: Strictly Last 10 Days
+        now = datetime.datetime.now(IST)
+        to_date = now.strftime('%Y-%m-%d %H:%M')
+        from_date = (now - datetime.timedelta(days=10)).strftime('%Y-%m-%d %H:%M')
+
+        # AngelOne API Payload
+        params = {
+            "exchange": exch,
+            "symboltoken": token,
+            "interval": interval,
+            "fromdate": from_date,
+            "todate": to_date
+        }
+        
+        logger.info(f"📊 [History] Fetching {interval} for Token: {token}")
+        
+        # API Call
+        historic_data = state.smart_api.getCandleData(params)
+        
+        if historic_data and historic_data.get('status'):
+            # --- SCORE LOGIC ---
+            current_score = update_user_score(1)
+            
+            result = {
+                "status": True,
+                "token": token,
+                "interval": interval,
+                "score": current_score,
+                "data": historic_data.get('data', [])
+            }
+            
+            # --- MEMORY CLEANUP ---
+            del historic_data
+            gc.collect() 
+            
+            return web.json_response(result)
+        else:
+            msg = historic_data.get('message', 'No data from API') if historic_data else 'No data from API'
+            return web.json_response({"status": False, "message": msg})
+
+    except Exception as e:
+        logger.error(f"❌ [History Error]: {e}")
+        return web.json_response({"status": False, "error": str(e)})
+
+async def get_expiry(request: web.Request):
+    """Returns list of expiry dates from SQLite master"""
+    try:
+        d = await request.json()
+        name = d.get('name', '').upper()
+        if not name:
+            return web.json_response({"expiries": [], "status": False})
+
+        if not state.db_path:
+            return web.json_response({"expiries": [], "status": False, "msg": "DB not ready"})
+
+        # Context manager for auto-closing connection
+        with sqlite3.connect(state.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT DISTINCT expiry 
+                FROM symbols 
+                WHERE name = ? AND expiry != '' 
+                ORDER BY expiry ASC
+            """, (name,))
+            exps = [r[0] for r in cursor.fetchall()]
+        
+        return web.json_response({
+            "status": True,
+            "name": name,
+            "expiries": exps
+        })
+    except Exception as e:
+        logger.error(f"❌ [Expiry API Error]: {e}")
+        return web.json_response({"expiries": [], "status": False})
+
+# Register HTTP REST Routes
+app.router.add_post('/api/get_chart_data', fetch_chart_data)
+app.router.add_post('/api/expiry_list', get_expiry)
 
 # --- 🛡️ ANGEL ONE LOGIN RETRY LOGIC ---
 def login_with_retry(smart_conn, client_code, mpin, totp_val):
@@ -264,6 +379,7 @@ async def broker_auto_login_task():
                     BROKER_JWT_TOKEN = session_data['data']['jwtToken']
                     BROKER_FEED_TOKEN = session_data['data']['feedToken']
                     LAST_BROKER_LOGIN_TIME = time.time()
+                    state.smart_api = smart_conn  # Keep state sync
                     force_broker_socket_restart()
         except: pass
         await asyncio.sleep(600)
@@ -304,6 +420,7 @@ async def start_background_tasks(app):
             BROKER_JWT_TOKEN = session_data['data']['jwtToken']
             BROKER_FEED_TOKEN = session_data['data']['feedToken']
             LAST_BROKER_LOGIN_TIME = time.time()
+            state.smart_api = smart_conn
             threading.Thread(target=start_angel_one_websocket_worker, args=(BROKER_JWT_TOKEN, BROKER_FEED_TOKEN), daemon=True).start()
     except: pass
     
