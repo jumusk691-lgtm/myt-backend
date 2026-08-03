@@ -9,15 +9,27 @@ import gc
 import jwt
 import socketio
 import pyotp
+import pytz
 from aiohttp import web
 from requests.exceptions import ReadTimeout
 
 from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
-from brain import state, logger, IST
 
-# --- 📝 LOGGING (MINIMAL TO SAVE CPU CYCLES) ---
+# --- 🕒 TIMEZONE & LOGGING SETUP ---
+IST = pytz.timezone('Asia/Kolkata')
+
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("MUNH_TITAN_REALTIME_PROD")
+
+# --- ⚙️ INTERNAL APP STATE ENGINE ---
+class AppState:
+    def __init__(self):
+        self.smart_api = None
+        self.db_path = "market_data.db"
+        self.score = 0
+
+state = AppState()
 
 # --- 🔑 CREDENTIALS ---
 API_KEY = "Z80wG5Sg"
@@ -63,8 +75,7 @@ sio.attach(app)
 def update_user_score(points=1):
     global USER_SCORE
     USER_SCORE += points
-    if hasattr(state, 'score'):
-        state.score = USER_SCORE
+    state.score = USER_SCORE
     logger.info(f"📊 Current User Score: {USER_SCORE}")
     return USER_SCORE
 
@@ -379,7 +390,7 @@ async def broker_auto_login_task():
                     BROKER_JWT_TOKEN = session_data['data']['jwtToken']
                     BROKER_FEED_TOKEN = session_data['data']['feedToken']
                     LAST_BROKER_LOGIN_TIME = time.time()
-                    state.smart_api = smart_conn  # Keep state sync
+                    state.smart_api = smart_conn
                     force_broker_socket_restart()
         except: pass
         await asyncio.sleep(600)
