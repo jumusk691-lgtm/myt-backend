@@ -64,6 +64,41 @@ def update_user_score(points):
     logger.info(f"📊 Current User Score: {USER_SCORE}")
     return USER_SCORE
 
+# --- 🌱 AUTO-SEED ENGINE (PREVENTS BLANK CHART ON SERVER RESTART) ---
+def seed_candles_if_empty(token_str, base_price):
+    """
+    Server restart hone par agar cache khali ho toh immediate 200 candles seed kar deta hai.
+    """
+    if token_str not in CANDLE_CACHE or not CANDLE_CACHE[token_str]["5M"]:
+        CANDLE_CACHE[token_str] = {}
+        now_sec = int(time.time())
+        
+        for tf_key, interval_sec in TIMEFRAMES.items():
+            tf_candles = []
+            price_tracker = base_price
+            current_bucket = (now_sec // interval_sec) * interval_sec
+            start_bucket = current_bucket - ((MAX_CANDLES_LIMIT - 1) * interval_sec)
+
+            for i in range(MAX_CANDLES_LIMIT):
+                c_time = start_bucket + (i * interval_sec)
+                # Small variance to generate natural chart view
+                delta = ((i % 5) - 2) * (base_price * 0.0005)
+                c_close = round(price_tracker + delta, 2)
+                c_open = round(price_tracker, 2)
+                c_high = round(max(c_open, c_close) + (base_price * 0.0002), 2)
+                c_low = round(min(c_open, c_close) - (base_price * 0.0002), 2)
+
+                tf_candles.append({
+                    "time": c_time,
+                    "open": c_open,
+                    "high": c_high,
+                    "low": c_low,
+                    "close": c_close
+                })
+                price_tracker = c_close
+
+            CANDLE_CACHE[token_str][tf_key] = tf_candles
+
 # --- 📈 MULTI-TIMEFRAME CANDLE AGGREGATOR ---
 def update_token_candles(token_str, price_val):
     """
@@ -72,11 +107,10 @@ def update_token_candles(token_str, price_val):
     if price_val <= 0:
         return
 
+    # Cache Empty Guard
+    seed_candles_if_empty(token_str, price_val)
+
     now_sec = int(time.time())
-
-    if token_str not in CANDLE_CACHE:
-        CANDLE_CACHE[token_str] = {tf: [] for tf in TIMEFRAMES}
-
     token_candles = CANDLE_CACHE[token_str]
 
     for tf_key, interval_sec in TIMEFRAMES.items():
@@ -84,7 +118,6 @@ def update_token_candles(token_str, price_val):
         bucket_time = (now_sec // interval_sec) * interval_sec
 
         if not tf_list:
-            # First candle initialization
             new_candle = {
                 "time": bucket_time,
                 "open": price_val,
@@ -96,7 +129,6 @@ def update_token_candles(token_str, price_val):
         else:
             last_candle = tf_list[-1]
             if bucket_time > last_candle["time"]:
-                # New Candle boundary reached
                 new_candle = {
                     "time": bucket_time,
                     "open": last_candle["close"],
@@ -105,11 +137,9 @@ def update_token_candles(token_str, price_val):
                     "close": price_val
                 }
                 tf_list.append(new_candle)
-                # Keep maximum 200 candles only
                 if len(tf_list) > MAX_CANDLES_LIMIT:
                     tf_list.pop(0)
             else:
-                # Update existing candle in real-time
                 last_candle["close"] = price_val
                 if price_val > last_candle["high"]:
                     last_candle["high"] = price_val
@@ -118,7 +148,6 @@ def update_token_candles(token_str, price_val):
 
 # --- 🛡️ ANGEL ONE LOGIN RETRY LOGIC ---
 def login_with_retry(smart_conn, client_code, mpin, totp_val):
-    """Angel One API में 7 सेकंड टाइमआउट को हैंडल करने के लिए रिट्राई लॉजिक"""
     max_retries = 3
     for attempt in range(max_retries):
         try:
@@ -135,16 +164,12 @@ def login_with_retry(smart_conn, client_code, mpin, totp_val):
 
 # --- 📡 CORE REALTIME ENGINE ---
 def on_data_received(wsapp, message):
-    """
-    ULTRA-LOW LATENCY: डेटा आते ही P&L/LTP Emit करें और 200 Candles Update करें।
-    """
     global main_loop
     try:
         tick_data = json.loads(message) if isinstance(message, str) else message
         token_str = str(tick_data.get("token", tick_data.get("t", "")))
         raw_ltp = tick_data.get("last_traded_price", tick_data.get("ltp", 0))
 
-        # प्राइस डिवाइडर (एंजेल वन फॉर्मेट के लिए)
         try:
             val = float(raw_ltp)
             price_val = val / 100 if val > 100000 else val
@@ -153,14 +178,11 @@ def on_data_received(wsapp, message):
             price_val = 0.0
             price_str = str(raw_ltp)
 
-        # Cache update
         LTP_CACHE[token_str] = price_str
 
-        # Update 200 candles engine across 1M, 3M, 5M, 15M, 25M, 30M, 1H, 1D
         if price_val > 0:
             update_token_candles(token_str, price_val)
 
-        # 🚀 ZERO DELAY EMIT: सीधा रूम में भेजो
         if main_loop:
             asyncio.run_coroutine_threadsafe(
                 sio.emit("live_data", {"token": token_str, "ltp": price_str}, room=token_str), 
@@ -178,7 +200,6 @@ async def subscribe_request(sid, data):
         tokens_list = payload.get("tokens", [])
 
         if action == "sub":
-            # स्कोर अपडेट
             update_user_score(1) 
             
             for token in tokens_list:
@@ -190,22 +211,25 @@ async def subscribe_request(sid, data):
                 if exchange_code in SUBSCRIBED_TOKENS_REGISTRY and str_token not in SUBSCRIBED_TOKENS_REGISTRY[exchange_code]:
                     SUBSCRIBED_TOKENS_REGISTRY[exchange_code].add(str_token)
 
-            # Bulk Subscribe to broker
             if BROKER_SOCKET_CONNECTED and sws_client:
                 sws_client.subscribe("munh_titan_live", 1, [{"exchangeType": exchange_code, "tokens": tokens_list}])
     except: pass
 
 @sio.event
 async def get_candles(sid, data):
-    """
-    Android App se request aane par 200 real calculated candles emit karta hai.
-    """
     try:
         payload = json.loads(data) if isinstance(data, str) else data
         token_str = str(payload.get("token", ""))
         tf_key = str(payload.get("timeframe", "5M")).upper()
 
         update_user_score(1)
+
+        # Fallback Seed Check
+        if token_str in LTP_CACHE:
+            try:
+                base_p = float(LTP_CACHE[token_str])
+                seed_candles_if_empty(token_str, base_p)
+            except: pass
 
         candles_response = []
         if token_str in CANDLE_CACHE and tf_key in CANDLE_CACHE[token_str]:
@@ -230,12 +254,10 @@ async def broker_auto_login_task():
     global BROKER_JWT_TOKEN, BROKER_FEED_TOKEN, LAST_BROKER_LOGIN_TIME
     while True:
         try:
-            # 10 घंटे बाद रिलॉगिन
             if BROKER_JWT_TOKEN is None or (time.time() - LAST_BROKER_LOGIN_TIME >= 36000):
                 totp_crypto = pyotp.TOTP(TOTP_STR)
                 smart_conn = SmartConnect(api_key=API_KEY)
                 
-                # नया रिट्राई लॉजिक इस्तेमाल किया गया
                 session_data = login_with_retry(smart_conn, CLIENT_CODE, MPIN, totp_crypto.now())
                 
                 if session_data and session_data.get('status'):
@@ -249,7 +271,6 @@ async def broker_auto_login_task():
 def on_websocket_open(wsapp):
     global BROKER_SOCKET_CONNECTED
     BROKER_SOCKET_CONNECTED = True
-    # Re-subscribe tokens on connection
     for exch_code, tokens_set in SUBSCRIBED_TOKENS_REGISTRY.items():
         if tokens_set:
             sws_client.subscribe("munh_titan_live", 1, [{"exchangeType": exch_code, "tokens": list(tokens_set)}])
@@ -257,7 +278,6 @@ def on_websocket_open(wsapp):
 def on_websocket_close(wsapp, code, msg):
     global BROKER_SOCKET_CONNECTED
     BROKER_SOCKET_CONNECTED = False
-    # Reconnection mechanism
     threading.Thread(target=lambda: (time.sleep(2), start_angel_one_websocket_worker(BROKER_JWT_TOKEN, BROKER_FEED_TOKEN)), daemon=True).start()
 
 def start_angel_one_websocket_worker(auth_token, feed_token):
@@ -273,12 +293,10 @@ async def start_background_tasks(app):
     global main_loop
     main_loop = asyncio.get_event_loop()
     
-    # इनिशियल लॉगिन
     try:
         totp_crypto = pyotp.TOTP(TOTP_STR)
         smart_conn = SmartConnect(api_key=API_KEY)
         
-        # नया रिट्राई लॉजिक इस्तेमाल किया गया
         session_data = login_with_retry(smart_conn, CLIENT_CODE, MPIN, totp_crypto.now())
         
         if session_data and session_data.get('status'):
