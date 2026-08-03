@@ -6,7 +6,6 @@ import datetime
 import threading
 import sqlite3
 import gc
-import jwt
 import socketio
 import pyotp
 import pytz
@@ -19,8 +18,8 @@ from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 # --- 🕒 TIMEZONE & LOGGING SETUP ---
 IST = pytz.timezone('Asia/Kolkata')
 
-logging.basicConfig(level=logging.WARNING, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("MUNH_TITAN_REALTIME_PROD")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("MUNH_TITAN_PROD")
 
 # --- ⚙️ INTERNAL APP STATE ENGINE ---
 class AppState:
@@ -41,7 +40,7 @@ TOTP_STR = "XFTXZ2445N4V2UMB7EWUCBDRMU"
 LTP_CACHE = {}               
 SUBSCRIBED_TOKENS_REGISTRY = {1: set(), 2: set(), 3: set(), 4: set(), 5: set()}
 BROKER_SOCKET_CONNECTED = False
-USER_SCORE = 0  # Bhai ka score tracking variable
+USER_SCORE = 0 
 
 # --- 📊 CANDLE ENGINE CONFIGURATION (200 CANDLES MAX) ---
 TIMEFRAMES = {
@@ -57,8 +56,6 @@ TIMEFRAMES = {
 MAX_CANDLES_LIMIT = 200
 CANDLE_CACHE = {}  # Format: { token_str: { tf_key: [ {time, open, high, low, close}, ... ] } }
 
-# JWT Management
-JWT_SECRET = "MUNH_TITAN_SUPER_SECRET_KEY_2026"
 BROKER_JWT_TOKEN = None
 BROKER_FEED_TOKEN = None
 LAST_BROKER_LOGIN_TIME = 0
@@ -71,6 +68,22 @@ sio = socketio.AsyncServer(async_mode='aiohttp', cors_allowed_origins='*')
 app = web.Application()
 sio.attach(app)
 
+# --- 🔄 EXCHANGE CODE NORMALIZER ---
+def normalize_exchange(exch):
+    """
+    NSE = 1, NFO = 2, BSE = 3, CDS = 4, MCX = 5
+    """
+    ex_str = str(exch).upper().strip()
+    if ex_str in ["5", "MCX", "MCX_FO", "MCXFO"]:
+        return 5
+    elif ex_str in ["2", "NFO", "NSE_FO"]:
+        return 2
+    elif ex_str in ["3", "BSE", "BSE_CM"]:
+        return 3
+    elif ex_str in ["4", "CDS", "CNO"]:
+        return 4
+    return 1  # Default NSE
+
 # --- 🎯 SCORE LOGIC ---
 def update_user_score(points=1):
     global USER_SCORE
@@ -79,11 +92,11 @@ def update_user_score(points=1):
     logger.info(f"📊 Current User Score: {USER_SCORE}")
     return USER_SCORE
 
-# --- 🌱 AUTO-SEED ENGINE (PREVENTS BLANK CHART ON SERVER RESTART) ---
-def seed_candles_if_empty(token_str, base_price):
-    """
-    Server restart hone par agar cache khali ho toh immediate 200 candles seed kar deta hai.
-    """
+# --- 🌱 AUTO-SEED ENGINE (PREVENTS BLANK CHART) ---
+def seed_candles_if_empty(token_str, base_price=100.0):
+    if base_price <= 0:
+        base_price = 100.0
+        
     if token_str not in CANDLE_CACHE or not CANDLE_CACHE[token_str].get("5M"):
         CANDLE_CACHE[token_str] = {}
         now_sec = int(time.time())
@@ -96,12 +109,11 @@ def seed_candles_if_empty(token_str, base_price):
 
             for i in range(MAX_CANDLES_LIMIT):
                 c_time = start_bucket + (i * interval_sec)
-                # Small variance to generate natural chart view
-                delta = ((i % 5) - 2) * (base_price * 0.0005)
+                delta = ((i % 5) - 2) * (base_price * 0.0008)
                 c_close = round(price_tracker + delta, 2)
                 c_open = round(price_tracker, 2)
-                c_high = round(max(c_open, c_close) + (base_price * 0.0002), 2)
-                c_low = round(min(c_open, c_close) - (base_price * 0.0002), 2)
+                c_high = round(max(c_open, c_close) + (base_price * 0.0003), 2)
+                c_low = round(min(c_open, c_close) - (base_price * 0.0003), 2)
 
                 tf_candles.append({
                     "time": c_time,
@@ -116,13 +128,9 @@ def seed_candles_if_empty(token_str, base_price):
 
 # --- 📈 MULTI-TIMEFRAME CANDLE AGGREGATOR ---
 def update_token_candles(token_str, price_val):
-    """
-    Ticks se real-time 1M, 3M, 5M, 15M, 25M, 30M, 1H, 1D timeframes ki exact 200 candles build karta hai.
-    """
     if price_val <= 0:
         return
 
-    # Cache Empty Guard
     seed_candles_if_empty(token_str, price_val)
 
     now_sec = int(time.time())
@@ -162,20 +170,15 @@ def update_token_candles(token_str, price_val):
                     last_candle["low"] = price_val
 
 # ==============================================================================
-# --- 🌐 REST HTTP API ENDPOINTS (AIOHTTP COMPATIBLE) ---
+# --- 🌐 REST HTTP API ENDPOINTS ---
 # ==============================================================================
 
 async def fetch_chart_data(request: web.Request):
-    """
-    Fetches historical candles for APK Charts.
-    Zero-RAM Optimized with Manual GC.
-    """
     try:
         d = await request.json()
         token = str(d.get('token'))
-        exch = d.get('exch', 'NSE')
+        exch = str(d.get('exch', 'NSE')).upper()
         
-        # Interval Validation
         requested_interval = d.get('interval', "FIVE_MINUTE")
         valid_intervals = {
             "ONE_MINUTE": "ONE_MINUTE",
@@ -188,17 +191,13 @@ async def fetch_chart_data(request: web.Request):
         }
         interval = valid_intervals.get(requested_interval, "FIVE_MINUTE")
         
-        # Session check
         if not state.smart_api:
-            logger.error("❌ [History] SmartApi Session is NULL!")
             return web.json_response({"status": False, "message": "API Session Expired"})
 
-        # Time Calculation: Strictly Last 10 Days
         now = datetime.datetime.now(IST)
         to_date = now.strftime('%Y-%m-%d %H:%M')
         from_date = (now - datetime.timedelta(days=10)).strftime('%Y-%m-%d %H:%M')
 
-        # AngelOne API Payload
         params = {
             "exchange": exch,
             "symboltoken": token,
@@ -207,15 +206,10 @@ async def fetch_chart_data(request: web.Request):
             "todate": to_date
         }
         
-        logger.info(f"📊 [History] Fetching {interval} for Token: {token}")
-        
-        # API Call
         historic_data = state.smart_api.getCandleData(params)
         
-        if historic_data and historic_data.get('status'):
-            # --- SCORE LOGIC ---
+        if historic_data and isinstance(historic_data, dict) and historic_data.get('status'):
             current_score = update_user_score(1)
-            
             result = {
                 "status": True,
                 "token": token,
@@ -223,14 +217,11 @@ async def fetch_chart_data(request: web.Request):
                 "score": current_score,
                 "data": historic_data.get('data', [])
             }
-            
-            # --- MEMORY CLEANUP ---
             del historic_data
             gc.collect() 
-            
             return web.json_response(result)
         else:
-            msg = historic_data.get('message', 'No data from API') if historic_data else 'No data from API'
+            msg = historic_data.get('message', 'No data') if isinstance(historic_data, dict) else 'Rate limit or error'
             return web.json_response({"status": False, "message": msg})
 
     except Exception as e:
@@ -238,17 +229,12 @@ async def fetch_chart_data(request: web.Request):
         return web.json_response({"status": False, "error": str(e)})
 
 async def get_expiry(request: web.Request):
-    """Returns list of expiry dates from SQLite master"""
     try:
         d = await request.json()
         name = d.get('name', '').upper()
-        if not name:
+        if not name or not state.db_path:
             return web.json_response({"expiries": [], "status": False})
 
-        if not state.db_path:
-            return web.json_response({"expiries": [], "status": False, "msg": "DB not ready"})
-
-        # Context manager for auto-closing connection
         with sqlite3.connect(state.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute("""
@@ -259,33 +245,29 @@ async def get_expiry(request: web.Request):
             """, (name,))
             exps = [r[0] for r in cursor.fetchall()]
         
-        return web.json_response({
-            "status": True,
-            "name": name,
-            "expiries": exps
-        })
+        return web.json_response({"status": True, "name": name, "expiries": exps})
     except Exception as e:
-        logger.error(f"❌ [Expiry API Error]: {e}")
         return web.json_response({"expiries": [], "status": False})
 
-# Register HTTP REST Routes
 app.router.add_post('/api/get_chart_data', fetch_chart_data)
 app.router.add_post('/api/expiry_list', get_expiry)
 
-# --- 🛡️ ANGEL ONE LOGIN RETRY LOGIC ---
+# --- 🛡️ ANGEL ONE LOGIN WITH RATE-LIMIT GUARD ---
 def login_with_retry(smart_conn, client_code, mpin, totp_val):
     max_retries = 3
     for attempt in range(max_retries):
         try:
             session_data = smart_conn.generateSession(client_code, mpin, totp_val)
-            if session_data and session_data.get('status'):
+            if isinstance(session_data, dict) and session_data.get('status'):
+                logger.info("✅ Login successful!")
                 return session_data
-        except ReadTimeout:
-            logger.warning(f"Timeout on login attempt {attempt + 1}. Retrying in 2 seconds...")
-            time.sleep(2)
+            else:
+                logger.warning(f"⚠️ Login attempt {attempt + 1} response: {session_data}")
         except Exception as e:
-            logger.error(f"Login error on attempt {attempt + 1}: {e}")
-            time.sleep(2)
+            logger.error(f"❌ Login error on attempt {attempt + 1}: {e}")
+        
+        # 5 Second cooldown to clear AngelOne Rate Limit
+        time.sleep(5)
     return None
 
 # --- 📡 CORE REALTIME ENGINE ---
@@ -322,7 +304,8 @@ async def subscribe_request(sid, data):
     try:
         payload = json.loads(data) if isinstance(data, str) else data
         action = payload.get("action", "")
-        exchange_code = payload.get("exchange")
+        raw_exch = payload.get("exchange", 1)
+        exchange_code = normalize_exchange(raw_exch)
         tokens_list = payload.get("tokens", [])
 
         if action == "sub":
@@ -331,15 +314,21 @@ async def subscribe_request(sid, data):
             for token in tokens_list:
                 str_token = str(token)
                 await sio.enter_room(sid, str_token)
+                
+                # Default seed if empty
+                base_p = float(LTP_CACHE.get(str_token, 7465.0))
+                seed_candles_if_empty(str_token, base_p)
+
                 if str_token in LTP_CACHE:
                     await sio.emit("live_data", {"token": str_token, "ltp": LTP_CACHE[str_token]}, room=sid)
                 
-                if exchange_code in SUBSCRIBED_TOKENS_REGISTRY and str_token not in SUBSCRIBED_TOKENS_REGISTRY[exchange_code]:
+                if exchange_code in SUBSCRIBED_TOKENS_REGISTRY:
                     SUBSCRIBED_TOKENS_REGISTRY[exchange_code].add(str_token)
 
             if BROKER_SOCKET_CONNECTED and sws_client:
                 sws_client.subscribe("munh_titan_live", 1, [{"exchangeType": exchange_code, "tokens": tokens_list}])
-    except: pass
+    except Exception as e:
+        logger.error(f"Error in subscribe_request: {e}")
 
 @sio.event
 async def get_candles(sid, data):
@@ -350,12 +339,12 @@ async def get_candles(sid, data):
 
         update_user_score(1)
 
-        # Fallback Seed Check
+        base_p = 100.0
         if token_str in LTP_CACHE:
-            try:
-                base_p = float(LTP_CACHE[token_str])
-                seed_candles_if_empty(token_str, base_p)
+            try: base_p = float(LTP_CACHE[token_str])
             except: pass
+
+        seed_candles_if_empty(token_str, base_p)
 
         candles_response = []
         if token_str in CANDLE_CACHE and tf_key in CANDLE_CACHE[token_str]:
@@ -386,18 +375,20 @@ async def broker_auto_login_task():
                 
                 session_data = login_with_retry(smart_conn, CLIENT_CODE, MPIN, totp_crypto.now())
                 
-                if session_data and session_data.get('status'):
+                if session_data and isinstance(session_data, dict) and session_data.get('status'):
                     BROKER_JWT_TOKEN = session_data['data']['jwtToken']
                     BROKER_FEED_TOKEN = session_data['data']['feedToken']
                     LAST_BROKER_LOGIN_TIME = time.time()
                     state.smart_api = smart_conn
                     force_broker_socket_restart()
-        except: pass
+        except Exception as e:
+            logger.error(f"Broker auto-login task error: {e}")
         await asyncio.sleep(600)
 
 def on_websocket_open(wsapp):
     global BROKER_SOCKET_CONNECTED
     BROKER_SOCKET_CONNECTED = True
+    logger.info("✅ Broker WebSocket Connected!")
     for exch_code, tokens_set in SUBSCRIBED_TOKENS_REGISTRY.items():
         if tokens_set:
             sws_client.subscribe("munh_titan_live", 1, [{"exchangeType": exch_code, "tokens": list(tokens_set)}])
@@ -405,7 +396,8 @@ def on_websocket_open(wsapp):
 def on_websocket_close(wsapp, code, msg):
     global BROKER_SOCKET_CONNECTED
     BROKER_SOCKET_CONNECTED = False
-    threading.Thread(target=lambda: (time.sleep(2), start_angel_one_websocket_worker(BROKER_JWT_TOKEN, BROKER_FEED_TOKEN)), daemon=True).start()
+    logger.warning("⚠️ Broker WebSocket Closed. Reconnecting in 5s...")
+    threading.Thread(target=lambda: (time.sleep(5), start_angel_one_websocket_worker(BROKER_JWT_TOKEN, BROKER_FEED_TOKEN)), daemon=True).start()
 
 def start_angel_one_websocket_worker(auth_token, feed_token):
     global sws_client
@@ -426,14 +418,15 @@ async def start_background_tasks(app):
         
         session_data = login_with_retry(smart_conn, CLIENT_CODE, MPIN, totp_crypto.now())
         
-        if session_data and session_data.get('status'):
+        if session_data and isinstance(session_data, dict) and session_data.get('status'):
             global BROKER_JWT_TOKEN, BROKER_FEED_TOKEN, LAST_BROKER_LOGIN_TIME
             BROKER_JWT_TOKEN = session_data['data']['jwtToken']
             BROKER_FEED_TOKEN = session_data['data']['feedToken']
             LAST_BROKER_LOGIN_TIME = time.time()
             state.smart_api = smart_conn
             threading.Thread(target=start_angel_one_websocket_worker, args=(BROKER_JWT_TOKEN, BROKER_FEED_TOKEN), daemon=True).start()
-    except: pass
+    except Exception as e:
+        logger.error(f"Error starting background tasks: {e}")
     
     app['auto_login'] = asyncio.create_task(broker_auto_login_task())
 
