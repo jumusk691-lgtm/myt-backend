@@ -192,7 +192,6 @@ async def fetch_chart_data(request: web.Request):
             except Exception as ex:
                 logger.warning(f"⚠️ Angel API getCandleData exception: {ex}")
 
-        # अगर एंजेल API से असली डेटा मिल गया
         if historic_data and isinstance(historic_data, dict) and historic_data.get('status'):
             current_score = update_user_score(1)
             result = {
@@ -204,7 +203,6 @@ async def fetch_chart_data(request: web.Request):
             }
             return web.json_response(result)
         
-        # ❌ कोई डमी फॉलबैक नहीं, सीधे एरे या एरर रिटर्न करें ताकि ओरिजिनल स्थिति पता चले
         logger.warning(f"⚠️ Angel API returned no data for token: {token}, exch: {exch}")
         current_score = update_user_score(1)
         return web.json_response({
@@ -218,6 +216,74 @@ async def fetch_chart_data(request: web.Request):
 
     except Exception as e:
         logger.error(f"❌ [History Error]: {e}")
+        return web.json_response({"status": False, "error": str(e)})
+
+async def fetch_historical_oi_data(request: web.Request):
+    """
+    New endpoint added based on Angel One documentation for fetching Historical OI Data (/rest/secure/angelbroking/historical/v1/getOIData)
+    """
+    try:
+        d = await request.json()
+        token = str(d.get('token'))
+        exch = str(d.get('exch', 'NFO')).upper()
+        requested_interval = d.get('interval', "THREE_MINUTE")
+        
+        valid_intervals = {
+            "ONE_MINUTE": "ONE_MINUTE",
+            "THREE_MINUTE": "THREE_MINUTE",
+            "FIVE_MINUTE": "FIVE_MINUTE",
+            "TEN_MINUTE": "TEN_MINUTE",
+            "FIFTEEN_MINUTE": "FIFTEEN_MINUTE",
+            "THIRTY_MINUTE": "THIRTY_MINUTE",
+            "ONE_HOUR": "ONE_HOUR",
+            "ONE_DAY": "ONE_DAY"
+        }
+        interval = valid_intervals.get(requested_interval, "THREE_MINUTE")
+
+        oi_data = None
+        if state.smart_api:
+            try:
+                now = datetime.datetime.now(IST)
+                to_date = now.strftime('%Y-%m-%d %H:%M')
+                from_date = (now - datetime.timedelta(days=5)).strftime('%Y-%m-%d %H:%M')
+
+                params = {
+                    "exchange": exch,
+                    "symboltoken": token,
+                    "interval": interval,
+                    "fromdate": from_date,
+                    "todate": to_date
+                }
+                # SmartApi wrapper supports getOIData or custom request, checking standard method format
+                if hasattr(state.smart_api, 'getOIData'):
+                    oi_data = state.smart_api.getOIData(params)
+                else:
+                    # Fallback using direct session request if method is named differently in the SDK version
+                    url = "https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getOIData"
+                    headers = state.smart_api.ajwt, # depending on internal lib properties, standardizing via custom post if needed
+                    # Using smart_api session if available
+                    response = state.smart_api._session.post(url, json=params, headers=state.smart_api._get_common_headers())
+                    oi_data = response.json()
+            except Exception as ex:
+                logger.warning(f"⚠️ Angel API getOIData exception: {ex}")
+
+        if oi_data and isinstance(oi_data, dict) and oi_data.get('status'):
+            current_score = update_user_score(1)
+            return web.json_response({
+                "status": True,
+                "token": token,
+                "score": current_score,
+                "data": oi_data.get('data', [])
+            })
+
+        return web.json_response({
+            "status": False,
+            "token": token,
+            "error": "No historical OI data available from broker API",
+            "data": []
+        })
+    except Exception as e:
+        logger.error(f"❌ [OI History Error]: {e}")
         return web.json_response({"status": False, "error": str(e)})
 
 async def get_expiry(request: web.Request):
@@ -242,6 +308,7 @@ async def get_expiry(request: web.Request):
         return web.json_response({"expiries": [], "status": False})
 
 app.router.add_post('/api/get_chart_data', fetch_chart_data)
+app.router.add_post('/api/get_oi_data', fetch_historical_oi_data)
 app.router.add_post('/api/expiry_list', get_expiry)
 
 # --- 🛡️ ANGEL ONE LOGIN WITH RATE-LIMIT GUARD ---
