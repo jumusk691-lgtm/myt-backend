@@ -41,6 +41,7 @@ LTP_CACHE = {}
 SUBSCRIBED_TOKENS_REGISTRY = {1: set(), 2: set(), 3: set(), 4: set(), 5: set()}
 BROKER_SOCKET_CONNECTED = False
 USER_SCORE = 0 
+IS_RECONNECTING = False  # Guard against thread spams and rate limits
 
 # --- 📊 CANDLE ENGINE CONFIGURATION (200 CANDLES MAX) ---
 TIMEFRAMES = {
@@ -388,7 +389,8 @@ def on_data_received(wsapp, message):
                 sio.emit("live_data", {"token": token_str, "ltp": price_str}, room=token_str), 
                 main_loop
             )
-    except: pass
+    except Exception as e:
+        pass
 
 @sio.event
 async def subscribe_request(sid, data):
@@ -414,7 +416,10 @@ async def subscribe_request(sid, data):
                     SUBSCRIBED_TOKENS_REGISTRY[exchange_code].add(str_token)
 
             if BROKER_SOCKET_CONNECTED and sws_client:
-                sws_client.subscribe("munh_titan_live", 1, [{"exchangeType": exchange_code, "tokens": tokens_list}])
+                try:
+                    sws_client.subscribe("munh_titan_live", 1, [{"exchangeType": exchange_code, "tokens": tokens_list}])
+                except Exception as e:
+                    logger.error(f"Error subscribing: {e}")
     except Exception as e:
         logger.error(f"Error in subscribe_request: {e}")
 
@@ -443,8 +448,10 @@ async def get_candles(sid, data):
 def force_broker_socket_restart():
     global sws_client, BROKER_SOCKET_CONNECTED
     if sws_client and BROKER_SOCKET_CONNECTED:
-        try: sws_client.close()
-        except: pass
+        try: 
+            sws_client.close()
+        except Exception: 
+            pass
 
 async def broker_auto_login_task():
     global BROKER_JWT_TOKEN, BROKER_FEED_TOKEN, LAST_BROKER_LOGIN_TIME
@@ -466,28 +473,70 @@ async def broker_auto_login_task():
             logger.error(f"Broker auto-login task error: {e}")
         await asyncio.sleep(600)
 
-def on_websocket_open(wsapp):
-    global BROKER_SOCKET_CONNECTED
+def on_websocket_open(wsapp, *args, **kwargs):
+    global BROKER_SOCKET_CONNECTED, IS_RECONNECTING
     BROKER_SOCKET_CONNECTED = True
+    IS_RECONNECTING = False
     logger.info("✅ Broker WebSocket Connected!")
     for exch_code, tokens_set in SUBSCRIBED_TOKENS_REGISTRY.items():
         if tokens_set:
-            sws_client.subscribe("munh_titan_live", 1, [{"exchangeType": exch_code, "tokens": list(tokens_set)}])
+            try:
+                sws_client.subscribe("munh_titan_live", 1, [{"exchangeType": exch_code, "tokens": list(tokens_set)}])
+            except Exception as e:
+                logger.error(f"Error subscribing tokens on websocket open: {e}")
 
-def on_websocket_close(wsapp, code, msg):
+def on_websocket_close(wsapp, *args, **kwargs):
     global BROKER_SOCKET_CONNECTED
     BROKER_SOCKET_CONNECTED = False
-    logger.warning("⚠️ Broker WebSocket Closed. Reconnecting in 5s...")
-    threading.Thread(target=lambda: (time.sleep(5), start_angel_one_websocket_worker(BROKER_JWT_TOKEN, BROKER_FEED_TOKEN)), daemon=True).start()
+    logger.warning("⚠️ Broker WebSocket Closed. Initiating safe reconnection...")
+    reconnect_broker_socket()
+
+def on_websocket_error(wsapp, *args, **kwargs):
+    logger.error(f"❌ Broker WebSocket Error: {args} {kwargs}")
+
+def reconnect_broker_socket():
+    global IS_RECONNECTING
+    if IS_RECONNECTING:
+        return
+    IS_RECONNECTING = True
+
+    def _safe_reconnect_worker():
+        time.sleep(10)  # Rate-limit guard delay
+        if BROKER_JWT_TOKEN and BROKER_FEED_TOKEN:
+            start_angel_one_websocket_worker(BROKER_JWT_TOKEN, BROKER_FEED_TOKEN)
+        else:
+            global IS_RECONNECTING
+            IS_RECONNECTING = False
+
+    threading.Thread(target=_safe_reconnect_worker, daemon=True).start()
 
 def start_angel_one_websocket_worker(auth_token, feed_token):
     global sws_client
-    if not auth_token or not feed_token: return
-    sws_client = SmartWebSocketV2(auth_token=auth_token, client_code=CLIENT_CODE, api_key=API_KEY, feed_token=feed_token)
-    sws_client.on_data = on_data_received
-    sws_client.on_open = on_websocket_open
-    sws_client.on_close = on_websocket_close
-    sws_client.connect()
+    if not auth_token or not feed_token: 
+        return
+
+    try:
+        if sws_client:
+            try:
+                sws_client.close()
+            except Exception:
+                pass
+
+        sws_client = SmartWebSocketV2(
+            auth_token=auth_token, 
+            client_code=CLIENT_CODE, 
+            api_key=API_KEY, 
+            feed_token=feed_token
+        )
+        sws_client.on_data = on_data_received
+        sws_client.on_open = on_websocket_open
+        sws_client.on_close = on_websocket_close
+        sws_client.on_error = on_websocket_error
+        sws_client.connect()
+    except Exception as e:
+        logger.error(f"Failed to start WebSocket worker: {e}")
+        global IS_RECONNECTING
+        IS_RECONNECTING = False
 
 async def start_background_tasks(app):
     global main_loop
