@@ -25,7 +25,7 @@ logger = logging.getLogger("MUNH_TITAN_PROD")
 class AppState:
     def __init__(self):
         self.smart_api = None
-        self.db_path = "market_data.db"
+        self.db_path = "angel_master.db"
         self.score = 0
 
 state = AppState()
@@ -174,12 +174,25 @@ async def fetch_chart_data(request: web.Request):
         }
         tf_key = tf_map.get(interval, "5M")
 
+        # 🧠 DYNAMIC DATE CALCULATOR FOR ~500-1000 CANDLES
+        interval_days_map = {
+            "ONE_MINUTE": 3,       # 3 days ~ 1125 candles
+            "THREE_MINUTE": 5,     # 5 days ~ 625 candles
+            "FIVE_MINUTE": 8,      # 8 days ~ 600 candles
+            "TEN_MINUTE": 15,      # 15 days ~ 560 candles
+            "FIFTEEN_MINUTE": 20,  # 20 days ~ 500 candles
+            "THIRTY_MINUTE": 40,   # 40 days ~ 500 candles
+            "ONE_HOUR": 80,        # 80 days ~ 560 candles
+            "ONE_DAY": 500         # 500 days ~ 500 candles
+        }
+        days_to_subtract = interval_days_map.get(interval, 8)
+
         historic_data = None
         if state.smart_api:
             try:
                 now = datetime.datetime.now(IST)
                 to_date = now.strftime('%Y-%m-%d %H:%M')
-                from_date = (now - datetime.timedelta(days=30)).strftime('%Y-%m-%d %H:%M')
+                from_date = (now - datetime.timedelta(days=days_to_subtract)).strftime('%Y-%m-%d %H:%M')
 
                 params = {
                     "exchange": exch,
@@ -188,6 +201,7 @@ async def fetch_chart_data(request: web.Request):
                     "fromdate": from_date,
                     "todate": to_date
                 }
+                logger.info(f"📈 Fetching {interval} Data | Token: {token} | From: {from_date} To: {to_date}")
                 historic_data = state.smart_api.getCandleData(params)
             except Exception as ex:
                 logger.warning(f"⚠️ Angel API getCandleData exception: {ex}")
@@ -219,9 +233,6 @@ async def fetch_chart_data(request: web.Request):
         return web.json_response({"status": False, "error": str(e)})
 
 async def fetch_historical_oi_data(request: web.Request):
-    """
-    New endpoint added based on Angel One documentation for fetching Historical OI Data (/rest/secure/angelbroking/historical/v1/getOIData)
-    """
     try:
         d = await request.json()
         token = str(d.get('token'))
@@ -254,14 +265,11 @@ async def fetch_historical_oi_data(request: web.Request):
                     "fromdate": from_date,
                     "todate": to_date
                 }
-                # SmartApi wrapper supports getOIData or custom request, checking standard method format
+                
                 if hasattr(state.smart_api, 'getOIData'):
                     oi_data = state.smart_api.getOIData(params)
                 else:
-                    # Fallback using direct session request if method is named differently in the SDK version
                     url = "https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getOIData"
-                    headers = state.smart_api.ajwt, # depending on internal lib properties, standardizing via custom post if needed
-                    # Using smart_api session if available
                     response = state.smart_api._session.post(url, json=params, headers=state.smart_api._get_common_headers())
                     oi_data = response.json()
             except Exception as ex:
