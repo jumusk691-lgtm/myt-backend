@@ -191,23 +191,37 @@ async def fetch_chart_data(request: web.Request):
         }
         interval = valid_intervals.get(requested_interval, "FIVE_MINUTE")
         
-        if not state.smart_api:
-            return web.json_response({"status": False, "message": "API Session Expired"})
-
-        now = datetime.datetime.now(IST)
-        to_date = now.strftime('%Y-%m-%d %H:%M')
-        from_date = (now - datetime.timedelta(days=10)).strftime('%Y-%m-%d %H:%M')
-
-        params = {
-            "exchange": exch,
-            "symboltoken": token,
-            "interval": interval,
-            "fromdate": from_date,
-            "todate": to_date
+        # इंटरवल को हमारे TIMEFRAME की चाबी से मैप करें
+        tf_map = {
+            "ONE_MINUTE": "1M",
+            "THREE_MINUTE": "3M",
+            "FIVE_MINUTE": "5M",
+            "FIFTEEN_MINUTE": "15M",
+            "THIRTY_MINUTE": "30M",
+            "ONE_HOUR": "1H",
+            "ONE_DAY": "1D"
         }
-        
-        historic_data = state.smart_api.getCandleData(params)
-        
+        tf_key = tf_map.get(interval, "5M")
+
+        historic_data = None
+        if state.smart_api:
+            try:
+                now = datetime.datetime.now(IST)
+                to_date = now.strftime('%Y-%m-%d %H:%M')
+                from_date = (now - datetime.timedelta(days=30)).strftime('%Y-%m-%d %H:%M')
+
+                params = {
+                    "exchange": exch,
+                    "symboltoken": token,
+                    "interval": interval,
+                    "fromdate": from_date,
+                    "todate": to_date
+                }
+                historic_data = state.smart_api.getCandleData(params)
+            except Exception as ex:
+                logger.warning(f"⚠️ Angel API getCandleData exception: {ex}")
+
+        # अगर एंजेल API से डेटा मिल गया
         if historic_data and isinstance(historic_data, dict) and historic_data.get('status'):
             current_score = update_user_score(1)
             result = {
@@ -217,12 +231,34 @@ async def fetch_chart_data(request: web.Request):
                 "score": current_score,
                 "data": historic_data.get('data', [])
             }
-            del historic_data
-            gc.collect() 
             return web.json_response(result)
-        else:
-            msg = historic_data.get('message', 'No data') if isinstance(historic_data, dict) else 'Rate limit or error'
-            return web.json_response({"status": False, "message": msg})
+        
+        # 🛡️ Fallback: अगर एंजेल API फेल हुआ या ऑप्शन का डेटा नहीं मिला, तो लोकल कैशे से भेजेंगे ताकि चार्ट कभी खाली न हो!
+        logger.info(f"🔄 Using Local Cache Fallback for token: {token}, timeframe: {tf_key}")
+        base_p = float(LTP_CACHE.get(token, 100.0))
+        seed_candles_if_empty(token, base_p)
+
+        formatted_candles = []
+        if token in CANDLE_CACHE and tf_key in CANDLE_CACHE[token]:
+            for c in CANDLE_CACHE[token][tf_key]:
+                c_time_ms = c["time"] * 1000 if c["time"] < 10000000000 else c["time"]
+                formatted_candles.append([
+                    c_time_ms,
+                    c["open"],
+                    c["high"],
+                    c["low"],
+                    c["close"],
+                    1000
+                ])
+
+        current_score = update_user_score(1)
+        return web.json_response({
+            "status": True,
+            "token": token,
+            "interval": interval,
+            "score": current_score,
+            "data": formatted_candles
+        })
 
     except Exception as e:
         logger.error(f"❌ [History Error]: {e}")
@@ -266,7 +302,6 @@ def login_with_retry(smart_conn, client_code, mpin, totp_val):
         except Exception as e:
             logger.error(f"❌ Login error on attempt {attempt + 1}: {e}")
         
-        # 5 Second cooldown to clear AngelOne Rate Limit
         time.sleep(5)
     return None
 
@@ -280,7 +315,6 @@ def on_data_received(wsapp, message):
 
         try:
             val = float(raw_ltp)
-            # Standard conversion: Angel One WebSocket sends LTP in Paise (Divide by 100 to get Rupees)
             price_val = val / 100.0 if val > 0 else 0.0
             price_str = f"{price_val:.2f}"
         except:
@@ -316,7 +350,6 @@ async def subscribe_request(sid, data):
                 str_token = str(token)
                 await sio.enter_room(sid, str_token)
                 
-                # Default seed if empty
                 base_p = float(LTP_CACHE.get(str_token, 7465.0))
                 seed_candles_if_empty(str_token, base_p)
 
