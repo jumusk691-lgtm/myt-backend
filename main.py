@@ -165,18 +165,6 @@ async def fetch_chart_data(request: web.Request):
             "ONE_DAY": "ONE_DAY"
         }
         interval = valid_intervals.get(requested_interval, "FIVE_MINUTE")
-        
-        tf_map = {
-            "ONE_MINUTE": "1M",
-            "THREE_MINUTE": "3M",
-            "FIVE_MINUTE": "5M",
-            "TEN_MINUTE": "5M",
-            "FIFTEEN_MINUTE": "15M",
-            "THIRTY_MINUTE": "30M",
-            "ONE_HOUR": "1H",
-            "ONE_DAY": "1D"
-        }
-        tf_key = tf_map.get(interval, "5M")
 
         interval_days_map = {
             "ONE_MINUTE": 3,       
@@ -207,7 +195,6 @@ async def fetch_chart_data(request: web.Request):
                 logger.info(f"📈 Sending Params to Angel: {params}")
                 historic_data = state.smart_api.getCandleData(params)
                 
-                # CRITICAL LOG: See exactly what Angel One returns
                 logger.info(f"🔍 Angel API Raw Response (Chart): {historic_data}")
                 
             except Exception as ex:
@@ -215,12 +202,27 @@ async def fetch_chart_data(request: web.Request):
 
         if historic_data and isinstance(historic_data, dict) and historic_data.get('status'):
             current_score = update_user_score(1)
+            raw_candles = historic_data.get('data', [])
+            
+            # Format raw candles for easy parsing on Mobile Canvas/Chart Library
+            formatted_candles = []
+            for item in raw_candles:
+                # Format: [timestamp_str, open, high, low, close, volume]
+                formatted_candles.append({
+                    "time": item[0],
+                    "open": item[1],
+                    "high": item[2],
+                    "low": item[3],
+                    "close": item[4],
+                    "volume": item[5] if len(item) > 5 else 0
+                })
+
             result = {
                 "status": True,
                 "token": token,
                 "interval": interval,
                 "score": current_score,
-                "data": historic_data.get('data', [])
+                "data": formatted_candles
             }
             return web.json_response(result)
         
@@ -296,7 +298,6 @@ async def fetch_historical_oi_data(request: web.Request):
                     response = state.smart_api._session.post(url, json=params, headers=state.smart_api._get_common_headers())
                     oi_data = response.json()
                 
-                # CRITICAL LOG: See exactly what Angel One returns for OI
                 logger.info(f"🔍 Angel API Raw Response (OI): {oi_data}")
                 
             except Exception as ex:
