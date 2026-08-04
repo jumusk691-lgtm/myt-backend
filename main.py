@@ -176,14 +176,14 @@ async def fetch_chart_data(request: web.Request):
 
         # 🧠 DYNAMIC DATE CALCULATOR FOR ~500-1000 CANDLES
         interval_days_map = {
-            "ONE_MINUTE": 3,       # 3 days ~ 1125 candles
-            "THREE_MINUTE": 5,     # 5 days ~ 625 candles
-            "FIVE_MINUTE": 8,      # 8 days ~ 600 candles
-            "TEN_MINUTE": 15,      # 15 days ~ 560 candles
-            "FIFTEEN_MINUTE": 20,  # 20 days ~ 500 candles
-            "THIRTY_MINUTE": 40,   # 40 days ~ 500 candles
-            "ONE_HOUR": 80,        # 80 days ~ 560 candles
-            "ONE_DAY": 500         # 500 days ~ 500 candles
+            "ONE_MINUTE": 3,       
+            "THREE_MINUTE": 5,     
+            "FIVE_MINUTE": 8,      
+            "TEN_MINUTE": 15,      
+            "FIFTEEN_MINUTE": 20,  
+            "THIRTY_MINUTE": 40,   
+            "ONE_HOUR": 80,        
+            "ONE_DAY": 500         
         }
         days_to_subtract = interval_days_map.get(interval, 8)
 
@@ -251,12 +251,25 @@ async def fetch_historical_oi_data(request: web.Request):
         }
         interval = valid_intervals.get(requested_interval, "THREE_MINUTE")
 
+        # Added mapping to fetch optimal days of OI data without breaking API limits
+        interval_days_map = {
+            "ONE_MINUTE": 3,       
+            "THREE_MINUTE": 5,     
+            "FIVE_MINUTE": 8,      
+            "TEN_MINUTE": 15,      
+            "FIFTEEN_MINUTE": 20,  
+            "THIRTY_MINUTE": 40,   
+            "ONE_HOUR": 80,        
+            "ONE_DAY": 500         
+        }
+        days_to_subtract = interval_days_map.get(interval, 5)
+
         oi_data = None
         if state.smart_api:
             try:
                 now = datetime.datetime.now(IST)
                 to_date = now.strftime('%Y-%m-%d %H:%M')
-                from_date = (now - datetime.timedelta(days=5)).strftime('%Y-%m-%d %H:%M')
+                from_date = (now - datetime.timedelta(days=days_to_subtract)).strftime('%Y-%m-%d %H:%M')
 
                 params = {
                     "exchange": exch,
@@ -266,6 +279,7 @@ async def fetch_historical_oi_data(request: web.Request):
                     "todate": to_date
                 }
                 
+                logger.info(f"📊 Fetching OI {interval} Data | Token: {token} | From: {from_date} To: {to_date}")
                 if hasattr(state.smart_api, 'getOIData'):
                     oi_data = state.smart_api.getOIData(params)
                 else:
