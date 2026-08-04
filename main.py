@@ -146,9 +146,12 @@ def update_token_candles(token_str, price_val):
 async def fetch_chart_data(request: web.Request):
     try:
         d = await request.json()
-        token = str(d.get('token'))
+        token = str(d.get('token', ''))
         exch = str(d.get('exch', 'NSE')).upper()
         
+        # Log the incoming request from APK
+        logger.info(f"📥 APK Chart Request: Token={token}, Exch={exch}, Interval={d.get('interval')}")
+
         requested_interval = d.get('interval', "FIVE_MINUTE")
         valid_intervals = {
             "ONE_MINUTE": "ONE_MINUTE",
@@ -174,7 +177,6 @@ async def fetch_chart_data(request: web.Request):
         }
         tf_key = tf_map.get(interval, "5M")
 
-        # 🧠 DYNAMIC DATE CALCULATOR FOR ~500-1000 CANDLES
         interval_days_map = {
             "ONE_MINUTE": 3,       
             "THREE_MINUTE": 5,     
@@ -201,8 +203,12 @@ async def fetch_chart_data(request: web.Request):
                     "fromdate": from_date,
                     "todate": to_date
                 }
-                logger.info(f"📈 Fetching {interval} Data | Token: {token} | From: {from_date} To: {to_date}")
+                logger.info(f"📈 Sending Params to Angel: {params}")
                 historic_data = state.smart_api.getCandleData(params)
+                
+                # CRITICAL LOG: See exactly what Angel One returns
+                logger.info(f"🔍 Angel API Raw Response (Chart): {historic_data}")
+                
             except Exception as ex:
                 logger.warning(f"⚠️ Angel API getCandleData exception: {ex}")
 
@@ -217,14 +223,14 @@ async def fetch_chart_data(request: web.Request):
             }
             return web.json_response(result)
         
-        logger.warning(f"⚠️ Angel API returned no data for token: {token}, exch: {exch}")
+        logger.warning(f"⚠️ Angel API returned no data or error. Token: {token}, Exch: {exch}")
         current_score = update_user_score(1)
         return web.json_response({
             "status": False,
             "token": token,
             "interval": interval,
             "score": current_score,
-            "error": "No historical data available from broker API",
+            "error": historic_data.get("message", "No historical data available") if isinstance(historic_data, dict) else "No data",
             "data": []
         })
 
@@ -235,8 +241,11 @@ async def fetch_chart_data(request: web.Request):
 async def fetch_historical_oi_data(request: web.Request):
     try:
         d = await request.json()
-        token = str(d.get('token'))
+        token = str(d.get('token', ''))
         exch = str(d.get('exch', 'NFO')).upper()
+        
+        logger.info(f"📥 APK OI Request: Token={token}, Exch={exch}, Interval={d.get('interval')}")
+
         requested_interval = d.get('interval', "THREE_MINUTE")
         
         valid_intervals = {
@@ -251,7 +260,6 @@ async def fetch_historical_oi_data(request: web.Request):
         }
         interval = valid_intervals.get(requested_interval, "THREE_MINUTE")
 
-        # Added mapping to fetch optimal days of OI data without breaking API limits
         interval_days_map = {
             "ONE_MINUTE": 3,       
             "THREE_MINUTE": 5,     
@@ -279,13 +287,17 @@ async def fetch_historical_oi_data(request: web.Request):
                     "todate": to_date
                 }
                 
-                logger.info(f"📊 Fetching OI {interval} Data | Token: {token} | From: {from_date} To: {to_date}")
+                logger.info(f"📊 Sending Params to Angel (OI): {params}")
                 if hasattr(state.smart_api, 'getOIData'):
                     oi_data = state.smart_api.getOIData(params)
                 else:
                     url = "https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getOIData"
                     response = state.smart_api._session.post(url, json=params, headers=state.smart_api._get_common_headers())
                     oi_data = response.json()
+                
+                # CRITICAL LOG: See exactly what Angel One returns for OI
+                logger.info(f"🔍 Angel API Raw Response (OI): {oi_data}")
+                
             except Exception as ex:
                 logger.warning(f"⚠️ Angel API getOIData exception: {ex}")
 
@@ -301,7 +313,7 @@ async def fetch_historical_oi_data(request: web.Request):
         return web.json_response({
             "status": False,
             "token": token,
-            "error": "No historical OI data available from broker API",
+            "error": oi_data.get("message", "No OI data available") if isinstance(oi_data, dict) else "No data",
             "data": []
         })
     except Exception as e:
