@@ -280,7 +280,8 @@ def on_data_received(wsapp, message):
 
         try:
             val = float(raw_ltp)
-            price_val = val / 100 if val > 100000 else val
+            # Standard conversion: Angel One WebSocket sends LTP in Paise (Divide by 100 to get Rupees)
+            price_val = val / 100.0 if val > 0 else 0.0
             price_str = f"{price_val:.2f}"
         except:
             price_val = 0.0
