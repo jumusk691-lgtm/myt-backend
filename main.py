@@ -92,51 +92,21 @@ def update_user_score(points=1):
     logger.info(f"📊 Current User Score: {USER_SCORE}")
     return USER_SCORE
 
-# --- 🌱 AUTO-SEED ENGINE (PREVENTS BLANK CHART) ---
-def seed_candles_if_empty(token_str, base_price=100.0):
-    if base_price <= 0:
-        base_price = 100.0
-        
-    if token_str not in CANDLE_CACHE or not CANDLE_CACHE[token_str].get("5M"):
-        CANDLE_CACHE[token_str] = {}
-        now_sec = int(time.time())
-        
-        for tf_key, interval_sec in TIMEFRAMES.items():
-            tf_candles = []
-            price_tracker = base_price
-            current_bucket = (now_sec // interval_sec) * interval_sec
-            start_bucket = current_bucket - ((MAX_CANDLES_LIMIT - 1) * interval_sec)
-
-            for i in range(MAX_CANDLES_LIMIT):
-                c_time = start_bucket + (i * interval_sec)
-                delta = ((i % 5) - 2) * (base_price * 0.0008)
-                c_close = round(price_tracker + delta, 2)
-                c_open = round(price_tracker, 2)
-                c_high = round(max(c_open, c_close) + (base_price * 0.0003), 2)
-                c_low = round(min(c_open, c_close) - (base_price * 0.0003), 2)
-
-                tf_candles.append({
-                    "time": c_time,
-                    "open": c_open,
-                    "high": c_high,
-                    "low": c_low,
-                    "close": c_close
-                })
-                price_tracker = c_close
-
-            CANDLE_CACHE[token_str][tf_key] = tf_candles
-
-# --- 📈 MULTI-TIMEFRAME CANDLE AGGREGATOR ---
+# --- 📈 LIVE TICK CANDLE AGGREGATOR (REALTIME ONLY) ---
 def update_token_candles(token_str, price_val):
     if price_val <= 0:
         return
 
-    seed_candles_if_empty(token_str, price_val)
-
     now_sec = int(time.time())
+    if token_str not in CANDLE_CACHE:
+        CANDLE_CACHE[token_str] = {}
+
     token_candles = CANDLE_CACHE[token_str]
 
     for tf_key, interval_sec in TIMEFRAMES.items():
+        if tf_key not in token_candles:
+            token_candles[tf_key] = []
+            
         tf_list = token_candles[tf_key]
         bucket_time = (now_sec // interval_sec) * interval_sec
 
@@ -184,6 +154,7 @@ async def fetch_chart_data(request: web.Request):
             "ONE_MINUTE": "ONE_MINUTE",
             "THREE_MINUTE": "THREE_MINUTE",
             "FIVE_MINUTE": "FIVE_MINUTE",
+            "TEN_MINUTE": "TEN_MINUTE",
             "FIFTEEN_MINUTE": "FIFTEEN_MINUTE",
             "THIRTY_MINUTE": "THIRTY_MINUTE",
             "ONE_HOUR": "ONE_HOUR",
@@ -191,11 +162,11 @@ async def fetch_chart_data(request: web.Request):
         }
         interval = valid_intervals.get(requested_interval, "FIVE_MINUTE")
         
-        # इंटरवल को हमारे TIMEFRAME की चाबी से मैप करें
         tf_map = {
             "ONE_MINUTE": "1M",
             "THREE_MINUTE": "3M",
             "FIVE_MINUTE": "5M",
+            "TEN_MINUTE": "5M",
             "FIFTEEN_MINUTE": "15M",
             "THIRTY_MINUTE": "30M",
             "ONE_HOUR": "1H",
@@ -221,7 +192,7 @@ async def fetch_chart_data(request: web.Request):
             except Exception as ex:
                 logger.warning(f"⚠️ Angel API getCandleData exception: {ex}")
 
-        # अगर एंजेल API से डेटा मिल गया
+        # अगर एंजेल API से असली डेटा मिल गया
         if historic_data and isinstance(historic_data, dict) and historic_data.get('status'):
             current_score = update_user_score(1)
             result = {
@@ -233,31 +204,16 @@ async def fetch_chart_data(request: web.Request):
             }
             return web.json_response(result)
         
-        # 🛡️ Fallback: अगर एंजेल API फेल हुआ या ऑप्शन का डेटा नहीं मिला, तो लोकल कैशे से भेजेंगे ताकि चार्ट कभी खाली न हो!
-        logger.info(f"🔄 Using Local Cache Fallback for token: {token}, timeframe: {tf_key}")
-        base_p = float(LTP_CACHE.get(token, 100.0))
-        seed_candles_if_empty(token, base_p)
-
-        formatted_candles = []
-        if token in CANDLE_CACHE and tf_key in CANDLE_CACHE[token]:
-            for c in CANDLE_CACHE[token][tf_key]:
-                c_time_ms = c["time"] * 1000 if c["time"] < 10000000000 else c["time"]
-                formatted_candles.append([
-                    c_time_ms,
-                    c["open"],
-                    c["high"],
-                    c["low"],
-                    c["close"],
-                    1000
-                ])
-
+        # ❌ कोई डमी फॉलबैक नहीं, सीधे एरे या एरर रिटर्न करें ताकि ओरिजिनल स्थिति पता चले
+        logger.warning(f"⚠️ Angel API returned no data for token: {token}, exch: {exch}")
         current_score = update_user_score(1)
         return web.json_response({
-            "status": True,
+            "status": False,
             "token": token,
             "interval": interval,
             "score": current_score,
-            "data": formatted_candles
+            "error": "No historical data available from broker API",
+            "data": []
         })
 
     except Exception as e:
@@ -350,9 +306,6 @@ async def subscribe_request(sid, data):
                 str_token = str(token)
                 await sio.enter_room(sid, str_token)
                 
-                base_p = float(LTP_CACHE.get(str_token, 7465.0))
-                seed_candles_if_empty(str_token, base_p)
-
                 if str_token in LTP_CACHE:
                     await sio.emit("live_data", {"token": str_token, "ltp": LTP_CACHE[str_token]}, room=sid)
                 
@@ -372,13 +325,6 @@ async def get_candles(sid, data):
         tf_key = str(payload.get("timeframe", "5M")).upper()
 
         update_user_score(1)
-
-        base_p = 100.0
-        if token_str in LTP_CACHE:
-            try: base_p = float(LTP_CACHE[token_str])
-            except: pass
-
-        seed_candles_if_empty(token_str, base_p)
 
         candles_response = []
         if token_str in CANDLE_CACHE and tf_key in CANDLE_CACHE[token_str]:
