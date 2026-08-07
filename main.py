@@ -79,7 +79,7 @@ def normalize_exchange(exch):
         return 5
     elif ex_str in ["2", "NFO", "NSE_FO"]:
         return 2
-    elif ex_str in ["3", "BSE", "BSE_CM"]:
+    elif ex_str in ["3", "BSE", "BSE_CM", "BFO"]:
         return 3
     elif ex_str in ["4", "CDS", "CNO"]:
         return 4
@@ -148,10 +148,22 @@ async def fetch_chart_data(request: web.Request):
     try:
         d = await request.json()
         token = str(d.get('token', ''))
-        exch = str(d.get('exch', 'NSE')).upper()
+        raw_exch = str(d.get('exch', 'NSE')).upper().strip()
         
-        # Log the incoming request from APK
-        logger.info(f"📥 APK Chart Request: Token={token}, Exch={exch}, Interval={d.get('interval')}")
+        # 🛠️ FIX 1: Robust Exchange Mapping for Angel One Smart API
+        if raw_exch in ["MCX", "MCXFO", "MCX_FO", "5"]:
+            exch = "MCX"
+        elif raw_exch in ["NFO", "NSE_FO", "2"]:
+            exch = "NFO"
+        elif raw_exch in ["BFO", "BSE_FO", "BSE", "3"]:
+            exch = "BFO"
+        elif raw_exch in ["CDS", "CNO", "4"]:
+            exch = "CDS"
+        else:
+            exch = "NSE"
+
+        # Log incoming request details
+        logger.info(f"📥 APK Chart Request: Token={token}, OriginalExch={raw_exch} -> ParsedExch={exch}, Interval={d.get('interval')}")
 
         requested_interval = d.get('interval', "FIVE_MINUTE")
         valid_intervals = {
@@ -166,17 +178,18 @@ async def fetch_chart_data(request: web.Request):
         }
         interval = valid_intervals.get(requested_interval, "FIVE_MINUTE")
 
+        # 🛠️ FIX 2: Optimized date lookbacks (MCX needs sufficient lookback for active contracts)
         interval_days_map = {
             "ONE_MINUTE": 3,       
             "THREE_MINUTE": 5,     
-            "FIVE_MINUTE": 8,      
+            "FIVE_MINUTE": 10,      
             "TEN_MINUTE": 15,      
-            "FIFTEEN_MINUTE": 20,  
-            "THIRTY_MINUTE": 40,   
-            "ONE_HOUR": 80,        
+            "FIFTEEN_MINUTE": 25,  
+            "THIRTY_MINUTE": 45,   
+            "ONE_HOUR": 90,        
             "ONE_DAY": 500         
         }
-        days_to_subtract = interval_days_map.get(interval, 8)
+        days_to_subtract = interval_days_map.get(interval, 10)
 
         historic_data = None
         if state.smart_api:
@@ -206,16 +219,17 @@ async def fetch_chart_data(request: web.Request):
             
             # Format raw candles for easy parsing on Mobile Canvas/Chart Library
             formatted_candles = []
-            for item in raw_candles:
-                # Format: [timestamp_str, open, high, low, close, volume]
-                formatted_candles.append({
-                    "time": item[0],
-                    "open": item[1],
-                    "high": item[2],
-                    "low": item[3],
-                    "close": item[4],
-                    "volume": item[5] if len(item) > 5 else 0
-                })
+            if raw_candles:
+                for item in raw_candles:
+                    # Format: [timestamp_str, open, high, low, close, volume]
+                    formatted_candles.append({
+                        "time": item[0],
+                        "open": float(item[1]),
+                        "high": float(item[2]),
+                        "low": float(item[3]),
+                        "close": float(item[4]),
+                        "volume": int(item[5]) if len(item) > 5 else 0
+                    })
 
             result = {
                 "status": True,
@@ -245,7 +259,16 @@ async def fetch_historical_oi_data(request: web.Request):
     try:
         d = await request.json()
         token = str(d.get('token', ''))
-        exch = str(d.get('exch', 'NFO')).upper()
+        raw_exch = str(d.get('exch', 'NFO')).upper().strip()
+        
+        if raw_exch in ["MCX", "MCXFO", "MCX_FO", "5"]:
+            exch = "MCX"
+        elif raw_exch in ["NFO", "NSE_FO", "2"]:
+            exch = "NFO"
+        elif raw_exch in ["BFO", "BSE_FO", "BSE", "3"]:
+            exch = "BFO"
+        else:
+            exch = "NFO"
         
         logger.info(f"📥 APK OI Request: Token={token}, Exch={exch}, Interval={d.get('interval')}")
 
