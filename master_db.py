@@ -4,7 +4,9 @@ import requests
 import os
 import gc
 import csv
-import io
+import sys
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
 from supabase import create_client
 
 # ==============================================================================
@@ -19,22 +21,37 @@ FYERS_NSE_CM_URL = "https://public.fyers.in/sym_mapping/nse_cm.csv"
 FYERS_NSE_FO_URL = "https://public.fyers.in/sym_mapping/nse_fo.csv"
 FYERS_MCX_URL = "https://public.fyers.in/sym_mapping/mcx_fo.csv"
 
+# Render Web Service Port Binding Keep-Alive Server
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/html")
+        self.end_headers()
+        self.wfile.write(b"Master DB Sync Service Running.")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
+def start_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
+
 def parse_fyers_csv(url, default_exch):
     records = []
     try:
         print(f"📥 Downloading Fyers Scrip Master from {default_exch}...")
         resp = requests.get(url, timeout=60)
         if resp.status_code == 200:
-            # Fyers CSV Files parsing
             lines = resp.text.splitlines()
             reader = csv.reader(lines)
             for row in reader:
-                if len(row) >= 10:
-                    # Map Fyers CSV columns to old DB Schema
-                    # Row Mapping: [FyToken, Description, LotSize, TickSize, ISIN, TradingSymbol, ExchCode, InstrumentType, Strike, Expiry]
-                    fy_token = row[0]          # Fyers Symbol e.g., NSE:SBIN-EQ or FyToken
-                    symbol = row[1]            # Trading Symbol
-                    name = row[1].split("-")[0] if "-" in row[1] else row[1] # Base Name
+                if len(row) >= 9:
+                    # Safe Index Extraction for Fyers CSV Format
+                    fy_token = row[0] if len(row) > 0 else ""
+                    symbol = row[1] if len(row) > 1 else ""
+                    name = symbol.split("-")[0] if "-" in symbol else symbol
                     lotsize = row[2] if len(row) > 2 else "1"
                     tick_size = row[3] if len(row) > 3 else "0.05"
                     instrumenttype = row[7] if len(row) > 7 else ""
@@ -58,14 +75,12 @@ def generate_and_upload_db():
     db_path = os.path.join(tmp_dir, "angel_master.db")
 
     try:
-        # 1. Fyers CSV Files से डेटा फेच करना (NSE Equity, FO और MCX)
         records = []
         records.extend(parse_fyers_csv(FYERS_NSE_CM_URL, "NSE"))
         records.extend(parse_fyers_csv(FYERS_NSE_FO_URL, "NFO"))
         records.extend(parse_fyers_csv(FYERS_MCX_URL, "MCX"))
         
         if len(records) > 0:
-            # 2. SQLite Database बनाना (पुराना सेम स्ट्रक्चर)
             if os.path.exists(db_path): 
                 os.remove(db_path)
                 
@@ -75,31 +90,35 @@ def generate_and_upload_db():
             cursor.execute("PRAGMA journal_mode=OFF")
             cursor.execute("PRAGMA synchronous=OFF")
             
-            # टेबल का नाम और स्ट्रक्चर वही रहेगा
             cursor.execute('''CREATE TABLE symbols (
                 token TEXT, symbol TEXT, name TEXT, expiry TEXT, 
                 strike TEXT, lotsize TEXT, instrumenttype TEXT, 
                 exch_seg TEXT, tick_size TEXT)''')
             
-            print(f"⚙️ Inserting {len(records)} Fyers records into SQLite database...")
+            print(f"⚙️ Inserting {len(records)} records into SQLite database...")
             cursor.executemany("INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?)", records)
             cursor.execute("CREATE INDEX idx_token_fast ON symbols(token)")
             cursor.execute("CREATE INDEX idx_name_fast ON symbols(name)")
             
             conn.commit()
             conn.close()
-            print("✅ [Master] SQLite .db file generated locally.")
+            print("✅ SQLite database generated locally.")
 
-            # 3. Supabase Storage पर 'angel_master.db' को ओवरराइट करना
             print("🚀 Uploading & Overwriting on Supabase Storage...")
             supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+            
             with open(db_path, "rb") as f:
-                supabase.storage.from_(BUCKET_NAME).upload(
-                    path="angel_master.db", 
-                    file=f.read(),
-                    file_options={"x-upsert": "true", "content-type": "application/x-sqlite3"}
-                )
-            print("✅ [Master] Cloud Backup Overwrite to Supabase Complete successfully!")
+                file_bytes = f.read()
+                
+            supabase.storage.from_(BUCKET_NAME).upload(
+                path="angel_master.db", 
+                file=file_bytes,
+                file_options={"x-upsert": "true", "content-type": "application/x-sqlite3"}
+            )
+            
+            print("==================================================")
+            print("🎉 SUCCESS: File Uploaded to Supabase Successfully!")
+            print("==================================================")
             
             del records
             gc.collect()
@@ -111,4 +130,12 @@ def generate_and_upload_db():
     return False
 
 if __name__ == "__main__":
+    # 1. Start Web Server in Background Thread (Required for Render Web Service)
+    web_thread = threading.Thread(target=start_health_server, daemon=True)
+    web_thread.start()
+
+    # 2. Execute Download and Upload on Deployment
     generate_and_upload_db()
+
+    # 3. Keep main thread alive so Render Service stays Green/Live
+    web_thread.join()
