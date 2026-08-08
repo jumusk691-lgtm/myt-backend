@@ -6,6 +6,8 @@ import datetime
 import threading
 import sqlite3
 import pytz
+import os
+import aiohttp
 import socketio
 from aiohttp import web
 
@@ -32,12 +34,14 @@ state = AppState()
 CLIENT_ID = "BC7D6R1O7-100"       # App ID
 SECRET_KEY = "6AEEEFZDT7"         # Secret ID
 REDIRECT_URI = "https://myt-backend-1.onrender.com"
+TOKEN_CACHE_FILE = "token_cache.json"
 
-# --- 🚀 GLOBAL STATES & SCORE TRACKING ---
+# --- 🚀 GLOBAL STATES & CACHE ---
 LTP_CACHE = {}               
 SUBSCRIBED_TOKENS_REGISTRY = set()
 BROKER_SOCKET_CONNECTED = False
 USER_SCORE = 0 
+LOT_SIZE_CACHE = {}
 
 TIMEFRAMES = {
     "1M": 60, "3M": 180, "5M": 300, "15M": 900,
@@ -59,7 +63,6 @@ MAX_CANDLES_LIMIT = 200
 CANDLE_CACHE = {}  
 
 FYERS_ACCESS_TOKEN = None
-
 main_loop = None
 fyers_ws = None
 
@@ -68,11 +71,30 @@ sio = socketio.AsyncServer(async_mode='aiohttp', cors_allowed_origins='*')
 app = web.Application()
 sio.attach(app)
 
+# --- 🎯 GET LOT SIZE FROM DATABASE ---
+def fetch_lot_size(symbol_str):
+    if symbol_str in LOT_SIZE_CACHE:
+        return LOT_SIZE_CACHE[symbol_str]
+    
+    clean_sym = symbol_str.split(":")[-1] if ":" in symbol_str else symbol_str
+    lot_size = 1
+
+    if os.path.exists(state.db_path):
+        try:
+            with sqlite3.connect(state.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT lotsize FROM symbols WHERE symbol = ? OR name = ? LIMIT 1", (clean_sym, clean_sym))
+                row = cursor.fetchone()
+                if row and row[0]:
+                    lot_size = int(row[0])
+        except Exception:
+            pass
+
+    LOT_SIZE_CACHE[symbol_str] = lot_size
+    return lot_size
+
 # --- 🔄 SYMBOL FORMATTER FOR FYERS ---
 def format_fyers_symbol(symbol_str, exch="NSE"):
-    """
-    Ensures symbol is in Fyers format e.g. NSE:SBIN-EQ, NFO:BANKNIFTY23AUGFUT, MCX:CRUDEOIL23SEPFUT
-    """
     sym = str(symbol_str).strip()
     if ":" in sym:
         return sym.upper()
@@ -85,7 +107,6 @@ def format_fyers_symbol(symbol_str, exch="NSE"):
     elif ex_str in ["3", "BSE", "BSE_CM", "BFO"]:
         return f"BSE:{sym}".upper()
     
-    # Default Equity / NSE
     if not sym.endswith("-EQ") and not sym.endswith("-INDEX"):
         sym = f"{sym}-EQ"
     return f"NSE:{sym}".upper()
@@ -95,7 +116,6 @@ def update_user_score(points=1):
     global USER_SCORE
     USER_SCORE += points
     state.score = USER_SCORE
-    logger.info(f"📊 Current User Score: {USER_SCORE}")
     return USER_SCORE
 
 # --- 📈 REALTIME TICK CANDLE AGGREGATOR ---
@@ -128,14 +148,34 @@ def update_token_candles(token_str, price_val):
                 last_candle["high"] = max(last_candle["high"], price_val)
                 last_candle["low"] = min(last_candle["low"], price_val)
 
+# --- 🔑 AUTO ACCESS TOKEN SAVER & LOAD ---
+def save_token_to_file(token):
+    try:
+        with open(TOKEN_CACHE_FILE, "w") as f:
+            json.dump({"access_token": token, "updated_at": str(datetime.datetime.now(IST))}, f)
+    except Exception as e:
+        logger.error(f"Failed to save token: {e}")
+
+def load_cached_token():
+    global FYERS_ACCESS_TOKEN, state
+    if os.path.exists(TOKEN_CACHE_FILE):
+        try:
+            with open(TOKEN_CACHE_FILE, "r") as f:
+                data = json.load(f)
+                token = data.get("access_token")
+                if token:
+                    FYERS_ACCESS_TOKEN = token
+                    state.fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=FYERS_ACCESS_TOKEN, log_path="")
+                    logger.info("🔑 Loaded cached FYERS Access Token successfully!")
+                    threading.Thread(target=start_fyers_websocket_worker, daemon=True).start()
+        except Exception as e:
+            logger.error(f"Error loading cached token: {e}")
+
 # ==============================================================================
 # --- 🌐 REST HTTP API ENDPOINTS ---
 # ==============================================================================
 
 async def handle_fyers_login(request: web.Request):
-    """
-    Receives auth_code from frontend/client and generates FYERS_ACCESS_TOKEN
-    """
     global FYERS_ACCESS_TOKEN, state
     try:
         d = await request.json()
@@ -155,9 +195,9 @@ async def handle_fyers_login(request: web.Request):
 
         if response and isinstance(response, dict) and response.get("s") == "ok":
             FYERS_ACCESS_TOKEN = response.get("access_token")
+            save_token_to_file(FYERS_ACCESS_TOKEN)
             state.fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=FYERS_ACCESS_TOKEN, log_path="")
             
-            # Start WebSocket Thread upon successful login
             threading.Thread(target=start_fyers_websocket_worker, daemon=True).start()
             
             current_score = update_user_score(5)
@@ -183,7 +223,7 @@ async def fetch_chart_data(request: web.Request):
         range_to = now.strftime('%Y-%m-%d')
         range_from = (now - datetime.timedelta(days=15)).strftime('%Y-%m-%d')
 
-        logger.info(f"📥 Chart Req: Symbol={fyers_symbol}, Res={resolution}")
+        lot_size = fetch_lot_size(token)
 
         if state.fyers:
             data_param = {
@@ -214,6 +254,7 @@ async def fetch_chart_data(request: web.Request):
                     "token": token,
                     "symbol": fyers_symbol,
                     "interval": requested_interval,
+                    "lot_size": lot_size,
                     "score": current_score,
                     "data": formatted_candles
                 })
@@ -222,6 +263,7 @@ async def fetch_chart_data(request: web.Request):
         return web.json_response({
             "status": False,
             "token": token,
+            "lot_size": lot_size,
             "score": current_score,
             "error": "No data or FYERS not authenticated",
             "data": []
@@ -245,6 +287,8 @@ async def fetch_historical_oi_data(request: web.Request):
         range_to = now.strftime('%Y-%m-%d')
         range_from = (now - datetime.timedelta(days=5)).strftime('%Y-%m-%d')
 
+        lot_size = fetch_lot_size(token)
+
         if state.fyers:
             data_param = {
                 "symbol": fyers_symbol,
@@ -262,35 +306,60 @@ async def fetch_historical_oi_data(request: web.Request):
                 return web.json_response({
                     "status": True,
                     "token": token,
+                    "lot_size": lot_size,
                     "score": current_score,
                     "data": response.get("candles", [])
                 })
 
-        return web.json_response({"status": False, "token": token, "data": []})
+        return web.json_response({"status": False, "token": token, "lot_size": lot_size, "data": []})
     except Exception as e:
         logger.error(f"❌ OI Error: {e}")
         return web.json_response({"status": False, "error": str(e)})
 
-async def get_expiry(request: web.Request):
+# --- 🔊 SILENT AUDIO BUSTER TO PREVENT RENDER SLEEP ---
+async def handle_ping_stream(request):
+    """
+    Returns endless silent MP3 stream to keep connections & CPU active
+    """
+    response = web.StreamResponse(
+        status=200,
+        reason='OK',
+        headers={
+            'Content-Type': 'audio/mpeg',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive'
+        }
+    )
+    await response.prepare(request)
+    # Minimal 1-second silent MP3 buffer frame
+    silent_mp3_frame = b'\xff\xe3\x18\xc4\x00\x00\x00\x03\x48\x00\x00\x00\x00' + b'\x00' * 100
     try:
-        d = await request.json()
-        name = d.get('name', '').upper()
-        if not name or not state.db_path:
-            return web.json_response({"expiries": [], "status": False})
+        while True:
+            await response.write(silent_mp3_frame)
+            await asyncio.sleep(10)
+    except Exception:
+        pass
+    return response
 
-        with sqlite3.connect(state.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT DISTINCT expiry FROM symbols WHERE name = ? AND expiry != '' ORDER BY expiry ASC", (name,))
-            exps = [r[0] for r in cursor.fetchall()]
-        
-        return web.json_response({"status": True, "name": name, "expiries": exps})
-    except Exception as e:
-        return web.json_response({"expiries": [], "status": False})
+# Self Keep-Alive Ping Thread
+def keep_alive_self_ping():
+    while True:
+        try:
+            time.sleep(120)  # Ping every 2 minutes
+            import urllib.request
+            urllib.request.urlopen("https://myt-backend-1.onrender.com/ping").read()
+            logger.info("🔊 Anti-Sleep Heartbeat Ping Executed")
+        except Exception:
+            pass
+
+async def handle_ping(request):
+    return web.json_response({"status": "active", "timestamp": str(datetime.datetime.now(IST))})
 
 app.router.add_post('/api/login', handle_fyers_login)
 app.router.add_post('/api/get_chart_data', fetch_chart_data)
 app.router.add_post('/api/get_oi_data', fetch_historical_oi_data)
-app.router.add_post('/api/expiry_list', get_expiry)
+app.router.add_get('/ping', handle_ping)
+app.router.add_get('/silent_stream', handle_ping_stream)
 
 # ==============================================================================
 # --- 📡 REALTIME WEBSOCKET & SOCKET.IO ENGINE ---
@@ -314,9 +383,15 @@ def on_message_received(ticks):
         if price_val > 0:
             update_token_candles(symbol, price_val)
 
+        lot_size = fetch_lot_size(symbol)
+
         if main_loop:
             asyncio.run_coroutine_threadsafe(
-                sio.emit("live_data", {"token": symbol, "ltp": price_str}, room=symbol), 
+                sio.emit("live_data", {
+                    "token": symbol, 
+                    "ltp": price_str, 
+                    "lot_size": lot_size
+                }, room=symbol), 
                 main_loop
             )
     except Exception:
@@ -358,31 +433,17 @@ async def subscribe_request(sid, data):
                 SUBSCRIBED_TOKENS_REGISTRY.add(fyers_symbol)
 
                 if fyers_symbol in LTP_CACHE:
-                    await sio.emit("live_data", {"token": fyers_symbol, "ltp": LTP_CACHE[fyers_symbol]}, room=sid)
+                    await sio.emit("live_data", {
+                        "token": fyers_symbol, 
+                        "ltp": LTP_CACHE[fyers_symbol],
+                        "lot_size": fetch_lot_size(fyers_symbol)
+                    }, room=sid)
 
             if BROKER_SOCKET_CONNECTED and fyers_ws and formatted_symbols:
                 fyers_ws.subscribe(symbols=formatted_symbols, data_type="symbolUpdate")
 
     except Exception as e:
         logger.error(f"Subscribe Error: {e}")
-
-@sio.event
-async def get_candles(sid, data):
-    try:
-        payload = json.loads(data) if isinstance(data, str) else data
-        token_str = str(payload.get("token", ""))
-        tf_key = str(payload.get("timeframe", "5M")).upper()
-
-        update_user_score(1)
-        candles_response = CANDLE_CACHE.get(token_str, {}).get(tf_key, [])
-
-        await sio.emit("candles_response", {
-            "token": token_str,
-            "timeframe": tf_key,
-            "candles": candles_response
-        }, room=sid)
-    except Exception as e:
-        logger.error(f"Get Candles Error: {e}")
 
 def start_fyers_websocket_worker():
     global fyers_ws
@@ -406,6 +467,8 @@ def start_fyers_websocket_worker():
 async def start_background_tasks(app_instance):
     global main_loop
     main_loop = asyncio.get_event_loop()
+    load_cached_token()
+    threading.Thread(target=keep_alive_self_ping, daemon=True).start()
 
 app.on_startup.append(start_background_tasks)
 
