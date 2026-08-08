@@ -5,87 +5,92 @@ import time
 import datetime
 import threading
 import sqlite3
-import gc
-import socketio
-import pyotp
 import pytz
+import socketio
 from aiohttp import web
-from requests.exceptions import ReadTimeout
 
-from SmartApi import SmartConnect
-from SmartApi.smartWebSocketV2 import SmartWebSocketV2
+# --- FYERS OFFICIAL SDK IMPORTS ---
+from fyers_apiv3 import fyersModel
+from fyers_apiv3.FyersWebsocket import data_ws
 
 # --- 🕒 TIMEZONE & LOGGING SETUP ---
 IST = pytz.timezone('Asia/Kolkata')
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("MUNH_TITAN_PROD")
+logger = logging.getLogger("FYERS_TITAN_PROD")
 
 # --- ⚙️ INTERNAL APP STATE ENGINE ---
 class AppState:
     def __init__(self):
-        self.smart_api = None
+        self.fyers = None
         self.db_path = "angel_master.db"
         self.score = 0
 
 state = AppState()
 
-# --- 🔑 CREDENTIALS ---
-API_KEY = "Z80wG5Sg"
-CLIENT_CODE = "S52638556"
-MPIN = "0000"
-TOTP_STR = "XFTXZ2445N4V2UMB7EWUCBDRMU"
+# --- 🔑 FYERS CREDENTIALS ---
+CLIENT_ID = "BC7D6R1O7-100"       # App ID
+SECRET_KEY = "6AEEEFZDT7"         # Secret ID
+REDIRECT_URI = "https://myt-backend-1.onrender.com"
 
 # --- 🚀 GLOBAL STATES & SCORE TRACKING ---
 LTP_CACHE = {}               
-SUBSCRIBED_TOKENS_REGISTRY = {1: set(), 2: set(), 3: set(), 4: set(), 5: set()}
+SUBSCRIBED_TOKENS_REGISTRY = set()
 BROKER_SOCKET_CONNECTED = False
 USER_SCORE = 0 
-IS_RECONNECTING = False  # Guard against thread spams and rate limits
 
-# --- 📊 CANDLE ENGINE CONFIGURATION (200 CANDLES MAX) ---
 TIMEFRAMES = {
-    "1M": 60,
-    "3M": 180,
-    "5M": 300,
-    "15M": 900,
-    "25M": 1500,
-    "30M": 1800,
-    "1H": 3600,
-    "1D": 86400
+    "1M": 60, "3M": 180, "5M": 300, "15M": 900,
+    "25M": 1500, "30M": 1800, "1H": 3600, "1D": 86400
 }
-MAX_CANDLES_LIMIT = 200
-CANDLE_CACHE = {}  # Format: { token_str: { tf_key: [ {time, open, high, low, close}, ... ] } }
 
-BROKER_JWT_TOKEN = None
-BROKER_FEED_TOKEN = None
-LAST_BROKER_LOGIN_TIME = 0
+FYERS_RESOLUTION_MAP = {
+    "ONE_MINUTE": "1", "1M": "1",
+    "THREE_MINUTE": "3", "3M": "3",
+    "FIVE_MINUTE": "5", "5M": "5",
+    "TEN_MINUTE": "10", "10M": "10",
+    "FIFTEEN_MINUTE": "15", "15M": "15",
+    "THIRTY_MINUTE": "30", "30M": "30",
+    "ONE_HOUR": "60", "1H": "60",
+    "ONE_DAY": "D", "1D": "D"
+}
+
+MAX_CANDLES_LIMIT = 200
+CANDLE_CACHE = {}  
+
+FYERS_ACCESS_TOKEN = None
 
 main_loop = None
-sws_client = None
+fyers_ws = None
 
 # Socket.IO & Aiohttp Setup
 sio = socketio.AsyncServer(async_mode='aiohttp', cors_allowed_origins='*')
 app = web.Application()
 sio.attach(app)
 
-# --- 🔄 EXCHANGE CODE NORMALIZER ---
-def normalize_exchange(exch):
+# --- 🔄 SYMBOL FORMATTER FOR FYERS ---
+def format_fyers_symbol(symbol_str, exch="NSE"):
     """
-    NSE = 1, NFO = 2, BSE = 3, CDS = 4, MCX = 5
+    Ensures symbol is in Fyers format e.g. NSE:SBIN-EQ, NFO:BANKNIFTY23AUGFUT, MCX:CRUDEOIL23SEPFUT
     """
+    sym = str(symbol_str).strip()
+    if ":" in sym:
+        return sym.upper()
+    
     ex_str = str(exch).upper().strip()
     if ex_str in ["5", "MCX", "MCX_FO", "MCXFO"]:
-        return 5
+        return f"MCX:{sym}".upper()
     elif ex_str in ["2", "NFO", "NSE_FO"]:
-        return 2
+        return f"NFO:{sym}".upper()
     elif ex_str in ["3", "BSE", "BSE_CM", "BFO"]:
-        return 3
-    elif ex_str in ["4", "CDS", "CNO"]:
-        return 4
-    return 1  # Default NSE
+        return f"BSE:{sym}".upper()
+    
+    # Default Equity / NSE
+    if not sym.endswith("-EQ") and not sym.endswith("-INDEX"):
+        sym = f"{sym}-EQ"
+    return f"NSE:{sym}".upper()
 
-# --- 🎯 SCORE LOGIC ---
+# --- 🎯 SCORE LOGIC ENGINE ---
 def update_user_score(points=1):
     global USER_SCORE
     USER_SCORE += points
@@ -93,11 +98,10 @@ def update_user_score(points=1):
     logger.info(f"📊 Current User Score: {USER_SCORE}")
     return USER_SCORE
 
-# --- 📈 LIVE TICK CANDLE AGGREGATOR (REALTIME ONLY) ---
+# --- 📈 REALTIME TICK CANDLE AGGREGATOR ---
 def update_token_candles(token_str, price_val):
     if price_val <= 0:
         return
-
     now_sec = int(time.time())
     if token_str not in CANDLE_CACHE:
         CANDLE_CACHE[token_str] = {}
@@ -112,147 +116,119 @@ def update_token_candles(token_str, price_val):
         bucket_time = (now_sec // interval_sec) * interval_sec
 
         if not tf_list:
-            new_candle = {
-                "time": bucket_time,
-                "open": price_val,
-                "high": price_val,
-                "low": price_val,
-                "close": price_val
-            }
-            tf_list.append(new_candle)
+            tf_list.append({"time": bucket_time, "open": price_val, "high": price_val, "low": price_val, "close": price_val})
         else:
             last_candle = tf_list[-1]
             if bucket_time > last_candle["time"]:
-                new_candle = {
-                    "time": bucket_time,
-                    "open": last_candle["close"],
-                    "high": max(last_candle["close"], price_val),
-                    "low": min(last_candle["close"], price_val),
-                    "close": price_val
-                }
-                tf_list.append(new_candle)
+                tf_list.append({"time": bucket_time, "open": last_candle["close"], "high": max(last_candle["close"], price_val), "low": min(last_candle["close"], price_val), "close": price_val})
                 if len(tf_list) > MAX_CANDLES_LIMIT:
                     tf_list.pop(0)
             else:
                 last_candle["close"] = price_val
-                if price_val > last_candle["high"]:
-                    last_candle["high"] = price_val
-                if price_val < last_candle["low"]:
-                    last_candle["low"] = price_val
+                last_candle["high"] = max(last_candle["high"], price_val)
+                last_candle["low"] = min(last_candle["low"], price_val)
 
 # ==============================================================================
 # --- 🌐 REST HTTP API ENDPOINTS ---
 # ==============================================================================
 
+async def handle_fyers_login(request: web.Request):
+    """
+    Receives auth_code from frontend/client and generates FYERS_ACCESS_TOKEN
+    """
+    global FYERS_ACCESS_TOKEN, state
+    try:
+        d = await request.json()
+        auth_code = d.get("auth_code")
+        if not auth_code:
+            return web.json_response({"status": False, "error": "auth_code is required"})
+
+        session = fyersModel.SessionModel(
+            client_id=CLIENT_ID,
+            secret_key=SECRET_KEY,
+            redirect_uri=REDIRECT_URI,
+            response_type="code",
+            grant_type="authorization_code"
+        )
+        session.set_token(auth_code)
+        response = session.generate_token()
+
+        if response and isinstance(response, dict) and response.get("s") == "ok":
+            FYERS_ACCESS_TOKEN = response.get("access_token")
+            state.fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=FYERS_ACCESS_TOKEN, log_path="")
+            
+            # Start WebSocket Thread upon successful login
+            threading.Thread(target=start_fyers_websocket_worker, daemon=True).start()
+            
+            current_score = update_user_score(5)
+            logger.info("✅ FYERS Login & Access Token Successful!")
+            return web.json_response({"status": True, "message": "Logged in successfully", "score": current_score})
+        else:
+            return web.json_response({"status": False, "error": response})
+    except Exception as e:
+        logger.error(f"❌ Login Endpoint Error: {e}")
+        return web.json_response({"status": False, "error": str(e)})
+
 async def fetch_chart_data(request: web.Request):
     try:
         d = await request.json()
-        token = str(d.get('token', ''))
+        token = str(d.get('token', d.get('symbol', '')))
         raw_exch = str(d.get('exch', 'NSE')).upper().strip()
-        
-        # 🛠️ FIX 1: Robust Exchange Mapping for Angel One Smart API
-        if raw_exch in ["MCX", "MCXFO", "MCX_FO", "5"]:
-            exch = "MCX"
-        elif raw_exch in ["NFO", "NSE_FO", "2"]:
-            exch = "NFO"
-        elif raw_exch in ["BFO", "BSE_FO", "BSE", "3"]:
-            exch = "BFO"
-        elif raw_exch in ["CDS", "CNO", "4"]:
-            exch = "CDS"
-        else:
-            exch = "NSE"
+        fyers_symbol = format_fyers_symbol(token, raw_exch)
 
-        # Log incoming request details
-        logger.info(f"📥 APK Chart Request: Token={token}, OriginalExch={raw_exch} -> ParsedExch={exch}, Interval={d.get('interval')}")
+        requested_interval = str(d.get('interval', "FIVE_MINUTE")).upper()
+        resolution = FYERS_RESOLUTION_MAP.get(requested_interval, "5")
 
-        requested_interval = d.get('interval', "FIVE_MINUTE")
-        valid_intervals = {
-            "ONE_MINUTE": "ONE_MINUTE",
-            "THREE_MINUTE": "THREE_MINUTE",
-            "FIVE_MINUTE": "FIVE_MINUTE",
-            "TEN_MINUTE": "TEN_MINUTE",
-            "FIFTEEN_MINUTE": "FIFTEEN_MINUTE",
-            "THIRTY_MINUTE": "THIRTY_MINUTE",
-            "ONE_HOUR": "ONE_HOUR",
-            "ONE_DAY": "ONE_DAY"
-        }
-        interval = valid_intervals.get(requested_interval, "FIVE_MINUTE")
+        now = datetime.datetime.now(IST)
+        range_to = now.strftime('%Y-%m-%d')
+        range_from = (now - datetime.timedelta(days=15)).strftime('%Y-%m-%d')
 
-        # 🛠️ FIX 2: Optimized date lookbacks (MCX needs sufficient lookback for active contracts)
-        interval_days_map = {
-            "ONE_MINUTE": 3,       
-            "THREE_MINUTE": 5,     
-            "FIVE_MINUTE": 10,      
-            "TEN_MINUTE": 15,      
-            "FIFTEEN_MINUTE": 25,  
-            "THIRTY_MINUTE": 45,   
-            "ONE_HOUR": 90,        
-            "ONE_DAY": 500         
-        }
-        days_to_subtract = interval_days_map.get(interval, 10)
+        logger.info(f"📥 Chart Req: Symbol={fyers_symbol}, Res={resolution}")
 
-        historic_data = None
-        if state.smart_api:
-            try:
-                now = datetime.datetime.now(IST)
-                to_date = now.strftime('%Y-%m-%d %H:%M')
-                from_date = (now - datetime.timedelta(days=days_to_subtract)).strftime('%Y-%m-%d %H:%M')
-
-                params = {
-                    "exchange": exch,
-                    "symboltoken": token,
-                    "interval": interval,
-                    "fromdate": from_date,
-                    "todate": to_date
-                }
-                logger.info(f"📈 Sending Params to Angel: {params}")
-                historic_data = state.smart_api.getCandleData(params)
-                
-                logger.info(f"🔍 Angel API Raw Response (Chart): {historic_data}")
-                
-            except Exception as ex:
-                logger.warning(f"⚠️ Angel API getCandleData exception: {ex}")
-
-        if historic_data and isinstance(historic_data, dict) and historic_data.get('status'):
-            current_score = update_user_score(1)
-            raw_candles = historic_data.get('data', [])
-            
-            # Format raw candles for easy parsing on Mobile Canvas/Chart Library
-            formatted_candles = []
-            if raw_candles:
-                for item in raw_candles:
-                    # Format: [timestamp_str, open, high, low, close, volume]
-                    formatted_candles.append({
-                        "time": item[0],
-                        "open": float(item[1]),
-                        "high": float(item[2]),
-                        "low": float(item[3]),
-                        "close": float(item[4]),
-                        "volume": int(item[5]) if len(item) > 5 else 0
-                    })
-
-            result = {
-                "status": True,
-                "token": token,
-                "interval": interval,
-                "score": current_score,
-                "data": formatted_candles
+        if state.fyers:
+            data_param = {
+                "symbol": fyers_symbol,
+                "resolution": resolution,
+                "date_format": "1",
+                "range_from": range_from,
+                "range_to": range_to,
+                "cont_flag": "1"
             }
-            return web.json_response(result)
-        
-        logger.warning(f"⚠️ Angel API returned no data or error. Token: {token}, Exch: {exch}")
+            response = state.fyers.history(data=data_param)
+
+            if response and isinstance(response, dict) and response.get("s") == "ok":
+                current_score = update_user_score(1)
+                raw_candles = response.get("candles", [])
+                
+                formatted_candles = [{
+                    "time": item[0],
+                    "open": float(item[1]),
+                    "high": float(item[2]),
+                    "low": float(item[3]),
+                    "close": float(item[4]),
+                    "volume": int(item[5]) if len(item) > 5 else 0
+                } for item in raw_candles]
+
+                return web.json_response({
+                    "status": True,
+                    "token": token,
+                    "symbol": fyers_symbol,
+                    "interval": requested_interval,
+                    "score": current_score,
+                    "data": formatted_candles
+                })
+
         current_score = update_user_score(1)
         return web.json_response({
             "status": False,
             "token": token,
-            "interval": interval,
             "score": current_score,
-            "error": historic_data.get("message", "No historical data available") if isinstance(historic_data, dict) else "No data",
+            "error": "No data or FYERS not authenticated",
             "data": []
         })
 
     except Exception as e:
-        logger.error(f"❌ [History Error]: {e}")
+        logger.error(f"❌ Chart Error: {e}")
         return web.json_response({"status": False, "error": str(e)})
 
 async def fetch_historical_oi_data(request: web.Request):
@@ -260,89 +236,39 @@ async def fetch_historical_oi_data(request: web.Request):
         d = await request.json()
         token = str(d.get('token', ''))
         raw_exch = str(d.get('exch', 'NFO')).upper().strip()
-        
-        if raw_exch in ["MCX", "MCXFO", "MCX_FO", "5"]:
-            exch = "MCX"
-        elif raw_exch in ["NFO", "NSE_FO", "2"]:
-            exch = "NFO"
-        elif raw_exch in ["BFO", "BSE_FO", "BSE", "3"]:
-            exch = "BFO"
-        else:
-            exch = "NFO"
-        
-        logger.info(f"📥 APK OI Request: Token={token}, Exch={exch}, Interval={d.get('interval')}")
+        fyers_symbol = format_fyers_symbol(token, raw_exch)
 
-        requested_interval = d.get('interval', "THREE_MINUTE")
-        
-        valid_intervals = {
-            "ONE_MINUTE": "ONE_MINUTE",
-            "THREE_MINUTE": "THREE_MINUTE",
-            "FIVE_MINUTE": "FIVE_MINUTE",
-            "TEN_MINUTE": "TEN_MINUTE",
-            "FIFTEEN_MINUTE": "FIFTEEN_MINUTE",
-            "THIRTY_MINUTE": "THIRTY_MINUTE",
-            "ONE_HOUR": "ONE_HOUR",
-            "ONE_DAY": "ONE_DAY"
-        }
-        interval = valid_intervals.get(requested_interval, "THREE_MINUTE")
+        requested_interval = str(d.get('interval', "THREE_MINUTE")).upper()
+        resolution = FYERS_RESOLUTION_MAP.get(requested_interval, "3")
 
-        interval_days_map = {
-            "ONE_MINUTE": 3,       
-            "THREE_MINUTE": 5,     
-            "FIVE_MINUTE": 8,      
-            "TEN_MINUTE": 15,      
-            "FIFTEEN_MINUTE": 20,  
-            "THIRTY_MINUTE": 40,   
-            "ONE_HOUR": 80,        
-            "ONE_DAY": 500         
-        }
-        days_to_subtract = interval_days_map.get(interval, 5)
+        now = datetime.datetime.now(IST)
+        range_to = now.strftime('%Y-%m-%d')
+        range_from = (now - datetime.timedelta(days=5)).strftime('%Y-%m-%d')
 
-        oi_data = None
-        if state.smart_api:
-            try:
-                now = datetime.datetime.now(IST)
-                to_date = now.strftime('%Y-%m-%d %H:%M')
-                from_date = (now - datetime.timedelta(days=days_to_subtract)).strftime('%Y-%m-%d %H:%M')
+        if state.fyers:
+            data_param = {
+                "symbol": fyers_symbol,
+                "resolution": resolution,
+                "date_format": "1",
+                "range_from": range_from,
+                "range_to": range_to,
+                "cont_flag": "1",
+                "oi_flag": "1"
+            }
+            response = state.fyers.history(data=data_param)
 
-                params = {
-                    "exchange": exch,
-                    "symboltoken": token,
-                    "interval": interval,
-                    "fromdate": from_date,
-                    "todate": to_date
-                }
-                
-                logger.info(f"📊 Sending Params to Angel (OI): {params}")
-                if hasattr(state.smart_api, 'getOIData'):
-                    oi_data = state.smart_api.getOIData(params)
-                else:
-                    url = "https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getOIData"
-                    response = state.smart_api._session.post(url, json=params, headers=state.smart_api._get_common_headers())
-                    oi_data = response.json()
-                
-                logger.info(f"🔍 Angel API Raw Response (OI): {oi_data}")
-                
-            except Exception as ex:
-                logger.warning(f"⚠️ Angel API getOIData exception: {ex}")
+            if response and isinstance(response, dict) and response.get("s") == "ok":
+                current_score = update_user_score(1)
+                return web.json_response({
+                    "status": True,
+                    "token": token,
+                    "score": current_score,
+                    "data": response.get("candles", [])
+                })
 
-        if oi_data and isinstance(oi_data, dict) and oi_data.get('status'):
-            current_score = update_user_score(1)
-            return web.json_response({
-                "status": True,
-                "token": token,
-                "score": current_score,
-                "data": oi_data.get('data', [])
-            })
-
-        return web.json_response({
-            "status": False,
-            "token": token,
-            "error": oi_data.get("message", "No OI data available") if isinstance(oi_data, dict) else "No data",
-            "data": []
-        })
+        return web.json_response({"status": False, "token": token, "data": []})
     except Exception as e:
-        logger.error(f"❌ [OI History Error]: {e}")
+        logger.error(f"❌ OI Error: {e}")
         return web.json_response({"status": False, "error": str(e)})
 
 async def get_expiry(request: web.Request):
@@ -354,98 +280,91 @@ async def get_expiry(request: web.Request):
 
         with sqlite3.connect(state.db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute("""
-                SELECT DISTINCT expiry 
-                FROM symbols 
-                WHERE name = ? AND expiry != '' 
-                ORDER BY expiry ASC
-            """, (name,))
+            cursor.execute("SELECT DISTINCT expiry FROM symbols WHERE name = ? AND expiry != '' ORDER BY expiry ASC", (name,))
             exps = [r[0] for r in cursor.fetchall()]
         
         return web.json_response({"status": True, "name": name, "expiries": exps})
     except Exception as e:
         return web.json_response({"expiries": [], "status": False})
 
+app.router.add_post('/api/login', handle_fyers_login)
 app.router.add_post('/api/get_chart_data', fetch_chart_data)
 app.router.add_post('/api/get_oi_data', fetch_historical_oi_data)
 app.router.add_post('/api/expiry_list', get_expiry)
 
-# --- 🛡️ ANGEL ONE LOGIN WITH RATE-LIMIT GUARD ---
-def login_with_retry(smart_conn, client_code, mpin, totp_val):
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            session_data = smart_conn.generateSession(client_code, mpin, totp_val)
-            if isinstance(session_data, dict) and session_data.get('status'):
-                logger.info("✅ Login successful!")
-                return session_data
-            else:
-                logger.warning(f"⚠️ Login attempt {attempt + 1} response: {session_data}")
-        except Exception as e:
-            logger.error(f"❌ Login error on attempt {attempt + 1}: {e}")
-        
-        time.sleep(5)
-    return None
+# ==============================================================================
+# --- 📡 REALTIME WEBSOCKET & SOCKET.IO ENGINE ---
+# ==============================================================================
 
-# --- 📡 CORE REALTIME ENGINE ---
-def on_data_received(wsapp, message):
+def on_message_received(ticks):
     global main_loop
     try:
-        tick_data = json.loads(message) if isinstance(message, str) else message
-        token_str = str(tick_data.get("token", tick_data.get("t", "")))
-        raw_ltp = tick_data.get("last_traded_price", tick_data.get("ltp", 0))
+        symbol = ticks.get("symbol", ticks.get("n", ""))
+        raw_ltp = ticks.get("ltp", ticks.get("v", {}).get("lp", 0))
 
         try:
-            val = float(raw_ltp)
-            price_val = val / 100.0 if val > 0 else 0.0
+            price_val = float(raw_ltp)
             price_str = f"{price_val:.2f}"
-        except:
+        except Exception:
             price_val = 0.0
             price_str = str(raw_ltp)
 
-        LTP_CACHE[token_str] = price_str
+        LTP_CACHE[symbol] = price_str
 
         if price_val > 0:
-            update_token_candles(token_str, price_val)
+            update_token_candles(symbol, price_val)
 
         if main_loop:
             asyncio.run_coroutine_threadsafe(
-                sio.emit("live_data", {"token": token_str, "ltp": price_str}, room=token_str), 
+                sio.emit("live_data", {"token": symbol, "ltp": price_str}, room=symbol), 
                 main_loop
             )
-    except Exception as e:
+    except Exception:
         pass
+
+def on_ws_open():
+    global BROKER_SOCKET_CONNECTED
+    BROKER_SOCKET_CONNECTED = True
+    logger.info("✅ FYERS Realtime WebSocket Connected!")
+    if fyers_ws and SUBSCRIBED_TOKENS_REGISTRY:
+        fyers_ws.subscribe(symbols=list(SUBSCRIBED_TOKENS_REGISTRY), data_type="symbolUpdate")
+
+def on_ws_error(msg):
+    logger.error(f"❌ FYERS WebSocket Error: {msg}")
+
+def on_ws_close():
+    global BROKER_SOCKET_CONNECTED
+    BROKER_SOCKET_CONNECTED = False
+    logger.warning("⚠️ FYERS WebSocket Closed")
 
 @sio.event
 async def subscribe_request(sid, data):
-    global sws_client
+    global fyers_ws
     try:
         payload = json.loads(data) if isinstance(data, str) else data
-        action = payload.get("action", "")
-        raw_exch = payload.get("exchange", 1)
-        exchange_code = normalize_exchange(raw_exch)
+        action = payload.get("action", "sub")
+        raw_exch = payload.get("exchange", "NSE")
         tokens_list = payload.get("tokens", [])
 
         if action == "sub":
-            update_user_score(1) 
-            
-            for token in tokens_list:
-                str_token = str(token)
-                await sio.enter_room(sid, str_token)
-                
-                if str_token in LTP_CACHE:
-                    await sio.emit("live_data", {"token": str_token, "ltp": LTP_CACHE[str_token]}, room=sid)
-                
-                if exchange_code in SUBSCRIBED_TOKENS_REGISTRY:
-                    SUBSCRIBED_TOKENS_REGISTRY[exchange_code].add(str_token)
+            update_user_score(1)
+            formatted_symbols = []
 
-            if BROKER_SOCKET_CONNECTED and sws_client:
-                try:
-                    sws_client.subscribe("munh_titan_live", 1, [{"exchangeType": exchange_code, "tokens": tokens_list}])
-                except Exception as e:
-                    logger.error(f"Error subscribing: {e}")
+            for token in tokens_list:
+                fyers_symbol = format_fyers_symbol(str(token), raw_exch)
+                formatted_symbols.append(fyers_symbol)
+                
+                await sio.enter_room(sid, fyers_symbol)
+                SUBSCRIBED_TOKENS_REGISTRY.add(fyers_symbol)
+
+                if fyers_symbol in LTP_CACHE:
+                    await sio.emit("live_data", {"token": fyers_symbol, "ltp": LTP_CACHE[fyers_symbol]}, room=sid)
+
+            if BROKER_SOCKET_CONNECTED and fyers_ws and formatted_symbols:
+                fyers_ws.subscribe(symbols=formatted_symbols, data_type="symbolUpdate")
+
     except Exception as e:
-        logger.error(f"Error in subscribe_request: {e}")
+        logger.error(f"Subscribe Error: {e}")
 
 @sio.event
 async def get_candles(sid, data):
@@ -455,10 +374,7 @@ async def get_candles(sid, data):
         tf_key = str(payload.get("timeframe", "5M")).upper()
 
         update_user_score(1)
-
-        candles_response = []
-        if token_str in CANDLE_CACHE and tf_key in CANDLE_CACHE[token_str]:
-            candles_response = CANDLE_CACHE[token_str][tf_key]
+        candles_response = CANDLE_CACHE.get(token_str, {}).get(tf_key, [])
 
         await sio.emit("candles_response", {
             "token": token_str,
@@ -466,123 +382,30 @@ async def get_candles(sid, data):
             "candles": candles_response
         }, room=sid)
     except Exception as e:
-        logger.error(f"Error fetching candles: {e}")
+        logger.error(f"Get Candles Error: {e}")
 
-# --- 🛠️ SESSION & CONNECTION HANDLING ---
-def force_broker_socket_restart():
-    global sws_client, BROKER_SOCKET_CONNECTED
-    if sws_client and BROKER_SOCKET_CONNECTED:
-        try: 
-            sws_client.close()
-        except Exception: 
-            pass
-
-async def broker_auto_login_task():
-    global BROKER_JWT_TOKEN, BROKER_FEED_TOKEN, LAST_BROKER_LOGIN_TIME
-    while True:
-        try:
-            if BROKER_JWT_TOKEN is None or (time.time() - LAST_BROKER_LOGIN_TIME >= 36000):
-                totp_crypto = pyotp.TOTP(TOTP_STR)
-                smart_conn = SmartConnect(api_key=API_KEY)
-                
-                session_data = login_with_retry(smart_conn, CLIENT_CODE, MPIN, totp_crypto.now())
-                
-                if session_data and isinstance(session_data, dict) and session_data.get('status'):
-                    BROKER_JWT_TOKEN = session_data['data']['jwtToken']
-                    BROKER_FEED_TOKEN = session_data['data']['feedToken']
-                    LAST_BROKER_LOGIN_TIME = time.time()
-                    state.smart_api = smart_conn
-                    force_broker_socket_restart()
-        except Exception as e:
-            logger.error(f"Broker auto-login task error: {e}")
-        await asyncio.sleep(600)
-
-def on_websocket_open(wsapp, *args, **kwargs):
-    global BROKER_SOCKET_CONNECTED, IS_RECONNECTING
-    BROKER_SOCKET_CONNECTED = True
-    IS_RECONNECTING = False
-    logger.info("✅ Broker WebSocket Connected!")
-    for exch_code, tokens_set in SUBSCRIBED_TOKENS_REGISTRY.items():
-        if tokens_set:
-            try:
-                sws_client.subscribe("munh_titan_live", 1, [{"exchangeType": exch_code, "tokens": list(tokens_set)}])
-            except Exception as e:
-                logger.error(f"Error subscribing tokens on websocket open: {e}")
-
-def on_websocket_close(wsapp, *args, **kwargs):
-    global BROKER_SOCKET_CONNECTED
-    BROKER_SOCKET_CONNECTED = False
-    logger.warning("⚠️ Broker WebSocket Closed. Initiating safe reconnection...")
-    reconnect_broker_socket()
-
-def on_websocket_error(wsapp, *args, **kwargs):
-    logger.error(f"❌ Broker WebSocket Error: {args} {kwargs}")
-
-def reconnect_broker_socket():
-    global IS_RECONNECTING
-    if IS_RECONNECTING:
+def start_fyers_websocket_worker():
+    global fyers_ws
+    if not FYERS_ACCESS_TOKEN:
         return
-    IS_RECONNECTING = True
-
-    def _safe_reconnect_worker():
-        time.sleep(10)  # Rate-limit guard delay
-        if BROKER_JWT_TOKEN and BROKER_FEED_TOKEN:
-            start_angel_one_websocket_worker(BROKER_JWT_TOKEN, BROKER_FEED_TOKEN)
-        else:
-            global IS_RECONNECTING
-            IS_RECONNECTING = False
-
-    threading.Thread(target=_safe_reconnect_worker, daemon=True).start()
-
-def start_angel_one_websocket_worker(auth_token, feed_token):
-    global sws_client
-    if not auth_token or not feed_token: 
-        return
-
     try:
-        if sws_client:
-            try:
-                sws_client.close()
-            except Exception:
-                pass
-
-        sws_client = SmartWebSocketV2(
-            auth_token=auth_token, 
-            client_code=CLIENT_CODE, 
-            api_key=API_KEY, 
-            feed_token=feed_token
+        full_token = f"{CLIENT_ID}:{FYERS_ACCESS_TOKEN}"
+        fyers_ws = data_ws.FyersDataSocket(
+            access_token=full_token,
+            log_path="",
+            l_type="symbolUpdate",
+            on_connect=on_ws_open,
+            on_close=on_ws_close,
+            on_error=on_ws_error,
+            on_message=on_message_received
         )
-        sws_client.on_data = on_data_received
-        sws_client.on_open = on_websocket_open
-        sws_client.on_close = on_websocket_close
-        sws_client.on_error = on_websocket_error
-        sws_client.connect()
+        fyers_ws.connect()
     except Exception as e:
-        logger.error(f"Failed to start WebSocket worker: {e}")
-        global IS_RECONNECTING
-        IS_RECONNECTING = False
+        logger.error(f"WebSocket Worker Exception: {e}")
 
-async def start_background_tasks(app):
+async def start_background_tasks(app_instance):
     global main_loop
     main_loop = asyncio.get_event_loop()
-    
-    try:
-        totp_crypto = pyotp.TOTP(TOTP_STR)
-        smart_conn = SmartConnect(api_key=API_KEY)
-        
-        session_data = login_with_retry(smart_conn, CLIENT_CODE, MPIN, totp_crypto.now())
-        
-        if session_data and isinstance(session_data, dict) and session_data.get('status'):
-            global BROKER_JWT_TOKEN, BROKER_FEED_TOKEN, LAST_BROKER_LOGIN_TIME
-            BROKER_JWT_TOKEN = session_data['data']['jwtToken']
-            BROKER_FEED_TOKEN = session_data['data']['feedToken']
-            LAST_BROKER_LOGIN_TIME = time.time()
-            state.smart_api = smart_conn
-            threading.Thread(target=start_angel_one_websocket_worker, args=(BROKER_JWT_TOKEN, BROKER_FEED_TOKEN), daemon=True).start()
-    except Exception as e:
-        logger.error(f"Error starting background tasks: {e}")
-    
-    app['auto_login'] = asyncio.create_task(broker_auto_login_task())
 
 app.on_startup.append(start_background_tasks)
 
