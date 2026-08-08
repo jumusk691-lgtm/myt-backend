@@ -93,23 +93,33 @@ def fetch_lot_size(symbol_str):
     LOT_SIZE_CACHE[symbol_str] = lot_size
     return lot_size
 
-# --- 🔄 SYMBOL FORMATTER FOR FYERS ---
+# --- 🔄 FIXED FYERS SYMBOL FORMATTER ---
 def format_fyers_symbol(symbol_str, exch="NSE"):
-    sym = str(symbol_str).strip()
-    if ":" in sym:
-        return sym.upper()
+    sym = str(symbol_str).strip().upper()
     
+    # अगर Prefix पहले से लगा हुआ है (जैसे NSE:..., NFO:..., MCX:..., BSE:...)
+    if ":" in sym:
+        return sym
+
     ex_str = str(exch).upper().strip()
-    if ex_str in ["5", "MCX", "MCX_FO", "MCXFO"]:
-        return f"MCX:{sym}".upper()
-    elif ex_str in ["2", "NFO", "NSE_FO"]:
-        return f"NFO:{sym}".upper()
+
+    # Smart Auto-Detection for Options & Futures
+    if any(idx in sym for idx in ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]):
+        if any(opt in sym for opt in ["CE", "PE", "FUT"]):
+            return f"NFO:{sym}"
+        if "INDEX" in sym or sym in ["NIFTY50-INDEX", "NIFTY BANK"]:
+            return f"NSE:{sym}"
+
+    if ex_str in ["2", "NFO", "NSE_FO"]:
+        return f"NFO:{sym}"
+    elif ex_str in ["5", "MCX", "MCX_FO", "MCXFO"]:
+        return f"MCX:{sym}"
     elif ex_str in ["3", "BSE", "BSE_CM", "BFO"]:
-        return f"BSE:{sym}".upper()
+        return f"BSE:{sym}"
     
     if not sym.endswith("-EQ") and not sym.endswith("-INDEX"):
         sym = f"{sym}-EQ"
-    return f"NSE:{sym}".upper()
+    return f"NSE:{sym}"
 
 # --- 🎯 SCORE LOGIC ENGINE ---
 def update_user_score(points=1):
@@ -318,9 +328,6 @@ async def fetch_historical_oi_data(request: web.Request):
 
 # --- 🔊 SILENT AUDIO BUSTER TO PREVENT RENDER SLEEP ---
 async def handle_ping_stream(request):
-    """
-    Returns endless silent MP3 stream to keep connections & CPU active
-    """
     response = web.StreamResponse(
         status=200,
         reason='OK',
@@ -331,7 +338,6 @@ async def handle_ping_stream(request):
         }
     )
     await response.prepare(request)
-    # Minimal 1-second silent MP3 buffer frame
     silent_mp3_frame = b'\xff\xe3\x18\xc4\x00\x00\x00\x03\x48\x00\x00\x00\x00' + b'\x00' * 100
     try:
         while True:
@@ -345,7 +351,7 @@ async def handle_ping_stream(request):
 def keep_alive_self_ping():
     while True:
         try:
-            time.sleep(120)  # Ping every 2 minutes
+            time.sleep(120)
             import urllib.request
             urllib.request.urlopen("https://myt-backend-1.onrender.com/ping").read()
             logger.info("🔊 Anti-Sleep Heartbeat Ping Executed")
@@ -386,16 +392,19 @@ def on_message_received(ticks):
         lot_size = fetch_lot_size(symbol)
 
         if main_loop:
+            # Broadcast to specific symbol room AND globally for broad client compatibility
             asyncio.run_coroutine_threadsafe(
                 sio.emit("live_data", {
                     "token": symbol, 
+                    "symbol": symbol,
                     "ltp": price_str, 
+                    "price": price_str,
                     "lot_size": lot_size
-                }, room=symbol), 
+                }), 
                 main_loop
             )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"Tick Broadcast Error: {e}")
 
 def on_ws_open():
     global BROKER_SOCKET_CONNECTED
@@ -432,10 +441,13 @@ async def subscribe_request(sid, data):
                 await sio.enter_room(sid, fyers_symbol)
                 SUBSCRIBED_TOKENS_REGISTRY.add(fyers_symbol)
 
+                # Send last cached LTP immediately if available
                 if fyers_symbol in LTP_CACHE:
                     await sio.emit("live_data", {
                         "token": fyers_symbol, 
+                        "symbol": fyers_symbol,
                         "ltp": LTP_CACHE[fyers_symbol],
+                        "price": LTP_CACHE[fyers_symbol],
                         "lot_size": fetch_lot_size(fyers_symbol)
                     }, room=sid)
 
