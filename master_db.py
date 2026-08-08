@@ -6,18 +6,32 @@ import gc
 import csv
 import sys
 import traceback
+from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 SUPABASE_URL = "https://fnfynhgkdevxytxtfzrk.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZuZnluaGdrZGV2eHl0eHRmenJrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc0OTAwMjgsImV4cCI6MjA5MzA2NjAyOH0.Tgr8kB6KGeAsAbXzH8a2wlLStqMFS3fnFPcowbL4Di8"
 BUCKET_NAME = "myt"
 
-# All 5 FYERS Official Master CSV Files
 FYERS_NSE_CM_URL = "https://public.fyers.in/sym_details/NSE_CM.csv"
 FYERS_NSE_FO_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
 FYERS_BSE_CM_URL = "https://public.fyers.in/sym_details/BSE_CM.csv"
 FYERS_BSE_FO_URL = "https://public.fyers.in/sym_details/BSE_FO.csv"
 FYERS_MCX_URL    = "https://public.fyers.in/sym_details/MCX_COM.csv"
+
+def format_expiry(raw_expiry):
+    """Converts Epoch Timestamp (e.g. 1786443000) to '11 Aug 2026' format"""
+    if not raw_expiry:
+        return ""
+    raw_str = str(raw_expiry).strip()
+    if raw_str.isdigit() and len(raw_str) >= 9:
+        try:
+            ts = int(raw_str)
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            return dt.strftime("%d %b %Y")  # Output: 11 Aug 2026
+        except Exception:
+            return raw_str
+    return raw_str
 
 def parse_csv_data(text, default_exch, records_list):
     lines = text.splitlines()
@@ -28,13 +42,19 @@ def parse_csv_data(text, default_exch, records_list):
             fy_token = row[0].strip()
             symbol = row[9].strip() if len(row) > 9 else row[1].strip()
             name = row[1].strip()
-            lotsize = row[2].strip() if len(row) > 2 else "1"
+            
+            # Lot size field parsing fix
+            raw_lot = row[2].strip() if len(row) > 2 else "1"
+            # If lot value is internal lot_id (>20 or unusual for equity), handle cleanly
+            lotsize = raw_lot if raw_lot.isdigit() and int(raw_lot) < 10000 else "1"
+            
             tick_size = row[3].strip() if len(row) > 3 else "0.05"
-            expiry = row[8].strip() if len(row) > 8 else ""
+            raw_expiry = row[8].strip() if len(row) > 8 else ""
+            expiry = format_expiry(raw_expiry) # Convert timestamp to formatted date string
+            
             strike = row[15].strip() if len(row) > 15 else "0"
             raw_inst = row[16].strip() if len(row) > 16 else ""
 
-            # Explicit Tagging for Stocks, Futures, and Options
             sym_upper = symbol.upper()
             if sym_upper.endswith("CE"):
                 inst_type = "CE"
@@ -80,7 +100,7 @@ def fetch_all_market_data():
     return all_records
 
 def generate_and_upload_db():
-    print("\n🔄 Generating Database for 7 Market Segments...")
+    print("\n🔄 Generating Fixed Master Database...")
     sys.stdout.flush()
 
     tmp_dir = tempfile.gettempdir()
@@ -88,7 +108,7 @@ def generate_and_upload_db():
 
     try:
         records = fetch_all_market_data()
-        print(f"📊 Total Combined Records: {len(records)}")
+        print(f"📊 Total Records: {len(records)}")
         sys.stdout.flush()
 
         if len(records) > 0:
@@ -132,7 +152,7 @@ def generate_and_upload_db():
             upload_resp = requests.post(upload_url, headers=headers, data=file_bytes, timeout=300)
 
             if upload_resp.status_code in [200, 201]:
-                print("🎉 SUCCESS: Entire Market Master Database Uploaded!")
+                print("🎉 SUCCESS: DB Updated with Formatted Dates and Lots!")
             else:
                 print(f"❌ Upload Failed: {upload_resp.text}")
 
