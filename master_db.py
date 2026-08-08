@@ -3,6 +3,8 @@ import tempfile
 import requests
 import os
 import gc
+import csv
+import io
 from supabase import create_client
 
 # ==============================================================================
@@ -12,22 +14,58 @@ SUPABASE_URL = "https://fnfynhgkdevxytxtfzrk.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZuZnluaGdrZGV2eHl0eHRmenJrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc0OTAwMjgsImV4cCI6MjA5MzA2NjAyOH0.Tgr8kB6KGeAsAbXzH8a2wlLStqMFS3fnFPcowbL4Di8"
 BUCKET_NAME = "myt"
 
+# FYERS Symbol Master URLs
+FYERS_NSE_CM_URL = "https://public.fyers.in/sym_mapping/nse_cm.csv"
+FYERS_NSE_FO_URL = "https://public.fyers.in/sym_mapping/nse_fo.csv"
+FYERS_MCX_URL = "https://public.fyers.in/sym_mapping/mcx_fo.csv"
+
+def parse_fyers_csv(url, default_exch):
+    records = []
+    try:
+        print(f"📥 Downloading Fyers Scrip Master from {default_exch}...")
+        resp = requests.get(url, timeout=60)
+        if resp.status_code == 200:
+            # Fyers CSV Files parsing
+            lines = resp.text.splitlines()
+            reader = csv.reader(lines)
+            for row in reader:
+                if len(row) >= 10:
+                    # Map Fyers CSV columns to old DB Schema
+                    # Row Mapping: [FyToken, Description, LotSize, TickSize, ISIN, TradingSymbol, ExchCode, InstrumentType, Strike, Expiry]
+                    fy_token = row[0]          # Fyers Symbol e.g., NSE:SBIN-EQ or FyToken
+                    symbol = row[1]            # Trading Symbol
+                    name = row[1].split("-")[0] if "-" in row[1] else row[1] # Base Name
+                    lotsize = row[2] if len(row) > 2 else "1"
+                    tick_size = row[3] if len(row) > 3 else "0.05"
+                    instrumenttype = row[7] if len(row) > 7 else ""
+                    strike = row[8] if len(row) > 8 else "0"
+                    expiry = row[9] if len(row) > 9 else ""
+                    exch_seg = default_exch
+
+                    records.append((
+                        str(fy_token), str(symbol), str(name), str(expiry),
+                        str(strike), str(lotsize), str(instrumenttype),
+                        str(exch_seg), str(tick_size)
+                    ))
+    except Exception as e:
+        print(f"⚠️ Error parsing {default_exch} CSV: {e}")
+    return records
+
 def generate_and_upload_db():
-    print("🔄 [Master] Initializing Angel One Scrip Master Sync...")
+    print("🔄 [Master] Initializing Fyers Scrip Master Sync...")
     
     tmp_dir = tempfile.gettempdir()
     db_path = os.path.join(tmp_dir, "angel_master.db")
 
     try:
-        # 1. Angel One से JSON डाउनलोड करना
-        master_url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-        print("📥 Downloading Scrip Master JSON from Angel One...")
-        response = requests.get(master_url, timeout=60)
+        # 1. Fyers CSV Files से डेटा फेच करना (NSE Equity, FO और MCX)
+        records = []
+        records.extend(parse_fyers_csv(FYERS_NSE_CM_URL, "NSE"))
+        records.extend(parse_fyers_csv(FYERS_NSE_FO_URL, "NFO"))
+        records.extend(parse_fyers_csv(FYERS_MCX_URL, "MCX"))
         
-        if response.status_code == 200:
-            json_payload = response.json()
-            
-            # 2. SQLite Database बनाना
+        if len(records) > 0:
+            # 2. SQLite Database बनाना (पुराना सेम स्ट्रक्चर)
             if os.path.exists(db_path): 
                 os.remove(db_path)
                 
@@ -37,17 +75,13 @@ def generate_and_upload_db():
             cursor.execute("PRAGMA journal_mode=OFF")
             cursor.execute("PRAGMA synchronous=OFF")
             
+            # टेबल का नाम और स्ट्रक्चर वही रहेगा
             cursor.execute('''CREATE TABLE symbols (
                 token TEXT, symbol TEXT, name TEXT, expiry TEXT, 
                 strike TEXT, lotsize TEXT, instrumenttype TEXT, 
                 exch_seg TEXT, tick_size TEXT)''')
             
-            records = [(str(i.get('token')), i.get('symbol'), i.get('name'), i.get('expiry'),
-                        i.get('strike'), i.get('lotsize'), i.get('instrumenttype'),
-                        i.get('exch_seg'), i.get('tick_size'))
-                       for i in json_payload if i.get('token')]
-            
-            print(f"⚙️ Inserting {len(records)} records into SQLite database...")
+            print(f"⚙️ Inserting {len(records)} Fyers records into SQLite database...")
             cursor.executemany("INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?)", records)
             cursor.execute("CREATE INDEX idx_token_fast ON symbols(token)")
             cursor.execute("CREATE INDEX idx_name_fast ON symbols(name)")
@@ -56,8 +90,8 @@ def generate_and_upload_db():
             conn.close()
             print("✅ [Master] SQLite .db file generated locally.")
 
-            # 3. Supabase Storage पर अपलोड करना
-            print("🚀 Uploading to Supabase Storage...")
+            # 3. Supabase Storage पर 'angel_master.db' को ओवरराइट करना
+            print("🚀 Uploading & Overwriting on Supabase Storage...")
             supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
             with open(db_path, "rb") as f:
                 supabase.storage.from_(BUCKET_NAME).upload(
@@ -65,9 +99,9 @@ def generate_and_upload_db():
                     file=f.read(),
                     file_options={"x-upsert": "true", "content-type": "application/x-sqlite3"}
                 )
-            print("✅ [Master] Cloud Backup to Supabase Complete successfully!")
+            print("✅ [Master] Cloud Backup Overwrite to Supabase Complete successfully!")
             
-            del json_payload, records
+            del records
             gc.collect()
             return True
             
