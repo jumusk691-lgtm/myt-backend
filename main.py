@@ -358,10 +358,21 @@ def keep_alive_self_ping():
             pass
 
 async def handle_ping(request):
-    # UPDATED: Returns websocket connection status in API ping
     return web.json_response({
         "status": "active", 
         "fyers_ws_connected": BROKER_SOCKET_CONNECTED,
+        "timestamp": str(datetime.datetime.now(IST))
+    })
+
+# --- 🔍 NEW DEBUG STATUS ENDPOINT ---
+async def handle_debug_status(request):
+    return web.json_response({
+        "status": True,
+        "fyers_authenticated": state.fyers is not None,
+        "fyers_ws_connected": BROKER_SOCKET_CONNECTED,
+        "subscribed_tokens_count": len(SUBSCRIBED_TOKENS_REGISTRY),
+        "subscribed_tokens": list(SUBSCRIBED_TOKENS_REGISTRY),
+        "ltp_cache": LTP_CACHE,
         "timestamp": str(datetime.datetime.now(IST))
     })
 
@@ -369,6 +380,7 @@ app.router.add_post('/api/login', handle_fyers_login)
 app.router.add_post('/api/get_chart_data', fetch_chart_data)
 app.router.add_post('/api/get_oi_data', fetch_historical_oi_data)
 app.router.add_get('/ping', handle_ping)
+app.router.add_get('/api/debug_status', handle_debug_status)
 app.router.add_get('/silent_stream', handle_ping_stream)
 
 # ==============================================================================
@@ -377,13 +389,14 @@ app.router.add_get('/silent_stream', handle_ping_stream)
 
 @sio.event
 async def connect(sid, environ):
-    # Sends status directly to Android client as soon as they connect to Socket.io
+    logger.info(f"📱 Android Client Connected via Socket.IO: {sid}")
     status_msg = "connected" if BROKER_SOCKET_CONNECTED else "disconnected"
     await sio.emit("market_status", {"status": status_msg, "fyers_ready": BROKER_SOCKET_CONNECTED}, room=sid)
 
 def on_message_received(ticks):
     global main_loop
     try:
+        logger.info(f"📥 Raw Incoming Tick from Fyers WS: {ticks}")
         symbol = ticks.get("symbol", ticks.get("n", ""))
         raw_ltp = ticks.get("ltp", ticks.get("v", {}).get("lp", 0))
 
@@ -418,9 +431,8 @@ def on_message_received(ticks):
 def on_ws_open():
     global BROKER_SOCKET_CONNECTED, main_loop
     BROKER_SOCKET_CONNECTED = True
-    logger.info("✅ FYERS Realtime WebSocket Connected!")
+    logger.info("✅ FYERS Realtime WebSocket Connected successfully!")
     
-    # Broadcast Live Market Connection Status to all connected Users
     if main_loop:
         asyncio.run_coroutine_threadsafe(
             sio.emit("market_status", {"status": "connected", "fyers_ready": True}), 
@@ -428,6 +440,7 @@ def on_ws_open():
         )
 
     if fyers_ws and SUBSCRIBED_TOKENS_REGISTRY:
+        logger.info(f"🔄 Re-subscribing {len(SUBSCRIBED_TOKENS_REGISTRY)} tokens to Fyers WS.")
         fyers_ws.subscribe(symbols=list(SUBSCRIBED_TOKENS_REGISTRY), data_type="symbolUpdate")
 
 def on_ws_error(msg):
@@ -436,9 +449,8 @@ def on_ws_error(msg):
 def on_ws_close():
     global BROKER_SOCKET_CONNECTED, main_loop
     BROKER_SOCKET_CONNECTED = False
-    logger.warning("⚠️ FYERS WebSocket Closed")
+    logger.warning("⚠️ FYERS WebSocket Closed!")
     
-    # Broadcast Live Market Disconnect Status to all connected Users
     if main_loop:
         asyncio.run_coroutine_threadsafe(
             sio.emit("market_status", {"status": "disconnected", "fyers_ready": False}), 
@@ -454,6 +466,8 @@ async def subscribe_request(sid, data):
         raw_exch = payload.get("exchange", "NSE")
         tokens_list = payload.get("tokens", [])
 
+        logger.info(f"📥 Received Subscription Request from Client {sid} -> Action: {action}, Exchange: {raw_exch}, Tokens: {tokens_list}")
+
         if action == "sub":
             update_user_score(1)
             formatted_symbols = []
@@ -461,6 +475,7 @@ async def subscribe_request(sid, data):
             for token in tokens_list:
                 fyers_symbol = format_fyers_symbol(str(token), raw_exch)
                 formatted_symbols.append(fyers_symbol)
+                logger.info(f"🔄 Formatted Token: '{token}' -> '{fyers_symbol}'")
                 
                 await sio.enter_room(sid, fyers_symbol)
                 if str(token) != fyers_symbol:
@@ -470,6 +485,7 @@ async def subscribe_request(sid, data):
 
                 if fyers_symbol in LTP_CACHE:
                     cached_price = LTP_CACHE[fyers_symbol]
+                    logger.info(f"⚡ Emitting Cached LTP for {fyers_symbol}: {cached_price}")
                     await sio.emit("live_data", {
                         "token": token,
                         "symbol": fyers_symbol,
@@ -478,10 +494,11 @@ async def subscribe_request(sid, data):
                         "lot_size": fetch_lot_size(fyers_symbol)
                     }, room=sid)
 
-            # --- QUOTES API FIX (Fetches latest price even if market is closed) ---
+            # --- QUOTES API FALLBACK (Fetches last price if market is closed) ---
             if state.fyers and formatted_symbols:
                 try:
                     sym_query = ",".join(formatted_symbols[:50])
+                    logger.info(f"🌐 Fetching Quotes API from Fyers for: {sym_query}")
                     quote_data = state.fyers.quotes({"symbols": sym_query})
                     
                     if quote_data and quote_data.get("s") == "ok":
@@ -490,6 +507,7 @@ async def subscribe_request(sid, data):
                             q_v = item.get("v", {})
                             q_ltp = str(q_v.get("lp", "0.00"))
                             
+                            logger.info(f"📊 Quote Received -> Symbol: {q_sym}, LTP: {q_ltp}")
                             if q_sym and q_ltp != "0.00":
                                 price_str = f"{float(q_ltp):.2f}"
                                 LTP_CACHE[q_sym] = price_str
@@ -501,21 +519,28 @@ async def subscribe_request(sid, data):
                                     "price": price_str,
                                     "lot_size": fetch_lot_size(q_sym)
                                 }, room=sid)
+                    else:
+                        logger.warning(f"⚠️ Quotes API Response not OK: {quote_data}")
                 except Exception as q_err:
-                    logger.error(f"Quotes API Fetch Error: {q_err}")
+                    logger.error(f"❌ Quotes API Fetch Error: {q_err}")
 
             if BROKER_SOCKET_CONNECTED and fyers_ws and formatted_symbols:
+                logger.info(f"🚀 Sending Subscriptions to Fyers WebSocket: {formatted_symbols}")
                 fyers_ws.subscribe(symbols=formatted_symbols, data_type="symbolUpdate")
+            else:
+                logger.warning(f"⚠️ Fyers WS not connected or no symbols. Connected Status: {BROKER_SOCKET_CONNECTED}")
 
     except Exception as e:
-        logger.error(f"Subscribe Error: {e}")
+        logger.error(f"❌ Subscribe Error: {e}")
 
 def start_fyers_websocket_worker():
     global fyers_ws
     if not FYERS_ACCESS_TOKEN:
+        logger.warning("⚠️ Cannot start Fyers WS worker: Access Token is missing!")
         return
     try:
         full_token = f"{CLIENT_ID}:{FYERS_ACCESS_TOKEN}"
+        logger.info("🔌 Initializing Fyers Data Socket...")
         fyers_ws = data_ws.FyersDataSocket(
             access_token=full_token,
             log_path="",
@@ -527,7 +552,7 @@ def start_fyers_websocket_worker():
         )
         fyers_ws.connect()
     except Exception as e:
-        logger.error(f"WebSocket Worker Exception: {e}")
+        logger.error(f"❌ WebSocket Worker Exception: {e}")
 
 async def start_background_tasks(app_instance):
     global main_loop
