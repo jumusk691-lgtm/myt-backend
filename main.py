@@ -99,20 +99,15 @@ def format_fyers_symbol(symbol_str, exch="NSE"):
         return ""
     
     sym = str(symbol_str).strip().upper()
-    
-    # 1. Clean Prefix if present (e.g. "NSE:NIFTY2681124600CE" -> "NIFTY2681124600CE")
     clean_sym = sym.split(":")[-1]
 
-    # 2. Options / Futures Detection (NFO Segment)
     if any(opt in clean_sym for opt in ["CE", "PE", "FUT"]):
         return f"NFO:{clean_sym}"
     
-    # 3. MCX Commodities Detection
     raw_exch = str(exch).strip().upper()
     if raw_exch in ["MCX", "MCX_FO", "MCXFO"] or any(comm in clean_sym for comm in ["GOLD", "SILVER", "CRUDE"]):
         return f"MCX:{clean_sym}"
 
-    # 4. Indices Detection
     if clean_sym in ["NIFTY50-INDEX", "NIFTY 50", "NIFTY", "NSE:NIFTY50-INDEX"]:
         return "NSE:NIFTY50-INDEX"
     if clean_sym in ["SENSEX-INDEX", "SENSEX", "BSE:SENSEX-INDEX"]:
@@ -122,24 +117,20 @@ def format_fyers_symbol(symbol_str, exch="NSE"):
     if "INDEX" in clean_sym:
         return f"NSE:{clean_sym}"
 
-    # 5. BSE Segment
     if raw_exch in ["BSE", "BSE_CM", "BFO"]:
         return f"BSE:{clean_sym}"
 
-    # 6. Default NSE Equity Stocks
     if not clean_sym.endswith("-EQ"):
         clean_sym = f"{clean_sym}-EQ"
         
     return f"NSE:{clean_sym}"
 
-# --- 🎯 SCORE LOGIC ENGINE ---
 def update_user_score(points=1):
     global USER_SCORE
     USER_SCORE += points
     state.score = USER_SCORE
     return USER_SCORE
 
-# --- 📈 REALTIME TICK CANDLE AGGREGATOR ---
 def update_token_candles(token_str, price_val):
     if price_val <= 0:
         return
@@ -169,7 +160,6 @@ def update_token_candles(token_str, price_val):
                 last_candle["high"] = max(last_candle["high"], price_val)
                 last_candle["low"] = min(last_candle["low"], price_val)
 
-# --- 🔑 AUTO ACCESS TOKEN SAVER & LOAD ---
 def save_token_to_file(token):
     try:
         with open(TOKEN_CACHE_FILE, "w") as f:
@@ -337,7 +327,6 @@ async def fetch_historical_oi_data(request: web.Request):
         logger.error(f"❌ OI Error: {e}")
         return web.json_response({"status": False, "error": str(e)})
 
-# --- 🔊 SILENT AUDIO BUSTER TO PREVENT RENDER SLEEP ---
 async def handle_ping_stream(request):
     response = web.StreamResponse(
         status=200,
@@ -358,7 +347,6 @@ async def handle_ping_stream(request):
         pass
     return response
 
-# Self Keep-Alive Ping Thread
 def keep_alive_self_ping():
     while True:
         try:
@@ -370,7 +358,12 @@ def keep_alive_self_ping():
             pass
 
 async def handle_ping(request):
-    return web.json_response({"status": "active", "timestamp": str(datetime.datetime.now(IST))})
+    # UPDATED: Returns websocket connection status in API ping
+    return web.json_response({
+        "status": "active", 
+        "fyers_ws_connected": BROKER_SOCKET_CONNECTED,
+        "timestamp": str(datetime.datetime.now(IST))
+    })
 
 app.router.add_post('/api/login', handle_fyers_login)
 app.router.add_post('/api/get_chart_data', fetch_chart_data)
@@ -381,6 +374,12 @@ app.router.add_get('/silent_stream', handle_ping_stream)
 # ==============================================================================
 # --- 📡 REALTIME WEBSOCKET & SOCKET.IO ENGINE ---
 # ==============================================================================
+
+@sio.event
+async def connect(sid, environ):
+    # Sends status directly to Android client as soon as they connect to Socket.io
+    status_msg = "connected" if BROKER_SOCKET_CONNECTED else "disconnected"
+    await sio.emit("market_status", {"status": status_msg, "fyers_ready": BROKER_SOCKET_CONNECTED}, room=sid)
 
 def on_message_received(ticks):
     global main_loop
@@ -410,18 +409,24 @@ def on_message_received(ticks):
                 "price": price_str,
                 "lot_size": lot_size
             }
-            # Global Broadcast
             asyncio.run_coroutine_threadsafe(sio.emit("live_data", payload), main_loop)
-            # Room Specific Broadcast
             asyncio.run_coroutine_threadsafe(sio.emit("live_data", payload, room=symbol), main_loop)
 
     except Exception as e:
         logger.error(f"Tick Broadcast Error: {e}")
 
 def on_ws_open():
-    global BROKER_SOCKET_CONNECTED
+    global BROKER_SOCKET_CONNECTED, main_loop
     BROKER_SOCKET_CONNECTED = True
     logger.info("✅ FYERS Realtime WebSocket Connected!")
+    
+    # Broadcast Live Market Connection Status to all connected Users
+    if main_loop:
+        asyncio.run_coroutine_threadsafe(
+            sio.emit("market_status", {"status": "connected", "fyers_ready": True}), 
+            main_loop
+        )
+
     if fyers_ws and SUBSCRIBED_TOKENS_REGISTRY:
         fyers_ws.subscribe(symbols=list(SUBSCRIBED_TOKENS_REGISTRY), data_type="symbolUpdate")
 
@@ -429,9 +434,16 @@ def on_ws_error(msg):
     logger.error(f"❌ FYERS WebSocket Error: {msg}")
 
 def on_ws_close():
-    global BROKER_SOCKET_CONNECTED
+    global BROKER_SOCKET_CONNECTED, main_loop
     BROKER_SOCKET_CONNECTED = False
     logger.warning("⚠️ FYERS WebSocket Closed")
+    
+    # Broadcast Live Market Disconnect Status to all connected Users
+    if main_loop:
+        asyncio.run_coroutine_threadsafe(
+            sio.emit("market_status", {"status": "disconnected", "fyers_ready": False}), 
+            main_loop
+        )
 
 @sio.event
 async def subscribe_request(sid, data):
@@ -451,14 +463,11 @@ async def subscribe_request(sid, data):
                 formatted_symbols.append(fyers_symbol)
                 
                 await sio.enter_room(sid, fyers_symbol)
-                
-                # Original symbol bhi enter karva lo agar raw name aatha ho
                 if str(token) != fyers_symbol:
                     await sio.enter_room(sid, str(token))
                     
                 SUBSCRIBED_TOKENS_REGISTRY.add(fyers_symbol)
 
-                # Send last cached LTP immediately if available
                 if fyers_symbol in LTP_CACHE:
                     cached_price = LTP_CACHE[fyers_symbol]
                     await sio.emit("live_data", {
@@ -468,6 +477,32 @@ async def subscribe_request(sid, data):
                         "price": cached_price,
                         "lot_size": fetch_lot_size(fyers_symbol)
                     }, room=sid)
+
+            # --- QUOTES API FIX (Fetches latest price even if market is closed) ---
+            if state.fyers and formatted_symbols:
+                try:
+                    sym_query = ",".join(formatted_symbols[:50])
+                    quote_data = state.fyers.quotes({"symbols": sym_query})
+                    
+                    if quote_data and quote_data.get("s") == "ok":
+                        for item in quote_data.get("d", []):
+                            q_sym = item.get("n", "")
+                            q_v = item.get("v", {})
+                            q_ltp = str(q_v.get("lp", "0.00"))
+                            
+                            if q_sym and q_ltp != "0.00":
+                                price_str = f"{float(q_ltp):.2f}"
+                                LTP_CACHE[q_sym] = price_str
+                                
+                                await sio.emit("live_data", {
+                                    "token": q_sym,
+                                    "symbol": q_sym,
+                                    "ltp": price_str,
+                                    "price": price_str,
+                                    "lot_size": fetch_lot_size(q_sym)
+                                }, room=sid)
+                except Exception as q_err:
+                    logger.error(f"Quotes API Fetch Error: {q_err}")
 
             if BROKER_SOCKET_CONNECTED and fyers_ws and formatted_symbols:
                 fyers_ws.subscribe(symbols=formatted_symbols, data_type="symbolUpdate")
