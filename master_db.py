@@ -15,17 +15,15 @@ SUPABASE_URL = "https://fnfynhgkdevxytxtfzrk.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZuZnluaGdrZGV2eHl0eHRmenJrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc0OTAwMjgsImV4cCI6MjA5MzA2NjAyOH0.Tgr8kB6KGeAsAbXzH8a2wlLStqMFS3fnFPcowbL4Di8"
 BUCKET_NAME = "myt"
 
-# Updated FYERS Official Data URLs (100% Working)
-FYERS_NSE_CM_URL = "https://public.fyers.in/sym_mapping/nse_cm.csv"
-FYERS_NSE_FO_URL = "https://public.fyers.in/sym_mapping/nse_fo.csv"
-FYERS_MCX_URL = "https://public.fyers.in/sym_mapping/mcx_fo.csv"
+# Correct Official FYERS Data URLs
+FYERS_NSE_CM_URL = "https://public.fyers.in/sym_details/NSE_CM.csv"
+FYERS_NSE_FO_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
+FYERS_MCX_URL = "https://public.fyers.in/sym_details/MCX_FO.csv"
 
-def fetch_fyers_records():
+def fetch_pure_fyers_records():
     records = []
-    # Real Browser User-Agent to avoid 404/403 Block
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        "Accept": "*/*"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
     }
     
     urls = [
@@ -45,16 +43,25 @@ def fetch_fyers_records():
                 reader = csv.reader(lines)
                 count = 0
                 for row in reader:
-                    # Fyers CSV Schema: [FyToken, Description, LotSize, TickSize, ISIN, TradingSymbol, ExchCode, InstrumentType, Strike, Expiry]
-                    if len(row) >= 2:
-                        fy_token = row[0].strip() if len(row) > 0 else ""
-                        symbol = row[1].strip() if len(row) > 1 else ""
-                        name = symbol.split("-")[0] if "-" in symbol else symbol
+                    # Fyers CSV Column Structure:
+                    # row[0]: FyToken (e.g. 10100000003456)
+                    # row[1]: Description
+                    # row[2]: Lot Size
+                    # row[3]: Tick Size
+                    # row[8]: Expiry Unix Timestamp (if available)
+                    # row[9]: Trading Symbol (e.g. NSE:TATAMOTORS-EQ)
+                    # row[15]: Strike Price
+                    # row[16]: Option Type
+                    if len(row) >= 10:
+                        fy_token = row[0].strip()
+                        symbol = row[9].strip() if len(row) > 9 else row[1].strip()
+                        name = row[1].strip()
                         lotsize = row[2].strip() if len(row) > 2 else "1"
                         tick_size = row[3].strip() if len(row) > 3 else "0.05"
-                        instrumenttype = row[7].strip() if len(row) > 7 else ""
-                        strike = row[8].strip() if len(row) > 8 else "0"
-                        expiry = row[9].strip() if len(row) > 9 else ""
+                        
+                        expiry = row[8].strip() if len(row) > 8 else ""
+                        strike = row[15].strip() if len(row) > 15 else "0"
+                        instrumenttype = row[16].strip() if len(row) > 16 else ""
 
                         records.append((
                             str(fy_token), str(symbol), str(name), str(expiry),
@@ -62,7 +69,7 @@ def fetch_fyers_records():
                             str(exch), str(tick_size)
                         ))
                         count += 1
-                print(f"✅ Successfully Fetched {count} FYERS Tokens for {exch}")
+                print(f"✅ Successfully Fetched {count} Pure FYERS Tokens for {exch}")
                 sys.stdout.flush()
             else:
                 print(f"❌ FYERS Download Failed for {exch} (Status: {resp.status_code})")
@@ -84,7 +91,7 @@ def generate_and_upload_db():
 
     try:
         # Strictly fetch ONLY Fyers records
-        records = fetch_fyers_records()
+        records = fetch_pure_fyers_records()
 
         print(f"📊 Total Pure FYERS Records Collected: {len(records)}")
         sys.stdout.flush()
@@ -104,7 +111,7 @@ def generate_and_upload_db():
                 strike TEXT, lotsize TEXT, instrumenttype TEXT, 
                 exch_seg TEXT, tick_size TEXT)''')
 
-            print(f"⚙️ Inserting {len(records)} FYERS records into SQLite DB...")
+            print(f"⚙️ Inserting {len(records)} Pure FYERS records into SQLite DB...")
             sys.stdout.flush()
             cursor.executemany("INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?)", records)
             cursor.execute("CREATE INDEX idx_token_fast ON symbols(token)")
@@ -142,7 +149,7 @@ def generate_and_upload_db():
             del records, file_bytes
             gc.collect()
         else:
-            print("❌ ABORTED: No FYERS tokens fetched. Supabase file NOT updated to prevent corrupt DB.")
+            print("❌ ABORTED: No FYERS tokens fetched. Supabase DB was NOT overwritten.")
             sys.stdout.flush()
 
     except Exception as e:
@@ -155,7 +162,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/html")
         self.end_headers()
-        self.wfile.write(b"Pure FYERS Master DB Upload Service Active.")
+        self.wfile.write(b"Pure FYERS Master DB Sync Active.")
 
     def log_message(self, format, *args):
         return
