@@ -19,64 +19,18 @@ FYERS_BSE_CM_URL = "https://public.fyers.in/sym_details/BSE_CM.csv"
 FYERS_BSE_FO_URL = "https://public.fyers.in/sym_details/BSE_FO.csv"
 FYERS_MCX_URL    = "https://public.fyers.in/sym_details/MCX_COM.csv"
 
-def format_expiry(raw_expiry):
-    """Converts Epoch Timestamp (e.g., 1786443000) to '11 Aug 2026' format"""
-    if not raw_expiry:
-        return ""
-    raw_str = str(raw_expiry).strip()
-    if raw_str.isdigit() and len(raw_str) >= 9:
-        try:
-            ts = int(raw_str)
+def convert_epoch_to_date(epoch_str):
+    """Converts Fyers epoch timestamp (e.g. 1786443000) to '11 AUG 2026'"""
+    if not epoch_str or not epoch_str.strip().isdigit():
+        return epoch_str
+    try:
+        ts = int(epoch_str.strip())
+        if ts > 1000000000:
             dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-            return dt.strftime("%d %b %Y")
-        except Exception:
-            return raw_str
-    return raw_str
-
-def detect_accurate_lot_size(symbol, row, exch):
-    """Detects exact lot size based on symbol name and CSV fallback"""
-    sym = symbol.upper()
-    
-    # Standard Index & Commodity Lot Sizes
-    if "NIFTY" in sym and "BANK" not in sym and "FIN" not in sym and "MID" not in sym:
-        return "25"
-    if "BANKNIFTY" in sym:
-        return "15"
-    if "FINNIFTY" in sym:
-        return "25"
-    if "MIDCPNIFTY" in sym or "MIDCAP" in sym:
-        return "50"
-    if "SENSEX" in sym:
-        return "10"
-    if "BANKEX" in sym:
-        return "15"
-    if "CRUDEOILM" in sym:
-        return "10"
-    if "CRUDEOIL" in sym:
-        return "100"
-    if "NATURALGAS" in sym:
-        return "1250"
-    if "NATGASMINI" in sym:
-        return "250"
-    if "GOLDM" in sym:
-        return "10"
-    if "GOLD" in sym:
-        return "100"
-    if "SILVERM" in sym:
-        return "5"
-    if "SILVER" in sym:
-        return "30"
-
-    # Fallback to CSV columns if Equity/Stock F&O
-    if exch in ["NFO", "BFO", "MCX"]:
-        for idx in [13, 14, 2, 3]:
-            if len(row) > idx:
-                val = row[idx].strip()
-                if val.isdigit() and int(val) > 0 and int(val) != 14 and int(val) != 31:
-                    return val
-        return "1"
-    
-    return "1" # Cash/Equity default
+            return dt.strftime("%d %b %Y").upper() # Outputs e.g. '11 AUG 2026'
+    except Exception:
+        pass
+    return epoch_str
 
 def parse_csv_data(text, default_exch, records_list):
     lines = text.splitlines()
@@ -85,19 +39,23 @@ def parse_csv_data(text, default_exch, records_list):
     for row in reader:
         if len(row) >= 10:
             fy_token = row[0].strip()
-            symbol = row[9].strip() if len(row) > 9 else row[1].strip()
             name = row[1].strip()
             
-            # Accurate Lot Size Detection
-            lotsize = detect_accurate_lot_size(symbol, row, default_exch)
+            # Dynamic Lot Size from Fyers CSV Index 2
+            raw_lot = row[2].strip() if len(row) > 2 else "1"
+            lotsize = raw_lot if raw_lot and raw_lot.isdigit() else "1"
             
             tick_size = row[3].strip() if len(row) > 3 else "0.05"
-            raw_expiry = row[8].strip() if len(row) > 8 else ""
-            expiry = format_expiry(raw_expiry)
             
+            # Expiry conversion from Timestamp to Readable Date String
+            raw_expiry = row[8].strip() if len(row) > 8 else ""
+            expiry = convert_epoch_to_date(raw_expiry)
+            
+            symbol = row[9].strip()
             strike = row[15].strip() if len(row) > 15 else "0"
             raw_inst = row[16].strip() if len(row) > 16 else ""
 
+            # Standardizing Instrument Types for DB Filtering
             sym_upper = symbol.upper()
             if sym_upper.endswith("CE"):
                 inst_type = "CE"
@@ -114,7 +72,7 @@ def parse_csv_data(text, default_exch, records_list):
                 str(default_exch), str(tick_size)
             ))
             count += 1
-    print(f"✅ Loaded {count} records for {default_exch}")
+    print(f"✅ Loaded {count} dynamic records for {default_exch}")
     sys.stdout.flush()
 
 def fetch_all_market_data():
@@ -131,8 +89,6 @@ def fetch_all_market_data():
 
     for url, exch in endpoints:
         try:
-            print(f"📥 Downloading {exch}...")
-            sys.stdout.flush()
             r = requests.get(url, headers=headers, timeout=60)
             if r.status_code == 200 and len(r.text) > 100:
                 parse_csv_data(r.text, exch, all_records)
@@ -143,7 +99,7 @@ def fetch_all_market_data():
     return all_records
 
 def generate_and_upload_db():
-    print("\n🔄 Generating Fixed Master Database with Accurate Lot Sizes...")
+    print("\n🔄 Generating Pure Dynamic Database...")
     sys.stdout.flush()
 
     tmp_dir = tempfile.gettempdir()
@@ -151,7 +107,7 @@ def generate_and_upload_db():
 
     try:
         records = fetch_all_market_data()
-        print(f"📊 Total Combined Records: {len(records)}")
+        print(f"📊 Total Records: {len(records)}")
         sys.stdout.flush()
 
         if len(records) > 0:
@@ -195,7 +151,7 @@ def generate_and_upload_db():
             upload_resp = requests.post(upload_url, headers=headers, data=file_bytes, timeout=300)
 
             if upload_resp.status_code in [200, 201]:
-                print("🎉 SUCCESS: Entire Market DB Uploaded with 100% Correct Lot Sizes!")
+                print("🎉 SUCCESS: Pure Dynamic Database Uploaded!")
             else:
                 print(f"❌ Upload Failed: {upload_resp.text}")
 
