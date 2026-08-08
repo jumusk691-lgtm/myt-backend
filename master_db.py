@@ -5,7 +5,6 @@ import os
 import gc
 import csv
 import sys
-import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -19,9 +18,6 @@ BUCKET_NAME = "myt"
 FYERS_NSE_CM_URL = "https://public.fyers.in/sym_mapping/nse_cm.csv"
 FYERS_NSE_FO_URL = "https://public.fyers.in/sym_mapping/nse_fo.csv"
 FYERS_MCX_URL = "https://public.fyers.in/sym_mapping/mcx_fo.csv"
-
-SYNC_STATUS = "NOT_STARTED"
-IS_PROCESSING = True
 
 def parse_fyers_csv(url, default_exch):
     records = []
@@ -49,7 +45,7 @@ def parse_fyers_csv(url, default_exch):
                         str(strike), str(lotsize), str(instrumenttype),
                         str(exch_seg), str(tick_size)
                     ))
-            print(f"✅ Download Complete: {len(records)} records for {default_exch}")
+            print(f"✅ Parsed {len(records)} records for {default_exch}")
             sys.stdout.flush()
     except Exception as e:
         print(f"⚠️ Error downloading {default_exch}: {e}")
@@ -57,8 +53,6 @@ def parse_fyers_csv(url, default_exch):
     return records
 
 def generate_and_upload_db():
-    global SYNC_STATUS, IS_PROCESSING
-    SYNC_STATUS = "RUNNING"
     print("\n🔄 ==========================================")
     print("🔄 STARTING FYERS MASTER SYNC & SUPABASE UPLOAD")
     print("🔄 ==========================================\n")
@@ -88,7 +82,7 @@ def generate_and_upload_db():
                 strike TEXT, lotsize TEXT, instrumenttype TEXT, 
                 exch_seg TEXT, tick_size TEXT)''')
 
-            print(f"⚙️ Inserting {len(records)} records into SQLite DB...")
+            print(f"⚙️ Inserting {len(records)} records into SQLite...")
             sys.stdout.flush()
             cursor.executemany("INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?)", records)
             cursor.execute("CREATE INDEX idx_token_fast ON symbols(token)")
@@ -96,10 +90,10 @@ def generate_and_upload_db():
 
             conn.commit()
             conn.close()
-            print("✅ Local SQLite file generated successfully.")
+            print("✅ SQLite database created successfully.")
             sys.stdout.flush()
 
-            print("🚀 Uploading & Overwriting on Supabase...")
+            print("🚀 Uploading to Supabase via Direct REST API...")
             sys.stdout.flush()
 
             upload_url = f"{SUPABASE_URL}/storage/v1/object/{BUCKET_NAME}/angel_master.db"
@@ -119,10 +113,8 @@ def generate_and_upload_db():
                 print("\n==================================================")
                 print("🎉 SUCCESS: Master DB Uploaded & Overwritten on Supabase!")
                 print("==================================================\n")
-                SYNC_STATUS = "COMPLETED_SUCCESS"
             else:
                 print(f"❌ Supabase Upload Failed: {upload_resp.status_code} - {upload_resp.text}")
-                SYNC_STATUS = f"FAILED_{upload_resp.status_code}"
 
             sys.stdout.flush()
             del records, file_bytes
@@ -131,49 +123,25 @@ def generate_and_upload_db():
     except Exception as e:
         print(f"❌ Sync Error: {e}")
         sys.stdout.flush()
-        SYNC_STATUS = f"ERROR_{str(e)}"
-    finally:
-        IS_PROCESSING = False
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/html")
         self.end_headers()
-        response_text = f"Status: {SYNC_STATUS}"
-        self.wfile.write(response_text.encode('utf-8'))
+        self.wfile.write(b"Master DB Upload Complete and Service Running.")
 
     def log_message(self, format, *args):
         return
 
-def self_ping_worker(port):
-    """
-    जब तक प्रोसेसिंग चालू रहेगी, यह हर 3 सेकंड में सर्वर को ऑटो-हिट करेगा 
-    ताकि Render टाइमआउट न करे और थ्रेड Kill न हो।
-    """
-    time.sleep(2)
-    while IS_PROCESSING:
-        try:
-            requests.get(f"http://127.0.0.1:{port}/", timeout=2)
-        except Exception:
-            pass
-        time.sleep(3)
-
-def run_sync_and_ping(port):
-    # Auto Ping धागा (Throttling Timeout Preventer)
-    threading.Thread(target=self_ping_worker, args=(port,), daemon=True).start()
-    
-    # Download & Upload Execute
+if __name__ == "__main__":
+    # STEP 1: मेन थ्रेड पर पहले पूरा सिंक और अपलोड खत्म करें
     generate_and_upload_db()
 
-if __name__ == "__main__":
+    # STEP 2: अपलोड पूरा होने के बाद पोर्ट बाइंड करें ताकि रेंडर सर्विस लाइव रहे
     port = int(os.environ.get("PORT", 10000))
-    print(f"🌐 Server initialized on port {port}...")
+    print(f"🌐 Server initialized on port {port}. Keeping process active...")
     sys.stdout.flush()
 
-    # बैकग्राउंड थ्रेड में डाउनलोड, ऑटो-पिंग और अपलोड चालू करें
-    threading.Thread(target=run_sync_and_ping, args=(port,), daemon=True).start()
-
-    # मुख्य थ्रेड पर पोर्ट लाइव रखें
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
     server.serve_forever()
