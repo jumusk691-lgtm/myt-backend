@@ -7,6 +7,9 @@ import threading
 import sqlite3
 import pytz
 import os
+import hashlib
+import requests
+import pyotp
 import aiohttp
 import socketio
 from aiohttp import web
@@ -17,7 +20,6 @@ from fyers_apiv3.FyersWebsocket import data_ws
 
 # --- 🕒 TIMEZONE & LOGGING SETUP ---
 IST = pytz.timezone('Asia/Kolkata')
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("FYERS_TITAN_PROD")
 
@@ -30,11 +32,16 @@ class AppState:
 
 state = AppState()
 
-# --- 🔑 FYERS CREDENTIALS ---
-CLIENT_ID = "BC7D6RF1O7-100"       # App ID
-SECRET_KEY = "6AEEEFZDT7"         # Secret ID
+# --- 🔑 FYERS CREDENTIALS & AUTOMATED PARAMS ---
+CLIENT_ID = "BC7D6RF107-100"       
+SECRET_KEY = "6AEEEFZDT7"         
 REDIRECT_URI = "https://myt-backend-1.onrender.com"
 TOKEN_CACHE_FILE = "token_cache.json"
+
+# Aapki Verified Credentials
+FY_ID = "FAI41352"
+PIN = "9853"
+TOTP_SECRET = "L6UYLWJQSYLVVZYP3ODHKQITDYZXFUQC"
 
 # --- 🚀 GLOBAL STATES & CACHE ---
 LTP_CACHE = {}               
@@ -167,6 +174,94 @@ def save_token_to_file(token):
     except Exception as e:
         logger.error(f"Failed to save token: {e}")
 
+# --- 🤖 AUTOMATED HEADLESS LOGIN FUNCTION ---
+def perform_automated_login():
+    global FYERS_ACCESS_TOKEN, state
+    try:
+        logger.info("🤖 Starting Automated Headless Fyers Login...")
+        base_url = "https://api-t1.fyers.in/vagator/v2"
+        
+        # 1. Send OTP
+        r1 = requests.post(f"{base_url}/send_login_otp", json={"fy_id": FY_ID, "app_id": "2"})
+        res1 = r1.json()
+        if res1.get("s") != "ok":
+            logger.error(f"❌ Automated Login Step 1 Failed: {res1}")
+            return False
+        req_key1 = res1.get("request_key")
+
+        # 2. Verify TOTP
+        totp_obj = pyotp.TOTP(TOTP_SECRET)
+        current_otp = totp_obj.now()
+        r2 = requests.post(f"{base_url}/verify_otp", json={"request_key": req_key1, "otp": current_otp})
+        res2 = r2.json()
+        if res2.get("s") != "ok":
+            logger.error(f"❌ Automated Login Step 2 Failed: {res2}")
+            return False
+        req_key2 = res2.get("request_key")
+
+        # 3. Verify PIN
+        r3 = requests.post(f"{base_url}/verify_pin", json={"request_key": req_key2, "identity_type": "pin", "identifier": PIN})
+        res3 = r3.json()
+        if res3.get("s") != "ok":
+            logger.error(f"❌ Automated Login Step 3 Failed: {res3}")
+            return False
+        
+        jwt_token = res3.get("data", {}).get("access_token")
+        if not jwt_token:
+            logger.error("❌ JWT Access Token not found!")
+            return False
+
+        # 4. Generate Fyers v3 Token directly
+        headers = {'authorization': f"Bearer {jwt_token}", 'content-type': 'application/json'}
+        payload = {
+            "fyers_id": FY_ID,
+            "app_id": CLIENT_ID,
+            "redirect_uri": REDIRECT_URI,
+            "appType": "100",
+            "code_challenge": "",
+            "state": "abcdefg",
+            "scope": "",
+            "nonce": "",
+            "response_type": "code",
+            "create_cookie": True
+        }
+        
+        r_auth = requests.post("https://api-t1.fyers.in/api/v3/token", json=payload, headers=headers)
+        res_auth = r_auth.json()
+        
+        if res_auth.get("s") == "ok" or "Url" in res_auth:
+            # Extract code from url if redirected
+            url_target = res_auth.get("Url", "")
+            if "auth_code=" in url_target:
+                from urllib.parse import urlparse, parse_qs
+                parsed_url = urlparse(url_target)
+                auth_code = parse_qs(parsed_url.query).get("auth_code", [None])[0]
+                
+                if auth_code:
+                    session = fyersModel.SessionModel(
+                        client_id=CLIENT_ID,
+                        secret_key=SECRET_KEY,
+                        redirect_uri=REDIRECT_URI,
+                        response_type="code",
+                        grant_type="authorization_code"
+                    )
+                    session.set_token(auth_code)
+                    token_response = session.generate_token()
+                    
+                    if token_response and isinstance(token_response, dict) and token_response.get("s") == "ok":
+                        FYERS_ACCESS_TOKEN = token_response.get("access_token")
+                        save_token_to_file(FYERS_ACCESS_TOKEN)
+                        state.fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=FYERS_ACCESS_TOKEN, log_path="")
+                        logger.info("🎉 Fully Automated Fyers Login & Token Generation Successful!")
+                        threading.Thread(target=start_fyers_websocket_worker, daemon=True).start()
+                        return True
+
+        logger.error(f"❌ Token Generation via Automated Flow Failed: {res_auth}")
+        return False
+    except Exception as e:
+        logger.error(f"❌ Automated Login Exception: {e}")
+        return False
+
 def load_cached_token():
     global FYERS_ACCESS_TOKEN, state
     if os.path.exists(TOKEN_CACHE_FILE):
@@ -179,195 +274,19 @@ def load_cached_token():
                     state.fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=FYERS_ACCESS_TOKEN, log_path="")
                     logger.info("🔑 Loaded cached FYERS Access Token successfully!")
                     threading.Thread(target=start_fyers_websocket_worker, daemon=True).start()
+                    return
         except Exception as e:
             logger.error(f"Error loading cached token: {e}")
+    
+    # If cache is missing, trigger automated login
+    perform_automated_login()
 
-# ==============================================================================
 # --- 🌐 REST HTTP API ENDPOINTS ---
-# ==============================================================================
-
-async def handle_fyers_login(request: web.Request):
-    global FYERS_ACCESS_TOKEN, state
-    try:
-        d = await request.json()
-        auth_code = d.get("auth_code")
-        if not auth_code:
-            return web.json_response({"status": False, "error": "auth_code is required"})
-
-        session = fyersModel.SessionModel(
-            client_id=CLIENT_ID,
-            secret_key=SECRET_KEY,
-            redirect_uri=REDIRECT_URI,
-            response_type="code",
-            grant_type="authorization_code"
-        )
-        session.set_token(auth_code)
-        response = session.generate_token()
-
-        if response and isinstance(response, dict) and response.get("s") == "ok":
-            FYERS_ACCESS_TOKEN = response.get("access_token")
-            save_token_to_file(FYERS_ACCESS_TOKEN)
-            state.fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=FYERS_ACCESS_TOKEN, log_path="")
-            
-            threading.Thread(target=start_fyers_websocket_worker, daemon=True).start()
-            
-            current_score = update_user_score(5)
-            logger.info("✅ FYERS Login & Access Token Successful!")
-            return web.json_response({"status": True, "message": "Logged in successfully", "score": current_score})
-        else:
-            return web.json_response({"status": False, "error": response})
-    except Exception as e:
-        logger.error(f"❌ Login Endpoint Error: {e}")
-        return web.json_response({"status": False, "error": str(e)})
-
-# --- 🔀 NEW BROWSER REDIRECT ROUTE (AUTO CAPTURE AUTH CODE) ---
-async def handle_fyers_redirect(request: web.Request):
-    global FYERS_ACCESS_TOKEN, state
-    try:
-        auth_code = request.query.get("auth_code")
-        if not auth_code:
-            return web.Response(text="<h2>❌ Auth code not found in URL! Please login through Fyers.</h2>", content_type="text/html")
-
-        session = fyersModel.SessionModel(
-            client_id=CLIENT_ID,
-            secret_key=SECRET_KEY,
-            redirect_uri=REDIRECT_URI,
-            response_type="code",
-            grant_type="authorization_code"
-        )
-        session.set_token(auth_code)
-        response = session.generate_token()
-
-        if response and isinstance(response, dict) and response.get("s") == "ok":
-            FYERS_ACCESS_TOKEN = response.get("access_token")
-            save_token_to_file(FYERS_ACCESS_TOKEN)
-            state.fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=FYERS_ACCESS_TOKEN, log_path="")
-            
-            threading.Thread(target=start_fyers_websocket_worker, daemon=True).start()
-            logger.info("✅ FYERS Login & Access Token Successful via Browser Redirect!")
-            return web.Response(text="<h1>🎉 Login Successful! Access token generated. You can close this tab now.</h1>", content_type="text/html")
-        else:
-            return web.Response(text=f"<h2>❌ Failed to generate token: {response}</h2>", content_type="text/html")
-    except Exception as e:
-        logger.error(f"❌ Redirect Handler Error: {e}")
-        return web.Response(text=f"<h2>❌ Error: {str(e)}</h2>", content_type="text/html")
-
-async def fetch_chart_data(request: web.Request):
-    try:
-        d = await request.json()
-        token = str(d.get('token', d.get('symbol', '')))
-        raw_exch = str(d.get('exch', 'NSE')).upper().strip()
-        fyers_symbol = format_fyers_symbol(token, raw_exch)
-
-        requested_interval = str(d.get('interval', "FIVE_MINUTE")).upper()
-        resolution = FYERS_RESOLUTION_MAP.get(requested_interval, "5")
-
-        now = datetime.datetime.now(IST)
-        range_to = now.strftime('%Y-%m-%d')
-        range_from = (now - datetime.timedelta(days=15)).strftime('%Y-%m-%d')
-
-        lot_size = fetch_lot_size(token)
-
-        if state.fyers:
-            data_param = {
-                "symbol": fyers_symbol,
-                "resolution": resolution,
-                "date_format": "1",
-                "range_from": range_from,
-                "range_to": range_to,
-                "cont_flag": "1"
-            }
-            response = state.fyers.history(data=data_param)
-
-            if response and isinstance(response, dict) and response.get("s") == "ok":
-                current_score = update_user_score(1)
-                raw_candles = response.get("candles", [])
-                
-                formatted_candles = [{
-                    "time": item[0],
-                    "open": float(item[1]),
-                    "high": float(item[2]),
-                    "low": float(item[3]),
-                    "close": float(item[4]),
-                    "volume": int(item[5]) if len(item) > 5 else 0
-                } for item in raw_candles]
-
-                return web.json_response({
-                    "status": True,
-                    "token": token,
-                    "symbol": fyers_symbol,
-                    "interval": requested_interval,
-                    "lot_size": lot_size,
-                    "score": current_score,
-                    "data": formatted_candles
-                })
-
-        current_score = update_user_score(1)
-        return web.json_response({
-            "status": False,
-            "token": token,
-            "lot_size": lot_size,
-            "score": current_score,
-            "error": "No data or FYERS not authenticated",
-            "data": []
-        })
-
-    except Exception as e:
-        logger.error(f"❌ Chart Error: {e}")
-        return web.json_response({"status": False, "error": str(e)})
-
-async def fetch_historical_oi_data(request: web.Request):
-    try:
-        d = await request.json()
-        token = str(d.get('token', ''))
-        raw_exch = str(d.get('exch', 'NFO')).upper().strip()
-        fyers_symbol = format_fyers_symbol(token, raw_exch)
-
-        requested_interval = str(d.get('interval', "THREE_MINUTE")).upper()
-        resolution = FYERS_RESOLUTION_MAP.get(requested_interval, "3")
-
-        now = datetime.datetime.now(IST)
-        range_to = now.strftime('%Y-%m-%d')
-        range_from = (now - datetime.timedelta(days=5)).strftime('%Y-%m-%d')
-
-        lot_size = fetch_lot_size(token)
-
-        if state.fyers:
-            data_param = {
-                "symbol": fyers_symbol,
-                "resolution": resolution,
-                "date_format": "1",
-                "range_from": range_from,
-                "range_to": range_to,
-                "cont_flag": "1",
-                "oi_flag": "1"
-            }
-            response = state.fyers.history(data=data_param)
-
-            if response and isinstance(response, dict) and response.get("s") == "ok":
-                current_score = update_user_score(1)
-                return web.json_response({
-                    "status": True,
-                    "token": token,
-                    "lot_size": lot_size,
-                    "score": current_score,
-                    "data": response.get("candles", [])
-                })
-
-        return web.json_response({"status": False, "token": token, "lot_size": lot_size, "data": []})
-    except Exception as e:
-        logger.error(f"❌ OI Error: {e}")
-        return web.json_response({"status": False, "error": str(e)})
-
 async def handle_ping_stream(request):
     response = web.StreamResponse(
         status=200,
         reason='OK',
-        headers={
-            'Content-Type': 'audio/mpeg',
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive'
-        }
+        headers={'Content-Type': 'audio/mpeg', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive'}
     )
     await response.prepare(request)
     silent_mp3_frame = b'\xff\xe3\x18\xc4\x00\x00\x00\x03\x48\x00\x00\x00\x00' + b'\x00' * 100
@@ -402,16 +321,11 @@ async def handle_debug_status(request):
         "fyers_authenticated": state.fyers is not None,
         "fyers_ws_connected": BROKER_SOCKET_CONNECTED,
         "subscribed_tokens_count": len(SUBSCRIBED_TOKENS_REGISTRY),
-        "subscribed_tokens": list(SUBSCRIBED_TOKENS_REGISTRY),
         "ltp_cache": LTP_CACHE,
         "timestamp": str(datetime.datetime.now(IST))
     })
 
 # --- ROUTE REGISTRATIONS ---
-app.router.add_get('/', handle_fyers_redirect)  # <--- Yeh naya root GET route add kiya gaya hai
-app.router.add_post('/api/login', handle_fyers_login)
-app.router.add_post('/api/get_chart_data', fetch_chart_data)
-app.router.add_post('/api/get_oi_data', fetch_historical_oi_data)
 app.router.add_get('/ping', handle_ping)
 app.router.add_get('/api/debug_status', handle_debug_status)
 app.router.add_get('/silent_stream', handle_ping_stream)
@@ -429,51 +343,29 @@ async def connect(sid, environ):
 def on_message_received(ticks):
     global main_loop
     try:
-        logger.info(f"📥 Raw Incoming Tick from Fyers WS: {ticks}")
         symbol = ticks.get("symbol", ticks.get("n", ""))
         raw_ltp = ticks.get("ltp", ticks.get("v", {}).get("lp", 0))
-
-        try:
-            price_val = float(raw_ltp)
-            price_str = f"{price_val:.2f}"
-        except Exception:
-            price_val = 0.0
-            price_str = str(raw_ltp)
-
+        price_val = float(raw_ltp) if raw_ltp else 0.0
+        price_str = f"{price_val:.2f}"
+        
         LTP_CACHE[symbol] = price_str
-
         if price_val > 0:
             update_token_candles(symbol, price_val)
 
-        lot_size = fetch_lot_size(symbol)
-
         if main_loop:
-            payload = {
-                "token": symbol, 
-                "symbol": symbol,
-                "ltp": price_str, 
-                "price": price_str,
-                "lot_size": lot_size
-            }
+            payload = {"token": symbol, "symbol": symbol, "ltp": price_str, "price": price_str, "lot_size": fetch_lot_size(symbol)}
             asyncio.run_coroutine_threadsafe(sio.emit("live_data", payload), main_loop)
             asyncio.run_coroutine_threadsafe(sio.emit("live_data", payload, room=symbol), main_loop)
-
     except Exception as e:
-        logger.error(f"Tick Broadcast Error: {e}")
+        logger.error(f"Tick Error: {e}")
 
 def on_ws_open():
     global BROKER_SOCKET_CONNECTED, main_loop
     BROKER_SOCKET_CONNECTED = True
     logger.info("✅ FYERS Realtime WebSocket Connected successfully!")
-    
     if main_loop:
-        asyncio.run_coroutine_threadsafe(
-            sio.emit("market_status", {"status": "connected", "fyers_ready": True}), 
-            main_loop
-        )
-
+        asyncio.run_coroutine_threadsafe(sio.emit("market_status", {"status": "connected", "fyers_ready": True}), main_loop)
     if fyers_ws and SUBSCRIBED_TOKENS_REGISTRY:
-        logger.info(f"🔄 Re-subscribing {len(SUBSCRIBED_TOKENS_REGISTRY)} tokens to Fyers WS.")
         fyers_ws.subscribe(symbols=list(SUBSCRIBED_TOKENS_REGISTRY), data_type="symbolUpdate")
 
 def on_ws_error(msg):
@@ -483,12 +375,8 @@ def on_ws_close():
     global BROKER_SOCKET_CONNECTED, main_loop
     BROKER_SOCKET_CONNECTED = False
     logger.warning("⚠️ FYERS WebSocket Closed!")
-    
     if main_loop:
-        asyncio.run_coroutine_threadsafe(
-            sio.emit("market_status", {"status": "disconnected", "fyers_ready": False}), 
-            main_loop
-        )
+        asyncio.run_coroutine_threadsafe(sio.emit("market_status", {"status": "disconnected", "fyers_ready": False}), main_loop)
 
 @sio.event
 async def subscribe_request(sid, data):
@@ -499,92 +387,54 @@ async def subscribe_request(sid, data):
         raw_exch = payload.get("exchange", "NSE")
         tokens_list = payload.get("tokens", [])
 
-        logger.info(f"📥 Received Subscription Request from Client {sid} -> Action: {action}, Exchange: {raw_exch}, Tokens: {tokens_list}")
-
         if action == "sub":
             update_user_score(1)
             formatted_symbols = []
-
             for token in tokens_list:
                 fyers_symbol = format_fyers_symbol(str(token), raw_exch)
                 formatted_symbols.append(fyers_symbol)
-                logger.info(f"🔄 Formatted Token: '{token}' -> '{fyers_symbol}'")
-                
                 await sio.enter_room(sid, fyers_symbol)
-                if str(token) != fyers_symbol:
-                    await sio.enter_room(sid, str(token))
-                    
                 SUBSCRIBED_TOKENS_REGISTRY.add(fyers_symbol)
 
                 if fyers_symbol in LTP_CACHE:
                     cached_price = LTP_CACHE[fyers_symbol]
-                    logger.info(f"⚡ Emitting Cached LTP for {fyers_symbol}: {cached_price}")
                     await sio.emit("live_data", {
-                        "token": token,
-                        "symbol": fyers_symbol,
-                        "ltp": cached_price,
-                        "price": cached_price,
-                        "lot_size": fetch_lot_size(fyers_symbol)
+                        "token": token, "symbol": fyers_symbol, "ltp": cached_price, "price": cached_price, "lot_size": fetch_lot_size(fyers_symbol)
                     }, room=sid)
 
             if state.fyers and formatted_symbols:
                 try:
                     sym_query = ",".join(formatted_symbols[:50])
-                    logger.info(f"🌐 Fetching Quotes API from Fyers for: {sym_query}")
                     quote_data = state.fyers.quotes({"symbols": sym_query})
-                    
                     if quote_data and quote_data.get("s") == "ok":
                         for item in quote_data.get("d", []):
                             q_sym = item.get("n", "")
-                            q_v = item.get("v", {})
-                            q_ltp = str(q_v.get("lp", "0.00"))
-                            
-                            logger.info(f"📊 Quote Received -> Symbol: {q_sym}, LTP: {q_ltp}")
+                            q_ltp = str(item.get("v", {}).get("lp", "0.00"))
                             if q_sym and q_ltp != "0.00":
                                 price_str = f"{float(q_ltp):.2f}"
                                 LTP_CACHE[q_sym] = price_str
-                                
-                                await sio.emit("live_data", {
-                                    "token": q_sym,
-                                    "symbol": q_sym,
-                                    "ltp": price_str,
-                                    "price": price_str,
-                                    "lot_size": fetch_lot_size(q_sym)
-                                }, room=sid)
-                    else:
-                        logger.warning(f"⚠️ Quotes API Response not OK: {quote_data}")
+                                await sio.emit("live_data", {"token": q_sym, "symbol": q_sym, "ltp": price_str, "price": price_str, "lot_size": fetch_lot_size(q_sym)}, room=sid)
                 except Exception as q_err:
-                    logger.error(f"❌ Quotes API Fetch Error: {q_err}")
+                    logger.error(f"❌ Quotes Error: {q_err}")
 
             if BROKER_SOCKET_CONNECTED and fyers_ws and formatted_symbols:
-                logger.info(f"🚀 Sending Subscriptions to Fyers WebSocket: {formatted_symbols}")
                 fyers_ws.subscribe(symbols=formatted_symbols, data_type="symbolUpdate")
-            else:
-                logger.warning(f"⚠️ Fyers WS not connected or no symbols. Connected Status: {BROKER_SOCKET_CONNECTED}")
-
     except Exception as e:
         logger.error(f"❌ Subscribe Error: {e}")
 
 def start_fyers_websocket_worker():
     global fyers_ws
     if not FYERS_ACCESS_TOKEN:
-        logger.warning("⚠️ Cannot start Fyers WS worker: Access Token is missing!")
         return
     try:
         full_token = f"{CLIENT_ID}:{FYERS_ACCESS_TOKEN}"
-        logger.info("🔌 Initializing Fyers Data Socket...")
         fyers_ws = data_ws.FyersDataSocket(
-            access_token=full_token,
-            log_path="",
-            l_type="symbolUpdate",
-            on_connect=on_ws_open,
-            on_close=on_ws_close,
-            on_error=on_ws_error,
-            on_message=on_message_received
+            access_token=full_token, log_path="", l_type="symbolUpdate",
+            on_connect=on_ws_open, on_close=on_ws_close, on_error=on_ws_error, on_message=on_message_received
         )
         fyers_ws.connect()
     except Exception as e:
-        logger.error(f"❌ WebSocket Worker Exception: {e}")
+        logger.error(f"❌ WS Exception: {e}")
 
 async def start_background_tasks(app_instance):
     global main_loop
