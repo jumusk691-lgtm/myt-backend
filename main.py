@@ -220,6 +220,38 @@ async def handle_fyers_login(request: web.Request):
         logger.error(f"❌ Login Endpoint Error: {e}")
         return web.json_response({"status": False, "error": str(e)})
 
+# --- 🔀 NEW BROWSER REDIRECT ROUTE (AUTO CAPTURE AUTH CODE) ---
+async def handle_fyers_redirect(request: web.Request):
+    global FYERS_ACCESS_TOKEN, state
+    try:
+        auth_code = request.query.get("auth_code")
+        if not auth_code:
+            return web.Response(text="<h2>❌ Auth code not found in URL! Please login through Fyers.</h2>", content_type="text/html")
+
+        session = fyersModel.SessionModel(
+            client_id=CLIENT_ID,
+            secret_key=SECRET_KEY,
+            redirect_uri=REDIRECT_URI,
+            response_type="code",
+            grant_type="authorization_code"
+        )
+        session.set_token(auth_code)
+        response = session.generate_token()
+
+        if response and isinstance(response, dict) and response.get("s") == "ok":
+            FYERS_ACCESS_TOKEN = response.get("access_token")
+            save_token_to_file(FYERS_ACCESS_TOKEN)
+            state.fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=FYERS_ACCESS_TOKEN, log_path="")
+            
+            threading.Thread(target=start_fyers_websocket_worker, daemon=True).start()
+            logger.info("✅ FYERS Login & Access Token Successful via Browser Redirect!")
+            return web.Response(text="<h1>🎉 Login Successful! Access token generated. You can close this tab now.</h1>", content_type="text/html")
+        else:
+            return web.Response(text=f"<h2>❌ Failed to generate token: {response}</h2>", content_type="text/html")
+    except Exception as e:
+        logger.error(f"❌ Redirect Handler Error: {e}")
+        return web.Response(text=f"<h2>❌ Error: {str(e)}</h2>", content_type="text/html")
+
 async def fetch_chart_data(request: web.Request):
     try:
         d = await request.json()
@@ -364,7 +396,6 @@ async def handle_ping(request):
         "timestamp": str(datetime.datetime.now(IST))
     })
 
-# --- 🔍 NEW DEBUG STATUS ENDPOINT ---
 async def handle_debug_status(request):
     return web.json_response({
         "status": True,
@@ -376,6 +407,8 @@ async def handle_debug_status(request):
         "timestamp": str(datetime.datetime.now(IST))
     })
 
+# --- ROUTE REGISTRATIONS ---
+app.router.add_get('/', handle_fyers_redirect)  # <--- Yeh naya root GET route add kiya gaya hai
 app.router.add_post('/api/login', handle_fyers_login)
 app.router.add_post('/api/get_chart_data', fetch_chart_data)
 app.router.add_post('/api/get_oi_data', fetch_historical_oi_data)
@@ -494,7 +527,6 @@ async def subscribe_request(sid, data):
                         "lot_size": fetch_lot_size(fyers_symbol)
                     }, room=sid)
 
-            # --- QUOTES API FALLBACK (Fetches last price if market is closed) ---
             if state.fyers and formatted_symbols:
                 try:
                     sym_query = ",".join(formatted_symbols[:50])
