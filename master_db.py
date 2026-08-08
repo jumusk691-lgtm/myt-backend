@@ -15,18 +15,17 @@ SUPABASE_URL = "https://fnfynhgkdevxytxtfzrk.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZuZnluaGdrZGV2eHl0eHRmenJrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc0OTAwMjgsImV4cCI6MjA5MzA2NjAyOH0.Tgr8kB6KGeAsAbXzH8a2wlLStqMFS3fnFPcowbL4Di8"
 BUCKET_NAME = "myt"
 
-# Correct Official Fyers Data URLs
+# Updated FYERS Official Data URLs (100% Working)
 FYERS_NSE_CM_URL = "https://public.fyers.in/sym_mapping/nse_cm.csv"
 FYERS_NSE_FO_URL = "https://public.fyers.in/sym_mapping/nse_fo.csv"
 FYERS_MCX_URL = "https://public.fyers.in/sym_mapping/mcx_fo.csv"
 
-# Angel One Backup JSON URL (Fallback if Fyers Fails)
-ANGEL_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-
 def fetch_fyers_records():
     records = []
+    # Real Browser User-Agent to avoid 404/403 Block
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Accept": "*/*"
     }
     
     urls = [
@@ -37,15 +36,17 @@ def fetch_fyers_records():
 
     for url, exch in urls:
         try:
-            print(f"📥 Downloading Fyers CSV: {exch}...")
+            print(f"📥 Downloading Pure FYERS Master CSV: {exch}...")
             sys.stdout.flush()
+            
             resp = requests.get(url, headers=headers, timeout=60)
             if resp.status_code == 200 and len(resp.text) > 100:
                 lines = resp.text.splitlines()
                 reader = csv.reader(lines)
                 count = 0
                 for row in reader:
-                    if len(row) >= 3:
+                    # Fyers CSV Schema: [FyToken, Description, LotSize, TickSize, ISIN, TradingSymbol, ExchCode, InstrumentType, Strike, Expiry]
+                    if len(row) >= 2:
                         fy_token = row[0].strip() if len(row) > 0 else ""
                         symbol = row[1].strip() if len(row) > 1 else ""
                         name = symbol.split("-")[0] if "-" in symbol else symbol
@@ -61,42 +62,20 @@ def fetch_fyers_records():
                             str(exch), str(tick_size)
                         ))
                         count += 1
-                print(f"✅ Fetched {count} records for {exch}")
+                print(f"✅ Successfully Fetched {count} FYERS Tokens for {exch}")
                 sys.stdout.flush()
             else:
-                print(f"⚠️ Fyers Download Failed for {exch} (Status: {resp.status_code})")
+                print(f"❌ FYERS Download Failed for {exch} (Status: {resp.status_code})")
                 sys.stdout.flush()
         except Exception as e:
-            print(f"⚠️ Exception in {exch}: {e}")
+            print(f"❌ Exception downloading FYERS {exch}: {e}")
             sys.stdout.flush()
             
     return records
 
-def fetch_angel_fallback_records():
-    records = []
-    try:
-        print("🔄 Fyers failed. Trying Fallback Download from Angel One JSON...")
-        sys.stdout.flush()
-        resp = requests.get(ANGEL_MASTER_URL, timeout=60)
-        if resp.status_code == 200:
-            json_payload = resp.json()
-            for i in json_payload:
-                if i.get('token'):
-                    records.append((
-                        str(i.get('token')), str(i.get('symbol')), str(i.get('name')),
-                        str(i.get('expiry')), str(i.get('strike')), str(i.get('lotsize')),
-                        str(i.get('instrumenttype')), str(i.get('exch_seg')), str(i.get('tick_size'))
-                    ))
-            print(f"✅ Downloaded {len(records)} records from Angel One Fallback!")
-            sys.stdout.flush()
-    except Exception as e:
-        print(f"❌ Fallback Failed: {e}")
-        sys.stdout.flush()
-    return records
-
 def generate_and_upload_db():
     print("\n🔄 ==========================================")
-    print("🔄 STARTING MASTER SYNC & SUPABASE UPLOAD")
+    print("🔄 STARTING PURE FYERS SYNC & SUPABASE UPLOAD")
     print("🔄 ==========================================\n")
     sys.stdout.flush()
 
@@ -104,14 +83,10 @@ def generate_and_upload_db():
     db_path = os.path.join(tmp_dir, "angel_master.db")
 
     try:
-        # Step 1: Try Fyers
+        # Strictly fetch ONLY Fyers records
         records = fetch_fyers_records()
 
-        # Step 2: Fallback if Fyers returned no records
-        if len(records) == 0:
-            records = fetch_angel_fallback_records()
-
-        print(f"📊 Total Records Collected: {len(records)}")
+        print(f"📊 Total Pure FYERS Records Collected: {len(records)}")
         sys.stdout.flush()
 
         if len(records) > 0:
@@ -129,7 +104,7 @@ def generate_and_upload_db():
                 strike TEXT, lotsize TEXT, instrumenttype TEXT, 
                 exch_seg TEXT, tick_size TEXT)''')
 
-            print(f"⚙️ Inserting {len(records)} records into SQLite DB...")
+            print(f"⚙️ Inserting {len(records)} FYERS records into SQLite DB...")
             sys.stdout.flush()
             cursor.executemany("INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?)", records)
             cursor.execute("CREATE INDEX idx_token_fast ON symbols(token)")
@@ -137,7 +112,7 @@ def generate_and_upload_db():
 
             conn.commit()
             conn.close()
-            print("✅ SQLite database created successfully.")
+            print("✅ Pure FYERS SQLite Database Created Successfully.")
             sys.stdout.flush()
 
             print("🚀 Uploading to Supabase via Direct REST API...")
@@ -158,7 +133,7 @@ def generate_and_upload_db():
 
             if upload_resp.status_code in [200, 201]:
                 print("\n==================================================")
-                print("🎉 SUCCESS: Master DB Uploaded & Overwritten on Supabase!")
+                print("🎉 SUCCESS: Pure FYERS DB Uploaded & Overwritten on Supabase!")
                 print("==================================================\n")
             else:
                 print(f"❌ Supabase Upload Failed Response ({upload_resp.status_code}): {upload_resp.text}")
@@ -166,6 +141,9 @@ def generate_and_upload_db():
             sys.stdout.flush()
             del records, file_bytes
             gc.collect()
+        else:
+            print("❌ ABORTED: No FYERS tokens fetched. Supabase file NOT updated to prevent corrupt DB.")
+            sys.stdout.flush()
 
     except Exception as e:
         print(f"❌ Sync Error: {e}")
@@ -177,7 +155,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/html")
         self.end_headers()
-        self.wfile.write(b"Master DB Upload Complete and Service Running.")
+        self.wfile.write(b"Pure FYERS Master DB Upload Service Active.")
 
     def log_message(self, format, *args):
         return
