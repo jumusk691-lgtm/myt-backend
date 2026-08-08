@@ -5,7 +5,7 @@ import os
 import gc
 import csv
 import sys
-import time
+import traceback
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ==============================================================================
@@ -29,7 +29,8 @@ def parse_fyers_csv(url, default_exch):
             lines = resp.text.splitlines()
             reader = csv.reader(lines)
             for row in reader:
-                if len(row) >= 9:
+                # Dynamically handle column length variations across NSE CM, FO, and MCX
+                if len(row) >= 3:
                     fy_token = row[0].strip() if len(row) > 0 else ""
                     symbol = row[1].strip() if len(row) > 1 else ""
                     name = symbol.split("-")[0] if "-" in symbol else symbol
@@ -45,10 +46,14 @@ def parse_fyers_csv(url, default_exch):
                         str(strike), str(lotsize), str(instrumenttype),
                         str(exch_seg), str(tick_size)
                     ))
-            print(f"✅ Parsed {len(records)} records for {default_exch}")
+            print(f"✅ Successfully Parsed {len(records)} records for {default_exch}")
+            sys.stdout.flush()
+        else:
+            print(f"⚠️ Failed to download {default_exch}. Status Code: {resp.status_code}")
             sys.stdout.flush()
     except Exception as e:
-        print(f"⚠️ Error downloading {default_exch}: {e}")
+        print(f"❌ Error downloading/parsing {default_exch}: {e}")
+        traceback.print_exc()
         sys.stdout.flush()
     return records
 
@@ -67,6 +72,9 @@ def generate_and_upload_db():
         records.extend(parse_fyers_csv(FYERS_NSE_FO_URL, "NFO"))
         records.extend(parse_fyers_csv(FYERS_MCX_URL, "MCX"))
 
+        print(f"📊 Total Records Collected: {len(records)}")
+        sys.stdout.flush()
+
         if len(records) > 0:
             if os.path.exists(db_path):
                 os.remove(db_path)
@@ -82,7 +90,7 @@ def generate_and_upload_db():
                 strike TEXT, lotsize TEXT, instrumenttype TEXT, 
                 exch_seg TEXT, tick_size TEXT)''')
 
-            print(f"⚙️ Inserting {len(records)} records into SQLite...")
+            print(f"⚙️ Inserting {len(records)} records into SQLite DB...")
             sys.stdout.flush()
             cursor.executemany("INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?)", records)
             cursor.execute("CREATE INDEX idx_token_fast ON symbols(token)")
@@ -90,7 +98,7 @@ def generate_and_upload_db():
 
             conn.commit()
             conn.close()
-            print("✅ SQLite database created successfully.")
+            print("✅ SQLite database created successfully locally.")
             sys.stdout.flush()
 
             print("🚀 Uploading to Supabase via Direct REST API...")
@@ -114,7 +122,7 @@ def generate_and_upload_db():
                 print("🎉 SUCCESS: Master DB Uploaded & Overwritten on Supabase!")
                 print("==================================================\n")
             else:
-                print(f"❌ Supabase Upload Failed: {upload_resp.status_code} - {upload_resp.text}")
+                print(f"❌ Supabase Upload Failed Response ({upload_resp.status_code}): {upload_resp.text}")
 
             sys.stdout.flush()
             del records, file_bytes
@@ -122,6 +130,7 @@ def generate_and_upload_db():
 
     except Exception as e:
         print(f"❌ Sync Error: {e}")
+        traceback.print_exc()
         sys.stdout.flush()
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -135,10 +144,8 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         return
 
 if __name__ == "__main__":
-    # STEP 1: मेन थ्रेड पर पहले पूरा सिंक और अपलोड खत्म करें
     generate_and_upload_db()
 
-    # STEP 2: अपलोड पूरा होने के बाद पोर्ट बाइंड करें ताकि रेंडर सर्विस लाइव रहे
     port = int(os.environ.get("PORT", 10000))
     print(f"🌐 Server initialized on port {port}. Keeping process active...")
     sys.stdout.flush()
