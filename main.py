@@ -95,31 +95,42 @@ def fetch_lot_size(symbol_str):
 
 # --- 🔄 FIXED FYERS SYMBOL FORMATTER ---
 def format_fyers_symbol(symbol_str, exch="NSE"):
+    if not symbol_str:
+        return ""
+    
     sym = str(symbol_str).strip().upper()
     
-    # अगर Prefix पहले से लगा हुआ है (जैसे NSE:..., NFO:..., MCX:..., BSE:...)
-    if ":" in sym:
-        return sym
+    # 1. Clean Prefix if present (e.g. "NSE:NIFTY2681124600CE" -> "NIFTY2681124600CE")
+    clean_sym = sym.split(":")[-1]
 
-    ex_str = str(exch).upper().strip()
-
-    # Smart Auto-Detection for Options & Futures
-    if any(idx in sym for idx in ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]):
-        if any(opt in sym for opt in ["CE", "PE", "FUT"]):
-            return f"NFO:{sym}"
-        if "INDEX" in sym or sym in ["NIFTY50-INDEX", "NIFTY BANK"]:
-            return f"NSE:{sym}"
-
-    if ex_str in ["2", "NFO", "NSE_FO"]:
-        return f"NFO:{sym}"
-    elif ex_str in ["5", "MCX", "MCX_FO", "MCXFO"]:
-        return f"MCX:{sym}"
-    elif ex_str in ["3", "BSE", "BSE_CM", "BFO"]:
-        return f"BSE:{sym}"
+    # 2. Options / Futures Detection (NFO Segment)
+    if any(opt in clean_sym for opt in ["CE", "PE", "FUT"]):
+        return f"NFO:{clean_sym}"
     
-    if not sym.endswith("-EQ") and not sym.endswith("-INDEX"):
-        sym = f"{sym}-EQ"
-    return f"NSE:{sym}"
+    # 3. MCX Commodities Detection
+    raw_exch = str(exch).strip().upper()
+    if raw_exch in ["MCX", "MCX_FO", "MCXFO"] or any(comm in clean_sym for comm in ["GOLD", "SILVER", "CRUDE"]):
+        return f"MCX:{clean_sym}"
+
+    # 4. Indices Detection
+    if clean_sym in ["NIFTY50-INDEX", "NIFTY 50", "NIFTY", "NSE:NIFTY50-INDEX"]:
+        return "NSE:NIFTY50-INDEX"
+    if clean_sym in ["SENSEX-INDEX", "SENSEX", "BSE:SENSEX-INDEX"]:
+        return "BSE:SENSEX-INDEX"
+    if clean_sym in ["NIFTY BANK", "BANKNIFTY", "NIFTYBANK-INDEX"]:
+        return "NSE:NIFTYBANK-INDEX"
+    if "INDEX" in clean_sym:
+        return f"NSE:{clean_sym}"
+
+    # 5. BSE Segment
+    if raw_exch in ["BSE", "BSE_CM", "BFO"]:
+        return f"BSE:{clean_sym}"
+
+    # 6. Default NSE Equity Stocks
+    if not clean_sym.endswith("-EQ"):
+        clean_sym = f"{clean_sym}-EQ"
+        
+    return f"NSE:{clean_sym}"
 
 # --- 🎯 SCORE LOGIC ENGINE ---
 def update_user_score(points=1):
@@ -392,17 +403,18 @@ def on_message_received(ticks):
         lot_size = fetch_lot_size(symbol)
 
         if main_loop:
-            # Broadcast to specific symbol room AND globally for broad client compatibility
-            asyncio.run_coroutine_threadsafe(
-                sio.emit("live_data", {
-                    "token": symbol, 
-                    "symbol": symbol,
-                    "ltp": price_str, 
-                    "price": price_str,
-                    "lot_size": lot_size
-                }), 
-                main_loop
-            )
+            payload = {
+                "token": symbol, 
+                "symbol": symbol,
+                "ltp": price_str, 
+                "price": price_str,
+                "lot_size": lot_size
+            }
+            # Global Broadcast
+            asyncio.run_coroutine_threadsafe(sio.emit("live_data", payload), main_loop)
+            # Room Specific Broadcast
+            asyncio.run_coroutine_threadsafe(sio.emit("live_data", payload, room=symbol), main_loop)
+
     except Exception as e:
         logger.error(f"Tick Broadcast Error: {e}")
 
@@ -439,15 +451,21 @@ async def subscribe_request(sid, data):
                 formatted_symbols.append(fyers_symbol)
                 
                 await sio.enter_room(sid, fyers_symbol)
+                
+                # Original symbol bhi enter karva lo agar raw name aatha ho
+                if str(token) != fyers_symbol:
+                    await sio.enter_room(sid, str(token))
+                    
                 SUBSCRIBED_TOKENS_REGISTRY.add(fyers_symbol)
 
                 # Send last cached LTP immediately if available
                 if fyers_symbol in LTP_CACHE:
+                    cached_price = LTP_CACHE[fyers_symbol]
                     await sio.emit("live_data", {
-                        "token": fyers_symbol, 
+                        "token": token,
                         "symbol": fyers_symbol,
-                        "ltp": LTP_CACHE[fyers_symbol],
-                        "price": LTP_CACHE[fyers_symbol],
+                        "ltp": cached_price,
+                        "price": cached_price,
                         "lot_size": fetch_lot_size(fyers_symbol)
                     }, room=sid)
 
