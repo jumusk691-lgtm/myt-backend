@@ -7,7 +7,6 @@ import csv
 import sys
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from supabase import create_client
 
 # ==============================================================================
 # --- CONFIGURATION ---
@@ -21,23 +20,24 @@ FYERS_NSE_CM_URL = "https://public.fyers.in/sym_mapping/nse_cm.csv"
 FYERS_NSE_FO_URL = "https://public.fyers.in/sym_mapping/nse_fo.csv"
 FYERS_MCX_URL = "https://public.fyers.in/sym_mapping/mcx_fo.csv"
 
-# Render Port Binding Server
+# Render Web Service Keep-Alive Server
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/html")
         self.end_headers()
-        self.wfile.write(b"Master DB Sync Active")
+        self.wfile.write(b"Master DB Sync Active and Completed!")
 
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
 
     def log_message(self, format, *args):
-        return  # Silence HTTP Server Logs
+        return
 
 def start_health_server():
     port = int(os.environ.get("PORT", 10000))
+    print(f"🌐 Health Check Server starting on port {port}...")
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
     server.serve_forever()
 
@@ -66,12 +66,14 @@ def parse_fyers_csv(url, default_exch):
                         str(strike), str(lotsize), str(instrumenttype),
                         str(exch_seg), str(tick_size)
                     ))
+            print(f"✅ Downloaded {len(records)} items from {default_exch}")
     except Exception as e:
         print(f"⚠️ Error parsing {default_exch} CSV: {e}")
     return records
 
 def generate_and_upload_db():
     print("🔄 [Master] Initializing Fyers Scrip Master Sync...")
+    sys.stdout.flush()
     
     tmp_dir = tempfile.gettempdir()
     db_path = os.path.join(tmp_dir, "angel_master.db")
@@ -98,6 +100,7 @@ def generate_and_upload_db():
                 exch_seg TEXT, tick_size TEXT)''')
             
             print(f"⚙️ Inserting {len(records)} records into SQLite database...")
+            sys.stdout.flush()
             cursor.executemany("INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?)", records)
             cursor.execute("CREATE INDEX idx_token_fast ON symbols(token)")
             cursor.execute("CREATE INDEX idx_name_fast ON symbols(name)")
@@ -105,37 +108,48 @@ def generate_and_upload_db():
             conn.commit()
             conn.close()
             print("✅ Local SQLite DB created successfully.")
+            sys.stdout.flush()
 
-            print("🚀 Uploading to Supabase Storage (Overwriting)...")
-            supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+            # DIRECT HTTP UPLOAD TO SUPABASE (Bypasses SDK Bugs & Forces Overwrite)
+            print("🚀 Uploading directly to Supabase via HTTP REST API...")
+            sys.stdout.flush()
+            
+            upload_url = f"{SUPABASE_URL}/storage/v1/object/{BUCKET_NAME}/angel_master.db"
+            headers = {
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "apiKey": SUPABASE_KEY,
+                "x-upsert": "true",
+                "Content-Type": "application/x-sqlite3"
+            }
             
             with open(db_path, "rb") as f:
-                file_bytes = f.read()
+                file_data = f.read()
                 
-            # PROPER SUPABASE OVERWRITE (file_options fix)
-            res = supabase.storage.from_(BUCKET_NAME).upload(
-                path="angel_master.db", 
-                file=file_bytes,
-                file_options={"cache-control": "3600", "upsert": "true"}
-            )
+            upload_resp = requests.post(upload_url, headers=headers, data=file_data, timeout=120)
             
-            print("==================================================")
-            print(f"🎉 SUCCESS: File Uploaded to Supabase! Response: {res}")
-            print("==================================================")
-            
-            del records, file_bytes
+            if upload_resp.status_code in [200, 201]:
+                print("==================================================")
+                print("🎉 SUCCESS: File Uploaded and Overwritten on Supabase!")
+                print("==================================================")
+            else:
+                print(f"❌ Supabase Upload Failed: {upload_resp.status_code} - {upload_resp.text}")
+                
+            sys.stdout.flush()
+            del records, file_data
             gc.collect()
             return True
             
     except Exception as e:
         print(f"❌ [Master] Process Failed: {e}")
+        sys.stdout.flush()
         return False
     return False
 
 if __name__ == "__main__":
-    web_thread = threading.Thread(target=start_health_server, daemon=True)
-    web_thread.start()
-
+    # STEP 1: Execute Sync First
+    print("▶️ STARTING MASTER DB SYNC PROCESS...")
+    sys.stdout.flush()
     generate_and_upload_db()
 
-    web_thread.join()
+    # STEP 2: Start Keep-Alive Web Server for Render
+    start_health_server()
