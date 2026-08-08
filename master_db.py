@@ -21,13 +21,13 @@ FYERS_MCX_URL    = "https://public.fyers.in/sym_details/MCX_COM.csv"
 
 def convert_epoch_to_date(epoch_str):
     """Converts Fyers epoch timestamp (e.g. 1786443000) to '11 AUG 2026'"""
-    if not epoch_str or not epoch_str.strip().isdigit():
+    if not epoch_str or not str(epoch_str).strip().isdigit():
         return epoch_str
     try:
-        ts = int(epoch_str.strip())
+        ts = int(str(epoch_str).strip())
         if ts > 1000000000:
             dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-            return dt.strftime("%d %b %Y").upper() # Outputs e.g. '11 AUG 2026'
+            return dt.strftime("%d %b %Y").upper()
     except Exception:
         pass
     return epoch_str
@@ -40,22 +40,28 @@ def parse_csv_data(text, default_exch, records_list):
         if len(row) >= 10:
             fy_token = row[0].strip()
             name = row[1].strip()
+            symbol = row[9].strip() if len(row) > 9 else row[1].strip()
             
-            # Dynamic Lot Size from Fyers CSV Index 2
-            raw_lot = row[2].strip() if len(row) > 2 else "1"
-            lotsize = raw_lot if raw_lot and raw_lot.isdigit() else "1"
+            # --- FIXED LOT SIZE MAPPING ---
+            # Index 13 or 14 contains actual Minimum Lot Quantity in Fyers FO CSVs
+            lotsize = "1"
+            if len(row) > 13 and row[13].strip().isdigit() and int(row[13].strip()) > 0:
+                lotsize = row[13].strip()
+            elif len(row) > 14 and row[14].strip().isdigit() and int(row[14].strip()) > 0:
+                lotsize = row[14].strip()
+            elif len(row) > 2 and row[2].strip().isdigit() and row[2].strip() not in ["14", "30", "31"]:
+                lotsize = row[2].strip()
+
+            tick_size = row[3].strip() if len(row) > 3 and row[3].strip() else "0.05"
             
-            tick_size = row[3].strip() if len(row) > 3 else "0.05"
-            
-            # Expiry conversion from Timestamp to Readable Date String
+            # Expiry conversion
             raw_expiry = row[8].strip() if len(row) > 8 else ""
             expiry = convert_epoch_to_date(raw_expiry)
             
-            symbol = row[9].strip()
             strike = row[15].strip() if len(row) > 15 else "0"
             raw_inst = row[16].strip() if len(row) > 16 else ""
 
-            # Standardizing Instrument Types for DB Filtering
+            # Categorize CE, PE, FUT, and EQ
             sym_upper = symbol.upper()
             if sym_upper.endswith("CE"):
                 inst_type = "CE"
@@ -99,7 +105,7 @@ def fetch_all_market_data():
     return all_records
 
 def generate_and_upload_db():
-    print("\n🔄 Generating Pure Dynamic Database...")
+    print("\n🔄 Generating Dynamic Fixed Database...")
     sys.stdout.flush()
 
     tmp_dir = tempfile.gettempdir()
@@ -151,7 +157,7 @@ def generate_and_upload_db():
             upload_resp = requests.post(upload_url, headers=headers, data=file_bytes, timeout=300)
 
             if upload_resp.status_code in [200, 201]:
-                print("🎉 SUCCESS: Pure Dynamic Database Uploaded!")
+                print("🎉 SUCCESS: Fixed Database Uploaded to Supabase!")
             else:
                 print(f"❌ Upload Failed: {upload_resp.text}")
 
