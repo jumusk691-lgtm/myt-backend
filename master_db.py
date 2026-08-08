@@ -5,9 +5,6 @@ import os
 import gc
 import csv
 import io
-import sys
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
 from supabase import create_client
 
 # ==============================================================================
@@ -22,31 +19,22 @@ FYERS_NSE_CM_URL = "https://public.fyers.in/sym_mapping/nse_cm.csv"
 FYERS_NSE_FO_URL = "https://public.fyers.in/sym_mapping/nse_fo.csv"
 FYERS_MCX_URL = "https://public.fyers.in/sym_mapping/mcx_fo.csv"
 
-# Render Web Service पोर्ट को ज़िंदा रखने के लिए छोटा सर्वर
-def start_dummy_health_server():
-    class DummyHandler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"Master Sync Service Active")
-
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), DummyHandler)
-    server.serve_forever()
-
 def parse_fyers_csv(url, default_exch):
     records = []
     try:
         print(f"📥 Downloading Fyers Scrip Master from {default_exch}...")
         resp = requests.get(url, timeout=60)
         if resp.status_code == 200:
+            # Fyers CSV Files parsing
             lines = resp.text.splitlines()
             reader = csv.reader(lines)
             for row in reader:
                 if len(row) >= 10:
-                    fy_token = row[0]          
-                    symbol = row[1]            
-                    name = row[1].split("-")[0] if "-" in row[1] else row[1] 
+                    # Map Fyers CSV columns to old DB Schema
+                    # Row Mapping: [FyToken, Description, LotSize, TickSize, ISIN, TradingSymbol, ExchCode, InstrumentType, Strike, Expiry]
+                    fy_token = row[0]          # Fyers Symbol e.g., NSE:SBIN-EQ or FyToken
+                    symbol = row[1]            # Trading Symbol
+                    name = row[1].split("-")[0] if "-" in row[1] else row[1] # Base Name
                     lotsize = row[2] if len(row) > 2 else "1"
                     tick_size = row[3] if len(row) > 3 else "0.05"
                     instrumenttype = row[7] if len(row) > 7 else ""
@@ -70,12 +58,14 @@ def generate_and_upload_db():
     db_path = os.path.join(tmp_dir, "angel_master.db")
 
     try:
+        # 1. Fyers CSV Files से डेटा फेच करना (NSE Equity, FO और MCX)
         records = []
         records.extend(parse_fyers_csv(FYERS_NSE_CM_URL, "NSE"))
         records.extend(parse_fyers_csv(FYERS_NSE_FO_URL, "NFO"))
         records.extend(parse_fyers_csv(FYERS_MCX_URL, "MCX"))
         
         if len(records) > 0:
+            # 2. SQLite Database बनाना (पुराना सेम स्ट्रक्चर)
             if os.path.exists(db_path): 
                 os.remove(db_path)
                 
@@ -85,6 +75,7 @@ def generate_and_upload_db():
             cursor.execute("PRAGMA journal_mode=OFF")
             cursor.execute("PRAGMA synchronous=OFF")
             
+            # टेबल का नाम और स्ट्रक्चर वही रहेगा
             cursor.execute('''CREATE TABLE symbols (
                 token TEXT, symbol TEXT, name TEXT, expiry TEXT, 
                 strike TEXT, lotsize TEXT, instrumenttype TEXT, 
@@ -99,6 +90,7 @@ def generate_and_upload_db():
             conn.close()
             print("✅ [Master] SQLite .db file generated locally.")
 
+            # 3. Supabase Storage पर 'angel_master.db' को ओवरराइट करना
             print("🚀 Uploading & Overwriting on Supabase Storage...")
             supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
             with open(db_path, "rb") as f:
@@ -119,17 +111,4 @@ def generate_and_upload_db():
     return False
 
 if __name__ == "__main__":
-    # 1. पोर्ट हेल्थ चेक के लिए बैकग्राउंड थ्रेड शुरू करें (अगर Render में यह Web Service है)
-    threading.Thread(target=start_dummy_health_server, daemon=True).start()
-    
-    # 2. डाउनलोड और अपलोड निष्पादित करें
-    success = generate_and_upload_db()
-    
-    if success:
-        print("🎉 Sync Completed Successfully!")
-    else:
-        print("💥 Sync Failed!")
-
-    # 3. अगर यह Render Cron Job या Background Worker है तो सफ़लतापूर्वक एग्ज़िट करें
-    if os.environ.get("RENDER_SERVICE_TYPE") != "web":
-        sys.exit(0 if success else 1)
+    generate_and_upload_db()
