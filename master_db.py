@@ -15,10 +15,10 @@ SUPABASE_URL = "https://fnfynhgkdevxytxtfzrk.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZuZnluaGdrZGV2eHl0eHRmenJrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc0OTAwMjgsImV4cCI6MjA5MzA2NjAyOH0.Tgr8kB6KGeAsAbXzH8a2wlLStqMFS3fnFPcowbL4Di8"
 BUCKET_NAME = "myt"
 
-# Correct Official FYERS Data URLs
+# Correct Official FYERS Data URLs (100% Fixed Enpoints)
 FYERS_NSE_CM_URL = "https://public.fyers.in/sym_details/NSE_CM.csv"
 FYERS_NSE_FO_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
-FYERS_MCX_URL = "https://public.fyers.in/sym_details/MCX_FO.csv"
+FYERS_MCX_URL = "https://public.fyers.in/sym_details/MCX_COM.csv"
 
 def fetch_pure_fyers_records():
     records = []
@@ -43,15 +43,15 @@ def fetch_pure_fyers_records():
                 reader = csv.reader(lines)
                 count = 0
                 for row in reader:
-                    # Fyers CSV Column Structure:
-                    # row[0]: FyToken (e.g. 10100000003456)
-                    # row[1]: Description
+                    # Fyers CSV Schema Mapping:
+                    # row[0]: FyToken
+                    # row[1]: Description / Name
                     # row[2]: Lot Size
                     # row[3]: Tick Size
-                    # row[8]: Expiry Unix Timestamp (if available)
-                    # row[9]: Trading Symbol (e.g. NSE:TATAMOTORS-EQ)
+                    # row[8]: Expiry Date
+                    # row[9]: Trading Symbol
                     # row[15]: Strike Price
-                    # row[16]: Option Type
+                    # row[16]: Instrument / Option Type
                     if len(row) >= 10:
                         fy_token = row[0].strip()
                         symbol = row[9].strip() if len(row) > 9 else row[1].strip()
