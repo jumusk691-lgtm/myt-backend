@@ -5,8 +5,8 @@ import os
 import gc
 import csv
 import sys
-from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from supabase import create_client
 
 # ==============================================================================
@@ -21,17 +21,20 @@ FYERS_NSE_CM_URL = "https://public.fyers.in/sym_mapping/nse_cm.csv"
 FYERS_NSE_FO_URL = "https://public.fyers.in/sym_mapping/nse_fo.csv"
 FYERS_MCX_URL = "https://public.fyers.in/sym_mapping/mcx_fo.csv"
 
-# Render Web Service Port Binding Keep-Alive Server
+# Render Port Binding Server
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/html")
         self.end_headers()
-        self.wfile.write(b"Master DB Sync Service Running.")
+        self.wfile.write(b"Master DB Sync Active")
 
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
+
+    def log_message(self, format, *args):
+        return  # Silence HTTP Server Logs
 
 def start_health_server():
     port = int(os.environ.get("PORT", 10000))
@@ -48,15 +51,14 @@ def parse_fyers_csv(url, default_exch):
             reader = csv.reader(lines)
             for row in reader:
                 if len(row) >= 9:
-                    # Safe Index Extraction for Fyers CSV Format
-                    fy_token = row[0] if len(row) > 0 else ""
-                    symbol = row[1] if len(row) > 1 else ""
+                    fy_token = row[0].strip() if len(row) > 0 else ""
+                    symbol = row[1].strip() if len(row) > 1 else ""
                     name = symbol.split("-")[0] if "-" in symbol else symbol
-                    lotsize = row[2] if len(row) > 2 else "1"
-                    tick_size = row[3] if len(row) > 3 else "0.05"
-                    instrumenttype = row[7] if len(row) > 7 else ""
-                    strike = row[8] if len(row) > 8 else "0"
-                    expiry = row[9] if len(row) > 9 else ""
+                    lotsize = row[2].strip() if len(row) > 2 else "1"
+                    tick_size = row[3].strip() if len(row) > 3 else "0.05"
+                    instrumenttype = row[7].strip() if len(row) > 7 else ""
+                    strike = row[8].strip() if len(row) > 8 else "0"
+                    expiry = row[9].strip() if len(row) > 9 else ""
                     exch_seg = default_exch
 
                     records.append((
@@ -102,25 +104,26 @@ def generate_and_upload_db():
             
             conn.commit()
             conn.close()
-            print("✅ SQLite database generated locally.")
+            print("✅ Local SQLite DB created successfully.")
 
-            print("🚀 Uploading & Overwriting on Supabase Storage...")
+            print("🚀 Uploading to Supabase Storage (Overwriting)...")
             supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
             
             with open(db_path, "rb") as f:
                 file_bytes = f.read()
                 
-            supabase.storage.from_(BUCKET_NAME).upload(
+            # PROPER SUPABASE OVERWRITE (file_options fix)
+            res = supabase.storage.from_(BUCKET_NAME).upload(
                 path="angel_master.db", 
                 file=file_bytes,
-                file_options={"x-upsert": "true", "content-type": "application/x-sqlite3"}
+                file_options={"cache-control": "3600", "upsert": "true"}
             )
             
             print("==================================================")
-            print("🎉 SUCCESS: File Uploaded to Supabase Successfully!")
+            print(f"🎉 SUCCESS: File Uploaded to Supabase! Response: {res}")
             print("==================================================")
             
-            del records
+            del records, file_bytes
             gc.collect()
             return True
             
@@ -130,12 +133,9 @@ def generate_and_upload_db():
     return False
 
 if __name__ == "__main__":
-    # 1. Start Web Server in Background Thread (Required for Render Web Service)
     web_thread = threading.Thread(target=start_health_server, daemon=True)
     web_thread.start()
 
-    # 2. Execute Download and Upload on Deployment
     generate_and_upload_db()
 
-    # 3. Keep main thread alive so Render Service stays Green/Live
     web_thread.join()
