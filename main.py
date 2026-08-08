@@ -31,7 +31,7 @@ class AppState:
 state = AppState()
 
 # --- 🔑 FYERS CREDENTIALS ---
-CLIENT_ID = "BC7D6R1O7-100"       # App ID
+CLIENT_ID = "BC7D6RF1O7-100"       # App ID
 SECRET_KEY = "6AEEEFZDT7"         # Secret ID
 REDIRECT_URI = "https://myt-backend-1.onrender.com"
 TOKEN_CACHE_FILE = "token_cache.json"
