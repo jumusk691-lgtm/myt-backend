@@ -15,21 +15,49 @@ SUPABASE_URL = "https://fnfynhgkdevxytxtfzrk.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZuZnluaGdrZGV2eHl0eHRmenJrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc0OTAwMjgsImV4cCI6MjA5MzA2NjAyOH0.Tgr8kB6KGeAsAbXzH8a2wlLStqMFS3fnFPcowbL4Di8"
 BUCKET_NAME = "myt"
 
+# Updated FYERS Data URLs with Fallbacks
 FYERS_NSE_CM_URL = "https://public.fyers.in/sym_mapping/nse_cm.csv"
 FYERS_NSE_FO_URL = "https://public.fyers.in/sym_mapping/nse_fo.csv"
 FYERS_MCX_URL = "https://public.fyers.in/sym_mapping/mcx_fo.csv"
 
-def parse_fyers_csv(url, default_exch):
+# Alternate Backup URLs
+FYERS_NSE_CM_ALT = "https://images.fyers.in/sym_mapping/nse_cm.csv"
+FYERS_NSE_FO_ALT = "https://images.fyers.in/sym_mapping/nse_fo.csv"
+FYERS_MCX_ALT = "https://images.fyers.in/sym_mapping/mcx_fo.csv"
+
+def download_csv_content(primary_url, alt_url, default_exch):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    
+    print(f"📥 Downloading Fyers CSV: {default_exch}...")
+    sys.stdout.flush()
+    
+    # Try primary URL
+    resp = requests.get(primary_url, headers=headers, timeout=60)
+    if resp.status_code == 200 and len(resp.text) > 100:
+        return resp.text
+
+    print(f"⚠️ Primary URL failed for {default_exch} ({resp.status_code}). Trying Alternate...")
+    sys.stdout.flush()
+
+    # Try alternate URL
+    resp_alt = requests.get(alt_url, headers=headers, timeout=60)
+    if resp_alt.status_code == 200 and len(resp_alt.text) > 100:
+        return resp_alt.text
+
+    print(f"❌ Both URLs failed for {default_exch}")
+    sys.stdout.flush()
+    return None
+
+def parse_fyers_csv(primary_url, alt_url, default_exch):
     records = []
     try:
-        print(f"📥 Downloading Fyers CSV: {default_exch}...")
-        sys.stdout.flush()
-        resp = requests.get(url, timeout=120)
-        if resp.status_code == 200:
-            lines = resp.text.splitlines()
+        csv_text = download_csv_content(primary_url, alt_url, default_exch)
+        if csv_text:
+            lines = csv_text.splitlines()
             reader = csv.reader(lines)
             for row in reader:
-                # Dynamically handle column length variations across NSE CM, FO, and MCX
                 if len(row) >= 3:
                     fy_token = row[0].strip() if len(row) > 0 else ""
                     symbol = row[1].strip() if len(row) > 1 else ""
@@ -48,11 +76,8 @@ def parse_fyers_csv(url, default_exch):
                     ))
             print(f"✅ Successfully Parsed {len(records)} records for {default_exch}")
             sys.stdout.flush()
-        else:
-            print(f"⚠️ Failed to download {default_exch}. Status Code: {resp.status_code}")
-            sys.stdout.flush()
     except Exception as e:
-        print(f"❌ Error downloading/parsing {default_exch}: {e}")
+        print(f"❌ Parsing Error for {default_exch}: {e}")
         traceback.print_exc()
         sys.stdout.flush()
     return records
@@ -68,9 +93,9 @@ def generate_and_upload_db():
 
     try:
         records = []
-        records.extend(parse_fyers_csv(FYERS_NSE_CM_URL, "NSE"))
-        records.extend(parse_fyers_csv(FYERS_NSE_FO_URL, "NFO"))
-        records.extend(parse_fyers_csv(FYERS_MCX_URL, "MCX"))
+        records.extend(parse_fyers_csv(FYERS_NSE_CM_URL, FYERS_NSE_CM_ALT, "NSE"))
+        records.extend(parse_fyers_csv(FYERS_NSE_FO_URL, FYERS_NSE_FO_ALT, "NFO"))
+        records.extend(parse_fyers_csv(FYERS_MCX_URL, FYERS_MCX_ALT, "MCX"))
 
         print(f"📊 Total Records Collected: {len(records)}")
         sys.stdout.flush()
@@ -98,7 +123,7 @@ def generate_and_upload_db():
 
             conn.commit()
             conn.close()
-            print("✅ SQLite database created successfully locally.")
+            print("✅ SQLite database created successfully.")
             sys.stdout.flush()
 
             print("🚀 Uploading to Supabase via Direct REST API...")
