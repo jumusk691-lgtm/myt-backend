@@ -215,11 +215,10 @@ def perform_automated_login():
             return False
         jwt_token = res3.json().get("data", {}).get("access_token")
 
-        # 4. Get Auth Code via v3 token endpoint (Using full Client ID to prevent invalid appId error)
+        # 4. Get Auth Code via v3 token endpoint (Fixed invalid appId error by sending only the base app_id)
         payload_token = {
             "fyers_id": FY_ID,
-            "app_id": CLIENT_ID,          # Fixed: Sending the full CLIENT_ID
-            "client_id": CLIENT_ID,       # Added: Extra key to ensure Fyers API accepts the payload
+            "app_id": CLIENT_ID.split('-')[0],  
             "redirect_uri": REDIRECT_URI,
             "appType": APP_TYPE,
             "code_challenge": "",
