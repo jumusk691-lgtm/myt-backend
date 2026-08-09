@@ -185,7 +185,7 @@ def perform_automated_login():
     global FYERS_ACCESS_TOKEN, state
     try:
         logger.info("🤖 Starting Fully Automated Headless Fyers Login...")
-        base_url = "https://api-t2.fyers.in/vagator/v2"  # Updated to correct t2 endpoint
+        base_url = "https://api-t2.fyers.in/vagator/v2"
         base_url_2 = "https://api-t1.fyers.in/api/v3"
 
         headers = {
@@ -215,10 +215,10 @@ def perform_automated_login():
             return False
         jwt_token = res3.json().get("data", {}).get("access_token")
 
-        # 4. Get Auth Code via v3 token endpoint
+        # 4. Get Auth Code via v3 token endpoint (Using base App ID without -100 suffix)
         payload_token = {
             "fyers_id": FY_ID,
-            "app_id": CLIENT_ID,
+            "app_id": CLIENT_ID.split("-")[0],
             "redirect_uri": REDIRECT_URI,
             "appType": APP_TYPE,
             "code_challenge": "",
