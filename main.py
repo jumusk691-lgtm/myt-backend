@@ -7,6 +7,10 @@ import threading
 import sqlite3
 import pytz
 import os
+import hashlib
+import requests
+import pyotp
+from urllib import parse
 import aiohttp
 import socketio
 from aiohttp import web
@@ -17,7 +21,6 @@ from fyers_apiv3.FyersWebsocket import data_ws
 
 # --- 🕒 TIMEZONE & LOGGING SETUP ---
 IST = pytz.timezone('Asia/Kolkata')
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("FYERS_TITAN_PROD")
 
@@ -30,11 +33,17 @@ class AppState:
 
 state = AppState()
 
-# --- 🔑 FYERS CREDENTIALS ---
+# --- 🔑 FYERS CREDENTIALS & AUTOMATED PARAMS ---
 CLIENT_ID = "BC7D6RF107-100"       # App ID
 SECRET_KEY = "6AEEEFZDT7"         # Secret ID
 REDIRECT_URI = "https://myt-backend-1.onrender.com"
 TOKEN_CACHE_FILE = "token_cache.json"
+
+# Automated Credentials
+FY_ID = "FAI41352"
+PIN = "9853"
+TOTP_SECRET = "L6UYLWJQSYLVVZYP3ODHKQITDYZXFUQC"
+APP_TYPE = "100"
 
 # --- 🚀 GLOBAL STATES & CACHE ---
 LTP_CACHE = {}               
@@ -167,6 +176,89 @@ def save_token_to_file(token):
     except Exception as e:
         logger.error(f"Failed to save token: {e}")
 
+def get_app_id_hash():
+    input_str = f"{CLIENT_ID}:{SECRET_KEY}"
+    return hashlib.sha256(input_str.encode()).hexdigest()
+
+# --- 🤖 AUTOMATED HEADLESS LOGIN FUNCTION ---
+def perform_automated_login():
+    global FYERS_ACCESS_TOKEN, state
+    try:
+        logger.info("🤖 Starting Fully Automated Headless Fyers Login...")
+        base_url = "https://api-t1.fyers.in/vagator/v2"
+        base_url_2 = "https://api-t1.fyers.in/api/v3"
+
+        # 1. Send OTP
+        res1 = requests.post(f"{base_url}/send_login_otp", json={"fy_id": FY_ID, "app_id": "2"})
+        if res1.status_code != 200:
+            logger.error(f"❌ OTP Send Failed: {res1.text}")
+            return False
+        req_key1 = res1.json().get("request_key")
+
+        # 2. Generate & Verify TOTP
+        totp_val = pyotp.TOTP(TOTP_SECRET).now()
+        res2 = requests.post(f"{base_url}/verify_otp", json={"request_key": req_key1, "otp": totp_val})
+        if res2.status_code != 200:
+            logger.error(f"❌ TOTP Verify Failed: {res2.text}")
+            return False
+        req_key2 = res2.json().get("request_key")
+
+        # 3. Verify PIN
+        res3 = requests.post(f"{base_url}/verify_pin", json={"request_key": req_key2, "identity_type": "pin", "identifier": PIN})
+        if res3.status_code != 200:
+            logger.error(f"❌ PIN Verify Failed: {res3.text}")
+            return False
+        jwt_token = res3.json().get("data", {}).get("access_token")
+
+        # 4. Get Auth Code via v3 token endpoint
+        payload_token = {
+            "fyers_id": FY_ID,
+            "app_id": CLIENT_ID,
+            "redirect_uri": REDIRECT_URI,
+            "appType": APP_TYPE,
+            "code_challenge": "",
+            "state": "sample_state",
+            "scope": "",
+            "nonce": "",
+            "response_type": "code",
+            "create_cookie": True
+        }
+        res4 = requests.post(f"{base_url_2}/token", json=payload_token, headers={'Authorization': f'Bearer {jwt_token}'})
+        if res4.status_code != 308 and res4.status_code != 200:
+            logger.error(f"❌ Token Step Failed: {res4.text}")
+            return False
+        
+        url_target = res4.json().get("Url", "")
+        auth_code = parse.parse_qs(parse.urlparse(url_target).query).get('auth_code', [None])[0]
+        if not auth_code:
+            logger.error("❌ Auth code extraction failed!")
+            return False
+
+        # 5. Validate Auth Code to get Final Access Token
+        payload_validate = {
+            "grant_type": "authorization_code",
+            "appIdHash": get_app_id_hash(),
+            "code": auth_code,
+        }
+        res5 = requests.post(f"{base_url_2}/validate-authcode", json=payload_validate)
+        if res5.status_code != 200:
+            logger.error(f"❌ Validate AuthCode Failed: {res5.text}")
+            return False
+
+        final_token = res5.json().get("access_token")
+        if final_token:
+            FYERS_ACCESS_TOKEN = final_token
+            save_token_to_file(FYERS_ACCESS_TOKEN)
+            state.fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=FYERS_ACCESS_TOKEN, log_path="")
+            logger.info("🎉 Fully Automated Fyers Login & Token Generation Successful!")
+            threading.Thread(target=start_fyers_websocket_worker, daemon=True).start()
+            return True
+
+        return False
+    except Exception as e:
+        logger.error(f"❌ Automated Login Exception: {e}")
+        return False
+
 def load_cached_token():
     global FYERS_ACCESS_TOKEN, state
     if os.path.exists(TOKEN_CACHE_FILE):
@@ -179,44 +271,16 @@ def load_cached_token():
                     state.fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=FYERS_ACCESS_TOKEN, log_path="")
                     logger.info("🔑 Loaded cached FYERS Access Token successfully!")
                     threading.Thread(target=start_fyers_websocket_worker, daemon=True).start()
+                    return
         except Exception as e:
             logger.error(f"Error loading cached token: {e}")
+    
+    # If cache doesn't exist, execute automated login automatically
+    perform_automated_login()
 
 # ==============================================================================
 # --- 🌐 REST HTTP API ENDPOINTS ---
 # ==============================================================================
-
-# --- 🔀 BROWSER REDIRECT ROUTE (AUTO CAPTURE AUTH CODE) ---
-async def handle_fyers_redirect(request: web.Request):
-    global FYERS_ACCESS_TOKEN, state
-    try:
-        auth_code = request.query.get("auth_code")
-        if not auth_code:
-            return web.Response(text="<h2>❌ Auth code not found in URL! Please login through Fyers.</h2>", content_type="text/html")
-
-        session = fyersModel.SessionModel(
-            client_id=CLIENT_ID,
-            secret_key=SECRET_KEY,
-            redirect_uri=REDIRECT_URI,
-            response_type="code",
-            grant_type="authorization_code"
-        )
-        session.set_token(auth_code)
-        response = session.generate_token()
-
-        if response and isinstance(response, dict) and response.get("s") == "ok":
-            FYERS_ACCESS_TOKEN = response.get("access_token")
-            save_token_to_file(FYERS_ACCESS_TOKEN)
-            state.fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=FYERS_ACCESS_TOKEN, log_path="")
-            
-            threading.Thread(target=start_fyers_websocket_worker, daemon=True).start()
-            logger.info("✅ FYERS Login & Access Token Successful via Browser Redirect!")
-            return web.Response(text="<h1>🎉 Login Successful! Access token generated. You can close this tab now.</h1>", content_type="text/html")
-        else:
-            return web.Response(text=f"<h2>❌ Failed to generate token: {response}</h2>", content_type="text/html")
-    except Exception as e:
-        logger.error(f"❌ Redirect Handler Error: {e}")
-        return web.Response(text=f"<h2>❌ Error: {str(e)}</h2>", content_type="text/html")
 
 async def handle_ping_stream(request):
     response = web.StreamResponse(
@@ -267,7 +331,6 @@ async def handle_debug_status(request):
     })
 
 # --- ROUTE REGISTRATIONS ---
-app.router.add_get('/', handle_fyers_redirect)
 app.router.add_get('/ping', handle_ping)
 app.router.add_get('/api/debug_status', handle_debug_status)
 app.router.add_get('/silent_stream', handle_ping_stream)
