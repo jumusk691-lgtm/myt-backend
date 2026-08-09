@@ -188,8 +188,13 @@ def perform_automated_login():
         base_url = "https://api-t1.fyers.in/vagator/v2"
         base_url_2 = "https://api-t1.fyers.in/api/v3"
 
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+
         # 1. Send OTP
-        res1 = requests.post(f"{base_url}/send_login_otp", json={"fy_id": FY_ID, "app_id": "2"})
+        res1 = requests.post(f"{base_url}/send_login_otp", json={"fy_id": FY_ID, "app_id": "2"}, headers=headers)
         if res1.status_code != 200:
             logger.error(f"❌ OTP Send Failed: {res1.text}")
             return False
@@ -197,14 +202,14 @@ def perform_automated_login():
 
         # 2. Generate & Verify TOTP
         totp_val = pyotp.TOTP(TOTP_SECRET).now()
-        res2 = requests.post(f"{base_url}/verify_otp", json={"request_key": req_key1, "otp": totp_val})
+        res2 = requests.post(f"{base_url}/verify_otp", json={"request_key": req_key1, "otp": totp_val}, headers=headers)
         if res2.status_code != 200:
             logger.error(f"❌ TOTP Verify Failed: {res2.text}")
             return False
         req_key2 = res2.json().get("request_key")
 
         # 3. Verify PIN
-        res3 = requests.post(f"{base_url}/verify_pin", json={"request_key": req_key2, "identity_type": "pin", "identifier": PIN})
+        res3 = requests.post(f"{base_url}/verify_pin", json={"request_key": req_key2, "identity_type": "pin", "identifier": PIN}, headers=headers)
         if res3.status_code != 200:
             logger.error(f"❌ PIN Verify Failed: {res3.text}")
             return False
@@ -223,7 +228,8 @@ def perform_automated_login():
             "response_type": "code",
             "create_cookie": True
         }
-        res4 = requests.post(f"{base_url_2}/token", json=payload_token, headers={'Authorization': f'Bearer {jwt_token}'})
+        token_headers = {'Authorization': f'Bearer {jwt_token}', **headers}
+        res4 = requests.post(f"{base_url_2}/token", json=payload_token, headers=token_headers)
         if res4.status_code != 308 and res4.status_code != 200:
             logger.error(f"❌ Token Step Failed: {res4.text}")
             return False
@@ -240,7 +246,7 @@ def perform_automated_login():
             "appIdHash": get_app_id_hash(),
             "code": auth_code,
         }
-        res5 = requests.post(f"{base_url_2}/validate-authcode", json=payload_validate)
+        res5 = requests.post(f"{base_url_2}/validate-authcode", json=payload_validate, headers=headers)
         if res5.status_code != 200:
             logger.error(f"❌ Validate AuthCode Failed: {res5.text}")
             return False
