@@ -185,7 +185,7 @@ def perform_automated_login():
     global FYERS_ACCESS_TOKEN, state
     try:
         logger.info("🤖 Starting Fully Automated Headless Fyers Login...")
-        base_url = "https://api-t1.fyers.in/vagator/v2"
+        base_url = "https://api-t2.fyers.in/vagator/v2"  # Updated to correct t2 endpoint
         base_url_2 = "https://api-t1.fyers.in/api/v3"
 
         headers = {
@@ -281,7 +281,6 @@ def load_cached_token():
         except Exception as e:
             logger.error(f"Error loading cached token: {e}")
     
-    # If cache doesn't exist, execute automated login automatically
     perform_automated_login()
 
 # ==============================================================================
