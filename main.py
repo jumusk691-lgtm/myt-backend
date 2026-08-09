@@ -34,7 +34,8 @@ class AppState:
 state = AppState()
 
 # --- 🔑 FYERS CREDENTIALS & AUTOMATED PARAMS ---
-CLIENT_ID = "BC7D6RF107-100"       # App ID
+CLIENT_ID = "BC7D6RF107-100"       # Full App ID for FyersModel SDK
+BASE_APP_ID = "BC7D6RF107"        # Pure App ID for Fyers API /token & Hash
 SECRET_KEY = "6AEEEFZDT7"         # Secret ID
 REDIRECT_URI = "https://myt-backend-1.onrender.com"
 TOKEN_CACHE_FILE = "token_cache.json"
@@ -177,7 +178,7 @@ def save_token_to_file(token):
         logger.error(f"Failed to save token: {e}")
 
 def get_app_id_hash():
-    input_str = f"{CLIENT_ID}:{SECRET_KEY}"
+    input_str = f"{BASE_APP_ID}:{SECRET_KEY}"
     return hashlib.sha256(input_str.encode()).hexdigest()
 
 # --- 🤖 AUTOMATED HEADLESS LOGIN FUNCTION ---
@@ -215,10 +216,10 @@ def perform_automated_login():
             return False
         jwt_token = res3.json().get("data", {}).get("access_token")
 
-        # 4. Get Auth Code via v3 token endpoint (Fixed app_id to full CLIENT_ID)
+        # 4. Get Auth Code via v3 token endpoint (Using BASE_APP_ID for app_id)
         payload_token = {
             "fyers_id": FY_ID,
-            "app_id": CLIENT_ID,
+            "app_id": BASE_APP_ID,
             "client_id": CLIENT_ID,
             "redirect_uri": REDIRECT_URI,
             "appType": APP_TYPE,
