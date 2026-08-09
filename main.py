@@ -166,27 +166,27 @@ def get_app_id_hash():
 def exchange_auth_code_for_token(auth_code):
     global FYERS_ACCESS_TOKEN, state
     try:
-        base_url_2 = "https://api-t1.fyers.in/api/v3"
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0"
-        }
-        payload_validate = {
-            "grant_type": "authorization_code",
-            "appIdHash": get_app_id_hash(),
-            "code": auth_code,
-        }
-        res = requests.post(f"{base_url_2}/validate-authcode", json=payload_validate, headers=headers)
-        if res.status_code == 200:
-            final_token = res.json().get("access_token")
-            if final_token:
-                FYERS_ACCESS_TOKEN = final_token
-                save_token_to_file(FYERS_ACCESS_TOKEN)
-                state.fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=FYERS_ACCESS_TOKEN, log_path="")
-                logger.info("🎉 Auth Code Successfully Exchanged for Access Token!")
-                threading.Thread(target=start_fyers_websocket_worker, daemon=True).start()
-                return True
-        logger.error(f"❌ Validate AuthCode Failed: {res.text}")
+        # Using official Fyers SessionModel to prevent validation failure and login loops
+        session = fyersModel.SessionModel(
+            client_id=CLIENT_ID,
+            secret_key=SECRET_KEY,
+            redirect_uri=REDIRECT_URI,
+            response_type="code",
+            grant_type="authorization_code"
+        )
+        session.set_token(auth_code)
+        response = session.generate_token()
+        
+        final_token = response.get("access_token")
+        if final_token:
+            FYERS_ACCESS_TOKEN = final_token
+            save_token_to_file(FYERS_ACCESS_TOKEN)
+            state.fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=FYERS_ACCESS_TOKEN, log_path="")
+            logger.info("🎉 Auth Code Successfully Exchanged for Access Token via SessionModel!")
+            threading.Thread(target=start_fyers_websocket_worker, daemon=True).start()
+            return True
+        
+        logger.error(f"❌ Validate AuthCode Failed Response: {response}")
         return False
     except Exception as e:
         logger.error(f"❌ Token Exchange Exception: {e}")
@@ -242,7 +242,7 @@ async def handle_oauth_callback(request):
             """
             return web.Response(text=html_content, content_type='text/html')
         else:
-            return web.Response(text="❌ Failed to validate auth code with Fyers broker.", status=400)
+            return web.Response(text="❌ Failed to validate auth code with Fyers broker. Please check credentials or try logging in again.", status=400)
     
     # Default landing info if no auth_code
     status_text = "Connected" if state.fyers else "Not Authenticated"
