@@ -33,7 +33,7 @@ class AppState:
 state = AppState()
 
 # --- 🔑 FYERS CREDENTIALS & PARAMS ---
-CLIENT_ID = "BC7D6RF107-100"       # Full App ID for FyersModel SDK
+CLIENT_ID = "BC7D6RF107-100"       # Full App ID for FyersModel SDK & Login Redirect
 BASE_APP_ID = "BC7D6RF107"        # Pure App ID for API /validate-authcode & Hash
 SECRET_KEY = "6AEEEFZDT7"         # Secret ID
 REDIRECT_URI = "https://myt-backend-1.onrender.com"
@@ -214,10 +214,10 @@ def load_cached_token():
 # ==============================================================================
 
 async def handle_login_redirect(request):
-    """Redirects user to official Fyers Login page"""
+    """Redirects user to official Fyers Login page using full CLIENT_ID"""
     fyers_login_url = (
         f"https://api-t1.fyers.in/api/v3/generate-authcode"
-        f"?client_id={BASE_APP_ID}"
+        f"?client_id={CLIENT_ID}"
         f"&redirect_uri={parse.quote(REDIRECT_URI, safe='')}"
         f"&response_type=code"
         f"&state=sample_state"
