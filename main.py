@@ -4,15 +4,17 @@ import logging
 import time
 import datetime
 import threading
+import os
 import pytz
 import socketio
 import ssl
 import websockets
 from aiohttp import web
 
-# --- Upstox Official SDK ---
+# --- Upstox Official SDK & Auto-TOTP Library ---
 import upstox_client
 from upstox_client.rest import ApiException
+from upstox_totp import UpstoxTOTP
 
 # --- 🕒 TIMEZONE & LOGGING SETUP ---
 IST = pytz.timezone('Asia/Kolkata')
@@ -30,7 +32,16 @@ state = AppState()
 
 # --- 🔑 UPSTOX CREDENTIALS ---
 API_KEY = "eba0a80f-c907-42fa-a926-6672a120254d"
-ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI2MkFIN0siLCJqdGkiOiI2YTc5ZTg5MTk4MWM2YjA3ZDIxNTcxY2IiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlhdCI6MTc4NjM3NDI4OSwiaXNzIjoidWRhap1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3ODYzOTkyMDB9.hvPeurdKyWsaCDE6auP9TR20QF6dxVkO0NdwMEWXMTI"
+API_SECRET = os.getenv("UPSTOX_API_SECRET", "cg0pdqyg8t")
+REDIRECT_URI = "https://myt-backend-1.onrender.com"
+
+# Access Token (Manual / Fallback)
+ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI2MkFIN0siLCJqdGkiOiI2YTc5ZDk1Mzk1YjgyYzEzZjc5OTlmOWEiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlzRXh0ZW5kZWQiOnRydWUsImlhdCI6MTc4NjM3MDM4NywiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxODE3OTM1MjAwfQ.ty3iYKAJLCRYvmGCAHq1UCovg-2fzIw0u7UyLNdGXsU")
+
+# User Credentials for Automatic Login
+UPSTOX_MOBILE_NO = os.getenv("UPSTOX_MOBILE_NO", "7735493540")
+UPSTOX_PIN = os.getenv("UPSTOX_PIN", "865895")
+UPSTOX_TOTP_KEY = os.getenv("UPSTOX_TOTP_KEY", "WPCJRHDA3KLBTZJO4D7N2ONIE6TV6WWR")
 
 # Configuration Setup
 configuration = upstox_client.Configuration()
@@ -60,6 +71,39 @@ main_loop = None
 sio = socketio.AsyncServer(async_mode='aiohttp', cors_allowed_origins='*')
 app = web.Application()
 sio.attach(app)
+
+# --- 🎯 AUTO ACCESS TOKEN REFRESH ENGINE ---
+def auto_refresh_upstox_token():
+    global ACCESS_TOKEN, configuration
+    try:
+        if not UPSTOX_TOTP_KEY or UPSTOX_TOTP_KEY == "":
+            logger.warning("⚠️ UPSTOX_TOTP_KEY not configured. Skipping Auto Token Generation, using fallback token.")
+            return False
+
+        logger.info("⏳ Attempting Automatic Token Generation via Upstox TOTP Engine...")
+        
+        upx = UpstoxTOTP(
+            username=UPSTOX_MOBILE_NO,
+            pin_code=UPSTOX_PIN,
+            totp_secret=UPSTOX_TOTP_KEY,
+            client_id=API_KEY,
+            client_secret=API_SECRET,
+            redirect_uri=REDIRECT_URI
+        )
+
+        response = upx.app_token.get_access_token()
+        if response and getattr(response, 'success', False) and response.data:
+            new_token = response.data.access_token
+            ACCESS_TOKEN = new_token
+            configuration.access_token = ACCESS_TOKEN
+            logger.info("✅ Successfully Auto-Generated & Updated New Upstox Access Token!")
+            return True
+        else:
+            logger.error("❌ Auto Token Generation Failed. Response invalid. Retrying fallback token.")
+    except Exception as e:
+        logger.error(f"❌ Exception occurred during Upstox Auto Token Refresh: {e}")
+    
+    return False
 
 # --- 🎯 SCORE LOGIC ---
 def update_user_score(points=1):
@@ -127,6 +171,8 @@ async def get_upstox_authorized_ws_url():
         api_response = api_instance.get_market_data_feed_authorize("2.0")
         if api_response and api_response.data:
             return api_response.data.authorized_redirect_uri
+    except ApiException as e:
+        logger.error(f"❌ Upstox WS Auth API Exception (Status {e.status}): {e.body}")
     except Exception as e:
         logger.error(f"❌ Upstox WS Auth URL Error: {e}")
     return None
@@ -138,6 +184,8 @@ async def start_upstox_feed_stream():
             ws_url = await get_upstox_authorized_ws_url()
             if not ws_url:
                 logger.warning("⚠️ Retrying Upstox WS Auth URL in 5 seconds...")
+                # Attempt Token Refresh if connection repeatedly fails
+                auto_refresh_upstox_token()
                 await asyncio.sleep(5)
                 continue
 
@@ -298,6 +346,10 @@ app.router.add_post('/api/get_chart_data', fetch_chart_data)
 async def start_background_tasks(app):
     global main_loop
     main_loop = asyncio.get_event_loop()
+    
+    # Trigger Initial Token Auto Refresh on Server Startup
+    auto_refresh_upstox_token()
+    
     asyncio.create_task(start_upstox_feed_stream())
     logger.info("✅ Upstox Backend Service Initialized.")
 
