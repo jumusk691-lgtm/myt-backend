@@ -3,7 +3,6 @@ import json
 import logging
 import time
 import datetime
-import threading
 import os
 import pytz
 import socketio
@@ -76,19 +75,20 @@ sio.attach(app)
 def auto_refresh_upstox_token():
     global ACCESS_TOKEN, configuration
     try:
-        if not UPSTOX_TOTP_KEY or UPSTOX_TOTP_KEY == "":
-            logger.warning("⚠️ UPSTOX_TOTP_KEY not configured. Skipping Auto Token Generation, using fallback token.")
+        if not UPSTOX_TOTP_KEY:
+            logger.warning("⚠️ UPSTOX_TOTP_KEY missing. Skipping Auto Token Generation.")
             return False
 
         logger.info("⏳ Attempting Automatic Token Generation via Upstox TOTP Engine...")
         
+        # Correct Explicit Parameter Mapping for UpstoxTOTP
         upx = UpstoxTOTP(
-            username=UPSTOX_MOBILE_NO,
-            pin_code=UPSTOX_PIN,
-            totp_secret=UPSTOX_TOTP_KEY,
-            client_id=API_KEY,
-            client_secret=API_SECRET,
-            redirect_uri=REDIRECT_URI
+            username=str(UPSTOX_MOBILE_NO),
+            pin_code=str(UPSTOX_PIN),
+            totp_secret=str(UPSTOX_TOTP_KEY),
+            client_id=str(API_KEY),
+            client_secret=str(API_SECRET),
+            redirect_uri=str(REDIRECT_URI)
         )
 
         response = upx.app_token.get_access_token()
@@ -99,7 +99,7 @@ def auto_refresh_upstox_token():
             logger.info("✅ Successfully Auto-Generated & Updated New Upstox Access Token!")
             return True
         else:
-            logger.error("❌ Auto Token Generation Failed. Response invalid. Retrying fallback token.")
+            logger.error("❌ Auto Token Generation Failed. Retrying fallback token.")
     except Exception as e:
         logger.error(f"❌ Exception occurred during Upstox Auto Token Refresh: {e}")
     
@@ -168,7 +168,8 @@ async def broadcast_tick(token: str, price: float):
 async def get_upstox_authorized_ws_url():
     try:
         api_instance = upstox_client.WebsocketApi(upstox_client.ApiClient(configuration))
-        api_response = api_instance.get_market_data_feed_authorize("2.0")
+        # Updated to "3.0" as required by latest Upstox API
+        api_response = api_instance.get_market_data_feed_authorize("3.0")
         if api_response and api_response.data:
             return api_response.data.authorized_redirect_uri
     except ApiException as e:
@@ -184,8 +185,6 @@ async def start_upstox_feed_stream():
             ws_url = await get_upstox_authorized_ws_url()
             if not ws_url:
                 logger.warning("⚠️ Retrying Upstox WS Auth URL in 5 seconds...")
-                # Attempt Token Refresh if connection repeatedly fails
-                auto_refresh_upstox_token()
                 await asyncio.sleep(5)
                 continue
 
@@ -202,7 +201,6 @@ async def start_upstox_feed_stream():
                     last_sub_set = set()
                     while ws.open:
                         current_subs = set(SUBSCRIBED_TOKENS)
-                        # Always include NIFTY and SENSEX
                         current_subs.add("NSE_INDEX|Nifty 50")
                         current_subs.add("BSE_INDEX|SENSEX")
 
@@ -224,7 +222,6 @@ async def start_upstox_feed_stream():
 
                 try:
                     async for message in ws:
-                        # Decode JSON / Protobuf Text from Upstox
                         try:
                             if isinstance(message, bytes):
                                 data = json.loads(message.decode('utf-8'))
@@ -243,7 +240,6 @@ async def start_upstox_feed_stream():
                                     await broadcast_tick(inst_key, ltp)
 
                         except Exception:
-                            # Direct binary / text fallback parsing
                             pass
 
                 except Exception as e:
@@ -297,8 +293,8 @@ async def disconnect(sid):
 async def fetch_chart_data(request: web.Request):
     try:
         d = await request.json()
-        instrument_key = str(d.get('token', '')).strip()  # e.g., NSE_EQ|INE009A01021
-        unit = str(d.get('interval', "1minute")).strip()  # day, 1minute, 3minute, etc.
+        instrument_key = str(d.get('token', '')).strip()
+        unit = str(d.get('interval', "1minute")).strip()
 
         if not instrument_key:
             return web.json_response({"status": False, "message": "Missing instrument_key"}, status=400)
@@ -308,7 +304,6 @@ async def fetch_chart_data(request: web.Request):
 
         history_api = upstox_client.HistoryApi(upstox_client.ApiClient(configuration))
         
-        # Upstox Historical Candle Call
         api_response = history_api.get_historical_candle_data1(
             instrument_key=instrument_key,
             interval=unit,
@@ -347,7 +342,7 @@ async def start_background_tasks(app):
     global main_loop
     main_loop = asyncio.get_event_loop()
     
-    # Trigger Initial Token Auto Refresh on Server Startup
+    # Attempt Initial Token Refresh
     auto_refresh_upstox_token()
     
     asyncio.create_task(start_upstox_feed_stream())
