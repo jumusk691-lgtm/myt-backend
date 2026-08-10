@@ -34,13 +34,10 @@ API_KEY = "eba0a80f-c907-42fa-a926-6672a120254d"
 API_SECRET = os.getenv("UPSTOX_API_SECRET", "cg0pdqyg8t")
 REDIRECT_URI = os.getenv("UPSTOX_REDIRECT_URI", "https://myt-backend-1.onrender.com")
 
-# 1-YEAR ANALYTICS ACCESS TOKEN (FIXED CASE)
-ANALYTICS_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI2MkFIN0siLCJqdGkiOiI2YTdhMTJlZjk1YjgyYzEzZjc5OTEyMmIiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlzRXh0ZW5kZWQiOnRydWUsImlhdCI6MTc4NjM4NTEzNSwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxODE3OTM1MjAwfQ.0z7HMMUZUwJ6mRkzY3EUE1bB36_i1c7M-6yiNc8clgs"
+# 1-YEAR ANALYTICS ACCESS TOKEN (UPDATED / FALLBACK)
+ANALYTICS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI6MjFIN0siLCJqdGkiOiI2YTdhMTJlZjk1YjgyYzEzZjc5OTEyMmIiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlzRXh0ZW5kZWQiOnRydWUsImlhdCI6MTc4NjM4NTEzNSwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxODE3OTM1MjAwfQ.0z7HMMUZUwJ6mRkzY3EUE1bB36_i1c7M-6yiNc8clgs").strip()
 
-# Set Access Token from Env or Default to Valid Analytics Token
-ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", ANALYTICS_TOKEN)
-if not ACCESS_TOKEN or ACCESS_TOKEN.startswith("E") or len(ACCESS_TOKEN) < 50:
-    ACCESS_TOKEN = ANALYTICS_TOKEN
+ACCESS_TOKEN = ANALYTICS_TOKEN
 
 # Configuration Setup
 configuration = upstox_client.Configuration()
@@ -169,8 +166,8 @@ async def start_upstox_feed_stream():
         try:
             ws_url = await get_upstox_authorized_ws_url()
             if not ws_url:
-                logger.warning("⚠️ Retrying Upstox WS Auth URL in 5 seconds...")
-                await asyncio.sleep(5)
+                logger.warning("⚠️ Retrying Upstox WS Auth URL in 10 seconds... Please check UPSTOX_ACCESS_TOKEN!")
+                await asyncio.sleep(10)
                 continue
 
             ssl_context = ssl.create_default_context()
@@ -202,7 +199,7 @@ async def start_upstox_feed_stream():
                             await ws.send(json.dumps(sub_payload).encode('utf-8'))
                             last_sub_set = current_subs
                             logger.info(f"📡 Subscribed Upstox Keys: {current_subs}")
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(2)
 
                 sub_task = asyncio.create_task(subscription_heartbeat())
 
@@ -210,7 +207,11 @@ async def start_upstox_feed_stream():
                     async for message in ws:
                         try:
                             if isinstance(message, bytes):
-                                data = json.loads(message.decode('utf-8'))
+                                try:
+                                    data = json.loads(message.decode('utf-8'))
+                                except Exception:
+                                    # Handle raw binary feed framing safely
+                                    continue
                             else:
                                 data = json.loads(message)
 
@@ -225,9 +226,8 @@ async def start_upstox_feed_stream():
                                 if ltp > 0:
                                     await broadcast_tick(inst_key, ltp)
 
-                        except Exception:
-                            # Fallback parsing for binary/text frames
-                            pass
+                        except Exception as parse_err:
+                            logger.debug(f"Parsing frame skipped: {parse_err}")
 
                 except Exception as e:
                     logger.error(f"❌ Stream Reader Error: {e}")
@@ -235,8 +235,8 @@ async def start_upstox_feed_stream():
                     sub_task.cancel()
 
         except Exception as e:
-            logger.error(f"❌ Upstox Connection Error: {e}. Reconnecting in 5s...")
-            await asyncio.sleep(5)
+            logger.error(f"❌ Upstox Connection Error: {e}. Reconnecting in 10s...")
+            await asyncio.sleep(10)
 
 # --- 🌐 SOCKET.IO HANDLERS ---
 @sio.event
