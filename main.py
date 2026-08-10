@@ -9,13 +9,11 @@ import socketio
 import ssl
 import websockets
 import aiohttp
-import pyotp
 from aiohttp import web
 
-# --- Upstox Official SDK & Auto-TOTP Library ---
+# --- Upstox Official SDK ---
 import upstox_client
 from upstox_client.rest import ApiException
-from upstox_totp import UpstoxTOTP
 
 # --- 🕒 TIMEZONE & LOGGING SETUP ---
 IST = pytz.timezone('Asia/Kolkata')
@@ -36,18 +34,13 @@ API_KEY = "eba0a80f-c907-42fa-a926-6672a120254d"
 API_SECRET = os.getenv("UPSTOX_API_SECRET", "cg0pdqyg8t")
 REDIRECT_URI = os.getenv("UPSTOX_REDIRECT_URI", "https://myt-backend-1.onrender.com")
 
-# 1-YEAR ANALYTICS ACCESS TOKEN (Fallback & Hardcoded Ensure)
+# 1-YEAR ANALYTICS ACCESS TOKEN (FIXED CASE)
 ANALYTICS_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI2MkFIN0siLCJqdGkiOiI2YTdhMTJlZjk1YjgyYzEzZjc5OTEyMmIiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlzRXh0ZW5kZWQiOnRydWUsImlhdCI6MTc4NjM4NTEzNSwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxODE3OTM1MjAwfQ.0z7HMMUZUwJ6mRkzY3EUE1bB36_i1c7M-6yiNc8clgs"
 
+# Set Access Token from Env or Default to Valid Analytics Token
 ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", ANALYTICS_TOKEN)
-# Ensure token is not empty or stale string
-if not ACCESS_TOKEN or len(ACCESS_TOKEN) < 50:
+if not ACCESS_TOKEN or ACCESS_TOKEN.startswith("E") or len(ACCESS_TOKEN) < 50:
     ACCESS_TOKEN = ANALYTICS_TOKEN
-
-# User Credentials for Automatic Login
-UPSTOX_MOBILE_NO = os.getenv("UPSTOX_MOBILE_NO", "7735493540")
-UPSTOX_PIN = os.getenv("UPSTOX_PIN", "865895")
-UPSTOX_TOTP_KEY = os.getenv("UPSTOX_TOTP_KEY", "WPCJRHDA3KLBTZJO4D7N2ONIE6TV6WWR")
 
 # Configuration Setup
 configuration = upstox_client.Configuration()
@@ -77,51 +70,6 @@ main_loop = None
 sio = socketio.AsyncServer(async_mode='aiohttp', cors_allowed_origins='*')
 app = web.Application()
 sio.attach(app)
-
-# --- 🎯 AUTO ACCESS TOKEN REFRESH ENGINE ---
-def auto_refresh_upstox_token():
-    global ACCESS_TOKEN, configuration
-    try:
-        if not UPSTOX_TOTP_KEY:
-            logger.warning("⚠️ UPSTOX_TOTP_KEY missing. Skipping Auto Token Generation.")
-            return False
-
-        logger.info("⏳ Attempting Automatic Token Refresh via TOTP Engine...")
-        
-        # Safe Try for UpstoxTOTP integration
-        try:
-            upx = UpstoxTOTP(
-                username=str(UPSTOX_MOBILE_NO),
-                pin_code=str(UPSTOX_PIN),
-                totp_secret=str(UPSTOX_TOTP_KEY),
-                client_id=str(API_KEY),
-                client_secret=str(API_SECRET),
-                redirect_uri=str(REDIRECT_URI)
-            )
-            response = upx.app_token.get_access_token()
-            if response and getattr(response, 'success', False) and response.data:
-                new_token = response.data.access_token
-                ACCESS_TOKEN = new_token
-                configuration.access_token = ACCESS_TOKEN
-                logger.info("✅ Successfully Auto-Generated & Updated New Upstox Access Token!")
-                return True
-        except Exception as inner_e:
-            logger.warning(f"⚠️ UpstoxTOTP direct call warning: {inner_e}")
-
-        # PyOTP Fallback Validation
-        totp = pyotp.TOTP(UPSTOX_TOTP_KEY)
-        generated_otp = totp.now()
-        logger.info(f"🔑 Live TOTP generated successfully: {generated_otp}")
-        
-        # Maintain existing valid analytics access token
-        ACCESS_TOKEN = ANALYTICS_TOKEN
-        configuration.access_token = ACCESS_TOKEN
-        return True
-
-    except Exception as e:
-        logger.error(f"❌ Exception occurred during Upstox Auto Token Refresh: {e}")
-    
-    return False
 
 # --- 🎯 SCORE LOGIC ---
 def update_user_score(points=1):
@@ -381,11 +329,8 @@ async def start_background_tasks(app):
     global main_loop
     main_loop = asyncio.get_event_loop()
     
-    # Attempt Initial Token Refresh
-    auto_refresh_upstox_token()
-    
     asyncio.create_task(start_upstox_feed_stream())
-    logger.info("✅ Upstox Backend Service Initialized.")
+    logger.info("✅ Upstox Backend Service Initialized with Analytics Token.")
 
 app.on_startup.append(start_background_tasks)
 
