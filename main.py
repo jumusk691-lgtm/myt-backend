@@ -177,6 +177,103 @@ def update_token_candles(token_str, price_val):
                 if len(tf_list) > MAX_CANDLES_LIMIT:
                     tf_list.pop(0)
 
+# --- 📡 SMART WEBSOCKET V2 HANDLERS ---
+def on_data(ws, message):
+    try:
+        if isinstance(message, dict) and "token" in message and "last_traded_price" in message:
+            token = str(message["token"])
+            # Angel One sends LTP multiplied by 100
+            ltp = float(message["last_traded_price"]) / 100.0 if message["last_traded_price"] > 10000 else float(message["last_traded_price"])
+            
+            LTP_CACHE[token] = ltp
+            update_token_candles(token, ltp)
+
+            # Broadcast to connected Android App clients via Socket.IO
+            if main_loop and main_loop.is_running():
+                tick_payload = {"token": token, "ltp": ltp}
+                asyncio.run_coroutine_threadsafe(sio.emit('tick_update', tick_payload), main_loop)
+    except Exception as e:
+        logger.error(f"❌ Error processing websocket tick: {e}")
+
+def on_open(ws):
+    global BROKER_SOCKET_CONNECTED
+    BROKER_SOCKET_CONNECTED = True
+    logger.info("⚡ SmartAPI WebSocket Connected Successfully!")
+    subscribe_registered_tokens()
+
+def on_error(ws, error):
+    global BROKER_SOCKET_CONNECTED
+    BROKER_SOCKET_CONNECTED = False
+    logger.error(f"❌ WebSocket Error: {error}")
+
+def on_close(ws, close_status_code, close_msg):
+    global BROKER_SOCKET_CONNECTED
+    BROKER_SOCKET_CONNECTED = False
+    logger.warning(f"⚠️ WebSocket Connection Closed: {close_status_code} - {close_msg}")
+
+def start_broker_websocket():
+    global sws_client
+    if not ensure_smart_api_session():
+        return
+
+    try:
+        sws_client = SmartWebSocketV2(BROKER_JWT_TOKEN, API_KEY, CLIENT_CODE, BROKER_FEED_TOKEN)
+        sws_client.on_data = on_data
+        sws_client.on_open = on_open
+        sws_client.on_error = on_error
+        sws_client.on_close = on_close
+
+        # Run socket in background thread
+        w_thread = threading.Thread(target=sws_client.connect, daemon=True)
+        w_thread.start()
+    except Exception as e:
+        logger.error(f"❌ Failed to start SmartWebSocketV2: {e}")
+
+def subscribe_registered_tokens():
+    if not sws_client or not BROKER_SOCKET_CONNECTED:
+        return
+
+    for exch_num, tokens in SUBSCRIBED_TOKENS_REGISTRY.items():
+        if tokens:
+            token_list = list(tokens)
+            # Action: 1 = Subscribe, Mode: 1 = LTP
+            token_payload = [{"exchangeType": exch_num, "tokens": token_list}]
+            try:
+                sws_client.subscribe("smartapi_ltp", 1, token_payload)
+                logger.info(f"📡 Subscribed {len(token_list)} tokens on Exchange {exch_num}")
+            except Exception as e:
+                logger.error(f"❌ Subscription failed for Exch {exch_num}: {e}")
+
+# --- 🌐 SOCKET.IO CLIENT EVENTS ---
+@sio.event
+async def connect(sid, environ):
+    logger.info(f"📱 Android Client Connected: {sid}")
+    # Send cached LTPs immediately on connect
+    if LTP_CACHE:
+        await sio.emit('initial_ltps', LTP_CACHE, room=sid)
+
+@sio.event
+async def subscribe_tokens(sid, data):
+    """
+    Data format expected from Android app:
+    {"tokens": [{"token": "288509", "exch": "NSE"}, ...]}
+    """
+    try:
+        tokens_input = data.get("tokens", [])
+        for item in tokens_input:
+            token = str(item.get("token")).strip()
+            exch_num = get_exchange_code_num(item.get("exch", "NSE"))
+            if token:
+                SUBSCRIBED_TOKENS_REGISTRY[exch_num].add(token)
+
+        subscribe_registered_tokens()
+    except Exception as e:
+        logger.error(f"❌ Error in subscribe_tokens event: {e}")
+
+@sio.event
+async def disconnect(sid):
+    logger.info(f"📱 Android Client Disconnected: {sid}")
+
 # --- 🚀 API ROUTE: GET HISTORICAL CHART DATA ---
 async def handle_get_chart_data(request):
     try:
@@ -221,7 +318,6 @@ async def handle_get_chart_data(request):
         if response and response.get("status") and response.get("data"):
             raw_candles = response["data"]
             
-            # Format: [["2026-08-10T09:15:00+05:30", open, high, low, close, volume], ...]
             formatted_candles = []
             for candle in raw_candles:
                 formatted_candles.append({
@@ -251,6 +347,14 @@ async def handle_get_chart_data(request):
 
 # Attach Routes
 app.router.add_post('/api/get_chart_data', handle_get_chart_data)
+
+# Background Task for SmartWebSocket Start
+async def start_background_tasks(app_instance):
+    global main_loop
+    main_loop = asyncio.get_event_loop()
+    threading.Thread(target=start_broker_websocket, daemon=True).start()
+
+app.on_startup.append(start_background_tasks)
 
 # App startup logic
 if __name__ == '__main__':
