@@ -8,6 +8,7 @@ import pytz
 import socketio
 import ssl
 import websockets
+import aiohttp
 from aiohttp import web
 
 # --- Upstox Official SDK & Auto-TOTP Library ---
@@ -167,15 +168,28 @@ async def broadcast_tick(token: str, price: float):
 # --- 🌐 UPSTOX LIVE WEBSOCKET STREAMING ENGINE ---
 async def get_upstox_authorized_ws_url():
     try:
-        api_instance = upstox_client.WebsocketApi(upstox_client.ApiClient(configuration))
-        # Updated to "3.0" as required by latest Upstox API
-        api_response = api_instance.get_market_data_feed_authorize("3.0")
-        if api_response and api_response.data:
-            return api_response.data.authorized_redirect_uri
-    except ApiException as e:
-        logger.error(f"❌ Upstox WS Auth API Exception (Status {e.status}): {e.body}")
+        # Upstox V3 Market Data Feed Authorized Endpoint
+        headers = {
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {ACCESS_TOKEN}'
+        }
+        
+        # Explicit V3 Endpoint URL to override old V2 SDK behavior
+        url = "https://api.upstox.com/v3/feed/market-data-feed/authorize"
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status == 200:
+                    res_data = await resp.json()
+                    if res_data.get("status") == "success":
+                        authorized_url = res_data["data"]["authorizedRedirectUri"]
+                        logger.info("✅ Successfully retrieved Upstox V3 Authorized Websocket URL!")
+                        return authorized_url
+                else:
+                    err_text = await resp.text()
+                    logger.error(f"❌ Upstox V3 WS Auth Failed Status {resp.status}: {err_text}")
     except Exception as e:
-        logger.error(f"❌ Upstox WS Auth URL Error: {e}")
+        logger.error(f"❌ Exception in V3 WS Auth URL Fetch: {e}")
     return None
 
 async def start_upstox_feed_stream():
@@ -209,7 +223,7 @@ async def start_upstox_feed_stream():
                                 "guid": "upstox_live_sub",
                                 "method": "sub",
                                 "data": {
-                                    "mode": "ltpc",
+                                    "mode": "full",
                                     "instrumentKeys": list(current_subs)
                                 }
                             }
