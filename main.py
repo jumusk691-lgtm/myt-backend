@@ -225,7 +225,7 @@ async def start_upstox_feed_stream():
                                 if ltp > 0:
                                     await broadcast_tick(inst_key, ltp)
 
-                        except Exception:
+                        except Exception as e:
                             pass
 
                 except Exception as e:
@@ -275,7 +275,14 @@ async def subscribe_request(sid, data):
 async def disconnect(sid):
     logger.info(f"📱 Android Client Disconnected: {sid}")
 
-# --- 🌐 REST HTTP API ENDPOINTS (UPSTOX HISTORICAL DATA) ---
+# --- 🌐 REST HTTP API ENDPOINTS (UPSTOX HISTORICAL DATA & HEALTH CHECK) ---
+async def home_route(request: web.Request):
+    return web.json_response({
+        "status": True,
+        "message": "MUNH Titan Upstox Backend Service is Live & Running!",
+        "version": "1.0.0"
+    })
+
 async def fetch_chart_data(request: web.Request):
     try:
         d = await request.json()
@@ -321,6 +328,7 @@ async def fetch_chart_data(request: web.Request):
         logger.error(f"Exception in fetch_chart_data: {e}")
         return web.json_response({"status": False, "message": str(e), "data": []}, status=500)
 
+app.router.add_get('/', home_route)
 app.router.add_post('/api/get_chart_data', fetch_chart_data)
 
 # --- 🔄 BACKGROUND TASKS ---
