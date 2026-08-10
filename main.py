@@ -6,6 +6,8 @@ import datetime
 import threading
 import pytz
 import socketio
+import ssl
+import websockets
 from aiohttp import web
 
 # --- Upstox Official SDK ---
@@ -118,6 +120,93 @@ async def broadcast_tick(token: str, price: float):
     }
     await sio.emit("live_data", payload)
 
+# --- 🌐 UPSTOX LIVE WEBSOCKET STREAMING ENGINE ---
+async def get_upstox_authorized_ws_url():
+    try:
+        api_instance = upstox_client.WebsocketApi(upstox_client.ApiClient(configuration))
+        api_response = api_instance.get_market_data_feed_authorize("2.0")
+        if api_response and api_response.data:
+            return api_response.data.authorized_redirect_uri
+    except Exception as e:
+        logger.error(f"❌ Upstox WS Auth URL Error: {e}")
+    return None
+
+async def start_upstox_feed_stream():
+    await asyncio.sleep(2)
+    while True:
+        try:
+            ws_url = await get_upstox_authorized_ws_url()
+            if not ws_url:
+                logger.warning("⚠️ Retrying Upstox WS Auth URL in 5 seconds...")
+                await asyncio.sleep(5)
+                continue
+
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+
+            logger.info("🔌 Connecting to Upstox Market Data Feed...")
+            async with websockets.connect(ws_url, ssl=ssl_context) as ws:
+                logger.info("⚡ Upstox Feed Connected Successfully!")
+                
+                # Active Subscription Loop
+                async def subscription_heartbeat():
+                    last_sub_set = set()
+                    while ws.open:
+                        current_subs = set(SUBSCRIBED_TOKENS)
+                        # Always include NIFTY and SENSEX
+                        current_subs.add("NSE_INDEX|Nifty 50")
+                        current_subs.add("BSE_INDEX|SENSEX")
+
+                        if current_subs != last_sub_set:
+                            sub_payload = {
+                                "guid": "upstox_live_sub",
+                                "method": "sub",
+                                "data": {
+                                    "mode": "ltpc",
+                                    "instrumentKeys": list(current_subs)
+                                }
+                            }
+                            await ws.send(json.dumps(sub_payload).encode('utf-8'))
+                            last_sub_set = current_subs
+                            logger.info(f"📡 Subscribed Upstox Keys: {current_subs}")
+                        await asyncio.sleep(1)
+
+                sub_task = asyncio.create_task(subscription_heartbeat())
+
+                try:
+                    async for message in ws:
+                        # Decode JSON / Protobuf Text from Upstox
+                        try:
+                            if isinstance(message, bytes):
+                                data = json.loads(message.decode('utf-8'))
+                            else:
+                                data = json.loads(message)
+
+                            feeds = data.get("feeds", {})
+                            for inst_key, feed_info in feeds.items():
+                                ltp = 0.0
+                                if "ltpc" in feed_info and "ltp" in feed_info["ltpc"]:
+                                    ltp = float(feed_info["ltpc"]["ltp"])
+                                elif "ff" in feed_info and "marketFF" in feed_info["ff"]:
+                                    ltp = float(feed_info["ff"]["marketFF"]["ltpc"]["ltp"])
+                                
+                                if ltp > 0:
+                                    await broadcast_tick(inst_key, ltp)
+
+                        except Exception:
+                            # Direct binary / text fallback parsing
+                            pass
+
+                except Exception as e:
+                    logger.error(f"❌ Stream Reader Error: {e}")
+                finally:
+                    sub_task.cancel()
+
+        except Exception as e:
+            logger.error(f"❌ Upstox Connection Error: {e}. Reconnecting in 5s...")
+            await asyncio.sleep(5)
+
 # --- 🌐 SOCKET.IO HANDLERS ---
 @sio.event
 async def connect(sid, environ):
@@ -209,6 +298,7 @@ app.router.add_post('/api/get_chart_data', fetch_chart_data)
 async def start_background_tasks(app):
     global main_loop
     main_loop = asyncio.get_event_loop()
+    asyncio.create_task(start_upstox_feed_stream())
     logger.info("✅ Upstox Backend Service Initialized.")
 
 app.on_startup.append(start_background_tasks)
