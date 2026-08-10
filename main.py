@@ -5,6 +5,7 @@ import time
 import datetime
 import os
 import pytz
+import urllib.parse
 import socketio
 import aiohttp
 from aiohttp import web
@@ -91,23 +92,31 @@ async def start_upstox_ltp_poller():
                 if not current_subs:
                     current_subs = ["NSE_INDEX|Nifty 50", "BSE_INDEX|SENSEX"]
 
-                # Convert pipe format to colon format for Upstox HTTP API standards
-                formatted_keys = [k.replace("|", ":") for k in current_subs]
-                keys_param = ",".join(formatted_keys)
-                url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={keys_param}"
+                # Clean and convert keys to Upstox API format
+                valid_formatted_keys = []
+                for k in current_subs:
+                    clean_k = str(k).strip().replace("|", ":")
+                    # Ignore invalid or empty tokens
+                    if clean_k and clean_k.upper() not in ("NONE", "NULL", "0"):
+                        valid_formatted_keys.append(clean_k)
 
-                async with session.get(url, headers=headers) as resp:
-                    if resp.status == 200:
-                        res_data = await resp.json()
-                        if res_data.get("status") == "success" and "data" in res_data:
-                            data_map = res_data["data"]
-                            for key_alias, detail in data_map.items():
-                                last_price = float(detail.get("last_price", 0.0))
-                                if last_price > 0:
-                                    await broadcast_tick(key_alias, last_price)
-                    else:
-                        err_txt = await resp.text()
-                        logger.error(f"❌ Upstox Quote API HTTP {resp.status}: {err_txt}")
+                if valid_formatted_keys:
+                    # URLencode key params (resolves HTTP 400 UDAPI1087 errors)
+                    keys_param = ",".join([urllib.parse.quote(k) for k in valid_formatted_keys])
+                    url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={keys_param}"
+
+                    async with session.get(url, headers=headers) as resp:
+                        if resp.status == 200:
+                            res_data = await resp.json()
+                            if res_data.get("status") == "success" and "data" in res_data:
+                                data_map = res_data["data"]
+                                for key_alias, detail in data_map.items():
+                                    last_price = float(detail.get("last_price", 0.0))
+                                    if last_price > 0:
+                                        await broadcast_tick(key_alias, last_price)
+                        else:
+                            err_txt = await resp.text()
+                            logger.error(f"❌ Upstox Quote API HTTP {resp.status}: {err_txt}")
 
             except Exception as e:
                 logger.error(f"❌ Error in Upstox Poller: {e}")
@@ -133,7 +142,7 @@ async def handle_subscription(sid, data):
             else:
                 token = str(item).strip()
                 
-            if token:
+            if token and token.upper() not in ("NONE", "NULL", "0"):
                 SUBSCRIBED_TOKENS.add(token)
                 
         logger.info(f"Subscribed Upstox Keys: {SUBSCRIBED_TOKENS}")
