@@ -38,24 +38,17 @@ TOTP_STR = "XFTXZ2445N4V2UMB7EWUCBDRMU"
 
 # --- 🚀 GLOBAL STATES & SCORE TRACKING ---
 LTP_CACHE = {}               
-SUBSCRIBED_TOKENS_REGISTRY = {1: set(), 2: set(), 3: set(), 4: set(), 5: set()}
+SUBSCRIBED_TOKENS_REGISTRY = {1: set(), 2: set(), 3: set(), 4: set(), 5: set(), 13: set()}
 BROKER_SOCKET_CONNECTED = False
 USER_SCORE = 0 
-IS_RECONNECTING = False  # Guard against thread spams and rate limits
 
-# --- 📊 CANDLE ENGINE CONFIGURATION (200 CANDLES MAX) ---
+# --- 📊 CANDLE ENGINE CONFIGURATION ---
 TIMEFRAMES = {
-    "1M": 60,
-    "3M": 180,
-    "5M": 300,
-    "15M": 900,
-    "25M": 1500,
-    "30M": 1800,
-    "1H": 3600,
-    "1D": 86400
+    "1M": 60, "3M": 180, "5M": 300, "15M": 900,
+    "25M": 1500, "30M": 1800, "1H": 3600, "1D": 86400
 }
 MAX_CANDLES_LIMIT = 200
-CANDLE_CACHE = {}  # Format: { token_str: { tf_key: [ {time, open, high, low, close}, ... ] } }
+CANDLE_CACHE = {}
 
 BROKER_JWT_TOKEN = None
 BROKER_FEED_TOKEN = None
@@ -69,32 +62,33 @@ sio = socketio.AsyncServer(async_mode='aiohttp', cors_allowed_origins='*')
 app = web.Application()
 sio.attach(app)
 
-# --- 🔄 EXCHANGE CODE NORMALIZER ---
+# --- 🔄 EXACT EXCHANGE CODE MAPPING ---
 def normalize_exchange(exch):
-    """
-    Returns string exchange format required by Angel One API
-    """
     ex_str = str(exch).upper().strip()
-    if ex_str in ["5", "MCX", "MCX_FO", "MCXFO"]:
+    if "MCX" in ex_str:
         return "MCX"
-    elif ex_str in ["2", "NFO", "NSE_FO"]:
+    elif "NFO" in ex_str or "NSE_FO" in ex_str:
         return "NFO"
-    elif ex_str in ["3", "BSE", "BSE_CM", "BFO"]:
+    elif "BFO" in ex_str or "BSE_FO" in ex_str:
         return "BFO"
-    elif ex_str in ["4", "CDS", "CNO"]:
+    elif "CDS" in ex_str or "CNO" in ex_str:
         return "CDS"
+    elif "BSE" in ex_str:
+        return "BSE"
     return "NSE"
 
 def get_exchange_code_num(exch):
     ex_str = str(exch).upper().strip()
-    if ex_str in ["5", "MCX", "MCX_FO", "MCXFO"]:
+    if "MCX" in ex_str:
         return 5
-    elif ex_str in ["2", "NFO", "NSE_FO"]:
+    elif "NFO" in ex_str or "NSE_FO" in ex_str:
         return 2
-    elif ex_str in ["3", "BSE", "BSE_CM", "BFO"]:
-        return 3
-    elif ex_str in ["4", "CDS", "CNO"]:
+    elif "BFO" in ex_str or "BSE_FO" in ex_str:
         return 4
+    elif "CDS" in ex_str or "CNO" in ex_str:
+        return 13
+    elif "BSE" in ex_str:
+        return 3
     return 1
 
 # --- 🎯 SCORE LOGIC ---
@@ -105,13 +99,13 @@ def update_user_score(points=1):
     logger.info(f"📊 Current User Score: {USER_SCORE}")
     return USER_SCORE
 
-# --- 🔐 SMART API LOGIN & RECONNECT SYSTEM ---
+# --- 🔐 SMART API LOGIN SYSTEM ---
 def ensure_smart_api_session():
     global BROKER_JWT_TOKEN, BROKER_FEED_TOKEN, LAST_BROKER_LOGIN_TIME
     now = time.time()
     
-    # Re-login every 6 hours if session expires
-    if state.smart_api and (now - LAST_BROKER_LOGIN_TIME < 21600):
+    # 6 घंटे तक Session एक्टिव रहेगा
+    if state.smart_api and BROKER_JWT_TOKEN and (now - LAST_BROKER_LOGIN_TIME < 21600):
         return True
 
     try:
@@ -123,6 +117,10 @@ def ensure_smart_api_session():
         if data and data.get('status'):
             BROKER_JWT_TOKEN = data['data']['jwtToken']
             BROKER_FEED_TOKEN = state.smart_api.getfeedToken()
+            
+            # SmartConnect Instance में Token सेट करें
+            state.smart_api.setAccessToken(BROKER_JWT_TOKEN)
+            
             LAST_BROKER_LOGIN_TIME = now
             logger.info("✅ SmartAPI Login Successful!")
             return True
@@ -133,7 +131,7 @@ def ensure_smart_api_session():
         logger.error(f"❌ Exception in SmartAPI Login: {e}")
         return False
 
-# --- 📈 LIVE TICK CANDLE AGGREGATOR (REALTIME ONLY) ---
+# --- 📈 LIVE TICK CANDLE AGGREGATOR ---
 def update_token_candles(token_str, price_val):
     if price_val <= 0:
         return
@@ -154,11 +152,8 @@ def update_token_candles(token_str, price_val):
 
         if not tf_list:
             tf_list.append({
-                "time": bucket_time,
-                "open": price_val,
-                "high": price_val,
-                "low": price_val,
-                "close": price_val
+                "time": bucket_time, "open": price_val,
+                "high": price_val, "low": price_val, "close": price_val
             })
         else:
             last_candle = tf_list[-1]
@@ -168,27 +163,26 @@ def update_token_candles(token_str, price_val):
                 last_candle["close"] = price_val
             elif bucket_time > last_candle["time"]:
                 tf_list.append({
-                    "time": bucket_time,
-                    "open": price_val,
-                    "high": price_val,
-                    "low": price_val,
-                    "close": price_val
+                    "time": bucket_time, "open": price_val,
+                    "high": price_val, "low": price_val, "close": price_val
                 })
                 if len(tf_list) > MAX_CANDLES_LIMIT:
                     tf_list.pop(0)
 
-# --- 📡 SMART WEBSOCKET V2 HANDLERS ---
+# --- 📡 SMART WEBSOCKET V2 HANDLERS (ISOLATED LIVE ENGINE) ---
 def on_data(ws, message):
     try:
         if isinstance(message, dict) and "token" in message and "last_traded_price" in message:
             token = str(message["token"])
-            # Angel One sends LTP multiplied by 100
-            ltp = float(message["last_traded_price"]) / 100.0 if message["last_traded_price"] > 10000 else float(message["last_traded_price"])
+            raw_ltp = float(message["last_traded_price"])
+            
+            # Angel One Paisa -> Rupee Conversion
+            ltp = raw_ltp / 100.0 if raw_ltp > 10000 else raw_ltp
             
             LTP_CACHE[token] = ltp
             update_token_candles(token, ltp)
 
-            # Broadcast to connected Android App clients via Socket.IO
+            # Android App को बिना रुके Ticks भेजें
             if main_loop and main_loop.is_running():
                 tick_payload = {"token": token, "ltp": ltp}
                 asyncio.run_coroutine_threadsafe(sio.emit('tick_update', tick_payload), main_loop)
@@ -198,7 +192,7 @@ def on_data(ws, message):
 def on_open(ws):
     global BROKER_SOCKET_CONNECTED
     BROKER_SOCKET_CONNECTED = True
-    logger.info("⚡ SmartAPI WebSocket Connected Successfully!")
+    logger.info("⚡ Live WebSocket Connected & Running!")
     subscribe_registered_tokens()
 
 def on_error(ws, error):
@@ -209,11 +203,12 @@ def on_error(ws, error):
 def on_close(ws, close_status_code, close_msg):
     global BROKER_SOCKET_CONNECTED
     BROKER_SOCKET_CONNECTED = False
-    logger.warning(f"⚠️ WebSocket Connection Closed: {close_status_code} - {close_msg}")
+    logger.warning(f"⚠️ WebSocket Closed: {close_status_code} - {close_msg}")
 
 def start_broker_websocket():
     global sws_client
     if not ensure_smart_api_session():
+        logger.error("❌ Cannot start WebSocket - Session Init Failed")
         return
 
     try:
@@ -223,7 +218,6 @@ def start_broker_websocket():
         sws_client.on_error = on_error
         sws_client.on_close = on_close
 
-        # Run socket in background thread
         w_thread = threading.Thread(target=sws_client.connect, daemon=True)
         w_thread.start()
     except Exception as e:
@@ -236,11 +230,10 @@ def subscribe_registered_tokens():
     for exch_num, tokens in SUBSCRIBED_TOKENS_REGISTRY.items():
         if tokens:
             token_list = list(tokens)
-            # Action: 1 = Subscribe, Mode: 1 = LTP
             token_payload = [{"exchangeType": exch_num, "tokens": token_list}]
             try:
                 sws_client.subscribe("smartapi_ltp", 1, token_payload)
-                logger.info(f"📡 Subscribed {len(token_list)} tokens on Exchange {exch_num}")
+                logger.info(f"📡 Subscribed {len(token_list)} tokens on ExchCode {exch_num}")
             except Exception as e:
                 logger.error(f"❌ Subscription failed for Exch {exch_num}: {e}")
 
@@ -248,21 +241,17 @@ def subscribe_registered_tokens():
 @sio.event
 async def connect(sid, environ):
     logger.info(f"📱 Android Client Connected: {sid}")
-    # Send cached LTPs immediately on connect
     if LTP_CACHE:
         await sio.emit('initial_ltps', LTP_CACHE, room=sid)
 
 @sio.event
 async def subscribe_tokens(sid, data):
-    """
-    Data format expected from Android app:
-    {"tokens": [{"token": "288509", "exch": "NSE"}, ...]}
-    """
     try:
         tokens_input = data.get("tokens", [])
         for item in tokens_input:
             token = str(item.get("token")).strip()
-            exch_num = get_exchange_code_num(item.get("exch", "NSE"))
+            exch_raw = item.get("exch", "NSE")
+            exch_num = get_exchange_code_num(exch_raw)
             if token:
                 SUBSCRIBED_TOKENS_REGISTRY[exch_num].add(token)
 
@@ -274,12 +263,14 @@ async def subscribe_tokens(sid, data):
 async def disconnect(sid):
     logger.info(f"📱 Android Client Disconnected: {sid}")
 
-# --- 🚀 API ROUTE: GET HISTORICAL CHART DATA ---
+# --- 🚀 API ROUTE: GET HISTORICAL CHART DATA (SAFELY ISOLATED) ---
 async def handle_get_chart_data(request):
+    """
+    यह API अगर फेल भी होती है, तो लाइव LTP WebSocket पर zero effect पड़ेगा।
+    """
     try:
         req_data = await request.json()
         token = str(req_data.get("token", "")).strip()
-        symbol = str(req_data.get("symbol", "")).strip()
         exch_raw = str(req_data.get("exch", "NSE")).strip()
         interval = str(req_data.get("interval", "FIVE_MINUTE")).strip()
         from_date = req_data.get("fromdate")
@@ -290,18 +281,16 @@ async def handle_get_chart_data(request):
 
         exchange_str = normalize_exchange(exch_raw)
 
-        # Fallback date generation if not sent by Android app
         now = datetime.datetime.now(IST)
         if not to_date:
             to_date = now.strftime("%Y-%m-%d %H:%M")
         if not from_date:
             from_date = (now - datetime.timedelta(days=5)).strftime("%Y-%m-%d %H:%M")
 
-        # Ensure active API session
-        if not ensure_smart_api_session():
-            return web.json_response({"status": False, "message": "SmartAPI authentication failed"}, status=500)
+        # अगर लॉगिन फेल होता है, तो सिर्फ Historical Call रिजेक्ट होगी
+        if not state.smart_api or not BROKER_JWT_TOKEN:
+            ensure_smart_api_session()
 
-        # SmartAPI Parameter Mapping
         historic_param = {
             "exchange": exchange_str,
             "symboltoken": token,
@@ -310,39 +299,37 @@ async def handle_get_chart_data(request):
             "todate": to_date
         }
 
-        logger.info(f"📊 Fetching Candle Data with params: {historic_param}")
+        logger.info(f"📊 Fetching Candle Data: {historic_param}")
         
-        # Execute Angel One Historical Data Call
-        response = state.smart_api.getCandleData(historic_param)
+        # Safe execution using try block
+        try:
+            response = state.smart_api.getCandleData(historic_param)
+            if response and response.get("status") and response.get("data"):
+                formatted_candles = [
+                    {
+                        "time": candle[0],
+                        "open": float(candle[1]),
+                        "high": float(candle[2]),
+                        "low": float(candle[3]),
+                        "close": float(candle[4])
+                    }
+                    for candle in response["data"]
+                ]
 
-        if response and response.get("status") and response.get("data"):
-            raw_candles = response["data"]
-            
-            formatted_candles = []
-            for candle in raw_candles:
-                formatted_candles.append({
-                    "time": candle[0],
-                    "open": float(candle[1]),
-                    "high": float(candle[2]),
-                    "low": float(candle[3]),
-                    "close": float(candle[4])
+                return web.json_response({
+                    "status": True,
+                    "message": "SUCCESS",
+                    "data": formatted_candles
                 })
-
-            return web.json_response({
-                "status": True,
-                "message": "SUCCESS",
-                "data": formatted_candles
-            })
-        else:
-            logger.error(f"❌ SmartAPI Historical Error Response: {response}")
-            return web.json_response({
-                "status": False,
-                "message": response.get("message", "Failed to fetch historical data"),
-                "data": []
-            })
+            else:
+                logger.warning(f"⚠️ Historical Data Error (Ignored for Live LTP): {response}")
+                return web.json_response({"status": False, "message": "Historical data unavailable", "data": []})
+        except Exception as api_err:
+            logger.error(f"❌ SmartAPI Historical Call Internal Error: {api_err}")
+            return web.json_response({"status": False, "message": "Historical API exception", "data": []})
 
     except Exception as e:
-        logger.error(f"❌ Exception in handle_get_chart_data: {e}", exc_info=True)
+        logger.error(f"❌ Exception in handle_get_chart_data: {e}")
         return web.json_response({"status": False, "message": str(e), "data": []}, status=500)
 
 # Attach Routes
