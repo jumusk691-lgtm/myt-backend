@@ -1,4 +1,4 @@
-upstox-python
+upstox-python-sdk
 smartapi-python
 python-socketio>=5.11.0
 python-engineio>=4.8.0
