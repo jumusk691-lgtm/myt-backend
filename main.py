@@ -5,7 +5,6 @@ import time
 import datetime
 import os
 import pytz
-import urllib.parse
 import socketio
 import aiohttp
 from aiohttp import web
@@ -33,7 +32,7 @@ API_KEY = "eba0a80f-c907-42fa-a926-6672a120254d"
 API_SECRET = os.getenv("UPSTOX_API_SECRET", "cg0pdqyg8t")
 
 # 1-YEAR ANALYTICS ACCESS TOKEN
-NEW_ANALYTICS_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI2MkFIN0siLCJqdGkiOiI2YTdhMTJlZjk1YjgyYzEzZjc5OWEyMmIiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlzRXh0ZW5kZWQiOnRydWUsImlhdCI6MTc4NjM4NTEzNSwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxODE3OTM1MjAwfQ.0z7HMMUZUwJ6mRkzY3EUE1bB36_i1c7M-6yiNc8clgs"
+NEW_ANALYTICS_TOKEN = "EyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI2MkFIN0siLCJqdGkiOiI2YTdhMTJlZjk1YjgyYzEzZjc5OWEyMmIiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlzRXh0ZW5kZWQiOnRydWUsImlhdCI6MTc4NjM4NTEzNSwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxODE3OTM1MjAwfQ.0z7HMMUZUwJ6mRkzY3EUE1bB36_i1c7M-6yiNc8clgs"
 
 ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", NEW_ANALYTICS_TOKEN).strip()
 
@@ -52,30 +51,21 @@ sio.attach(app)
 # Helper function to broadcast live price tick to clients
 async def broadcast_tick(token: str, price: float):
     price_str = f"{price:.2f}"
-    
-    # Store both formats (: and |) in cache for reliable lookups
-    pipe_key = token.replace(":", "|")
-    colon_key = token.replace("|", ":")
-    
     LTP_CACHE[token] = price_str
-    LTP_CACHE[pipe_key] = price_str
-    LTP_CACHE[colon_key] = price_str
     
-    # Send both instrument_key formats to prevent mismatch on Android UI
     payload = {
-        "instrument_key": pipe_key,
-        "token": pipe_key,
+        "instrument_key": token,
         "ltp": price_str
     }
     await sio.emit("live_data", payload)
 
     # Standardize Index aliases for Android Client mapping
-    if pipe_key in ("NSE_INDEX|Nifty 50", "NSE_INDEX:Nifty 50"):
+    if token == "NSE_INDEX|Nifty 50":
         LTP_CACHE["NIFTY"] = price_str
-        await sio.emit("live_data", {"instrument_key": "NIFTY", "token": "NIFTY", "ltp": price_str})
-    elif pipe_key in ("BSE_INDEX|SENSEX", "BSE_INDEX:SENSEX"):
+        await sio.emit("live_data", {"instrument_key": "NIFTY", "ltp": price_str})
+    elif token == "BSE_INDEX|SENSEX":
         LTP_CACHE["SENSEX"] = price_str
-        await sio.emit("live_data", {"instrument_key": "SENSEX", "token": "SENSEX", "ltp": price_str})
+        await sio.emit("live_data", {"instrument_key": "SENSEX", "ltp": price_str})
 
 # --- 🔄 FAST LTP POLLING ENGINE (Reliable & Bypass Protobuf Parsing) ---
 async def start_upstox_ltp_poller():
@@ -92,31 +82,27 @@ async def start_upstox_ltp_poller():
                 if not current_subs:
                     current_subs = ["NSE_INDEX|Nifty 50", "BSE_INDEX|SENSEX"]
 
-                # Clean and convert keys to Upstox API format
-                valid_formatted_keys = []
-                for k in current_subs:
-                    clean_k = str(k).strip().replace("|", ":")
-                    # Ignore invalid or empty tokens
-                    if clean_k and clean_k.upper() not in ("NONE", "NULL", "0"):
-                        valid_formatted_keys.append(clean_k)
+                # Upstox LTP endpoint supports comma separated keys
+                keys_param = ",".join(current_subs)
+                url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={keys_param}"
 
-                if valid_formatted_keys:
-                    # URLencode key params (resolves HTTP 400 UDAPI1087 errors)
-                    keys_param = ",".join([urllib.parse.quote(k) for k in valid_formatted_keys])
-                    url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={keys_param}"
-
-                    async with session.get(url, headers=headers) as resp:
-                        if resp.status == 200:
-                            res_data = await resp.json()
-                            if res_data.get("status") == "success" and "data" in res_data:
-                                data_map = res_data["data"]
-                                for key_alias, detail in data_map.items():
-                                    last_price = float(detail.get("last_price", 0.0))
-                                    if last_price > 0:
-                                        await broadcast_tick(key_alias, last_price)
-                        else:
-                            err_txt = await resp.text()
-                            logger.error(f"❌ Upstox Quote API HTTP {resp.status}: {err_txt}")
+                async with session.get(url, headers=headers) as resp:
+                    if resp.status == 200:
+                        res_data = await resp.json()
+                        if res_data.get("status") == "success" and "data" in res_data:
+                            data_map = res_data["data"]
+                            for key_alias, detail in data_map.items():
+                                inst_key = detail.get("instrument_token") or key_alias.replace(":", "|")
+                                last_price = float(detail.get("last_price", 0.0))
+                                if last_price > 0:
+                                    await broadcast_tick(inst_key, last_price)
+                                    # Handle colon to pipe mismatch format from Upstox API
+                                    if ":" in key_alias:
+                                        pipe_key = key_alias.replace(":", "|")
+                                        await broadcast_tick(pipe_key, last_price)
+                    else:
+                        err_txt = await resp.text()
+                        logger.error(f"❌ Upstox Quote API HTTP {resp.status}: {err_txt}")
 
             except Exception as e:
                 logger.error(f"❌ Error in Upstox Poller: {e}")
@@ -142,7 +128,7 @@ async def handle_subscription(sid, data):
             else:
                 token = str(item).strip()
                 
-            if token and token.upper() not in ("NONE", "NULL", "0"):
+            if token:
                 SUBSCRIBED_TOKENS.add(token)
                 
         logger.info(f"Subscribed Upstox Keys: {SUBSCRIBED_TOKENS}")
@@ -172,14 +158,11 @@ async def home_route(request: web.Request):
 async def fetch_chart_data(request: web.Request):
     try:
         d = await request.json()
-        instrument_key = str(d.get('token', '') or d.get('instrument_key', '')).strip()
+        instrument_key = str(d.get('token', '')).strip()
         unit = str(d.get('interval', "1minute")).strip()
 
         if not instrument_key:
             return web.json_response({"status": False, "message": "Missing instrument_key"}, status=400)
-
-        # Ensure correct delimiter format for Upstox History API
-        formatted_key = instrument_key.replace("|", ":")
 
         to_date = datetime.datetime.now(IST).strftime("%Y-%m-%d")
         from_date = (datetime.datetime.now(IST) - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
@@ -187,7 +170,7 @@ async def fetch_chart_data(request: web.Request):
         history_api = upstox_client.HistoryApi(upstox_client.ApiClient(configuration))
         
         api_response = history_api.get_historical_candle_data1(
-            instrument_key=formatted_key,
+            instrument_key=instrument_key,
             interval=unit,
             to_date=to_date,
             from_date=from_date,
