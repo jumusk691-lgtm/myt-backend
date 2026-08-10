@@ -3,35 +3,36 @@ import tempfile
 import requests
 import os
 import gc
-import pyotp  # TOTP के लिए
+import csv
+import gzip
+import io
 from supabase import create_client
 
 # ==============================================================================
-# --- CONFIGURATION ---
+# --- CONFIGURATION (Only Supabase Config Needed) ---
 # ==============================================================================
-API_KEY = "Z80WG5Sg"
-CLIENT_CODE = "S52638556"
-MPIN = "0000"
-TOTP_STR = "XFTXZ2445N4V2UMB7EWUCBDRMU"
-
 SUPABASE_URL = "https://fnfynhgkdevxytxtfzrk.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZuZnluaGdrZGV2eHl0eHRmenJrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc0OTAwMjgsImV4cCI6MjA5MzA2NjAyOH0.Tgr8kB6KGeAsAbXzH8a2wlLStqMFS3fnFPcowbL4Di8"
 BUCKET_NAME = "myt"
 
 # ==============================================================================
-# --- FULL SYNC & OVERWRITE LOGIC (.db generation) ---
+# --- FULL SYNC & OVERWRITE LOGIC (Upstox Data -> angel_master.db) ---
 # ==============================================================================
 def sync_master_data():
-    print("🔄 [Master] Initializing Angel One Scrip Master Sync...")
+    print("🔄 [Upstox Master] Initializing Upstox Scrip Master Sync...")
     tmp_dir = tempfile.gettempdir()
     db_path = os.path.join(tmp_dir, "angel_master.db")
 
     try:
-        master_url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-        response = requests.get(master_url, timeout=60)
+        # Upstox Public Master Contract Complete File URL (No Keys/Login Required)
+        upstox_url = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
+        print("⬇️ [Upstox Master] Downloading complete instrument master file from Upstox...")
+        response = requests.get(upstox_url, timeout=120)
         
         if response.status_code == 200:
-            json_payload = response.json()
+            # Decompress Gzip data in memory
+            decompressed_content = gzip.decompress(response.content).decode('utf-8')
+            csv_reader = csv.DictReader(io.StringIO(decompressed_content))
 
             if os.path.exists(db_path):
                 os.remove(db_path)
@@ -41,32 +42,59 @@ def sync_master_data():
             cursor.execute("PRAGMA journal_mode=OFF")
             cursor.execute("PRAGMA synchronous=OFF")
             
+            # Table schema directly aligned with DatabaseHelper.kt
             cursor.execute('''CREATE TABLE symbols (
                 token TEXT, symbol TEXT, name TEXT, expiry TEXT, 
                 strike TEXT, lotsize TEXT, instrumenttype TEXT, 
                 exch_seg TEXT, tick_size TEXT)''')
 
-            records = [
-                (
-                    str(i.get('token')),
-                    i.get('symbol'),
-                    i.get('name'),
-                    i.get('expiry'),
-                    i.get('strike'),
-                    i.get('lotsize'),
-                    i.get('instrumenttype'),
-                    i.get('exch_seg'),
-                    i.get('tick_size')
-                )
-                for i in json_payload if i.get('token')
-            ]
+            records = []
+            
+            for row in csv_reader:
+                # Instrument Key serves as token in Upstox (e.g. NSE_EQ|INE002A01018 or NSE_FO|43812)
+                token = row.get('instrument_key') or row.get('token') or ''
+                if not token:
+                    continue
 
+                trading_symbol = row.get('tradingsymbol') or row.get('symbol') or ''
+                name = row.get('name') or trading_symbol
+                expiry = row.get('expiry') or ''
+                strike = row.get('strike') or '0.0'
+                lotsize = row.get('lot_size') or '1'
+                instrumenttype = row.get('instrument_type') or ''
+                segment = row.get('exchange') or ''
+                tick_size = row.get('tick_size') or '0.05'
+
+                # Standardize exch_seg mapping according to DatabaseHelper expectations
+                # Segment values: NSE_EQ, NSE_FO, BSE_EQ, BSE_FO, MCX_FO
+                exch_seg = segment
+                if "|" in token:
+                    exch_seg = token.split("|")[0]
+
+                records.append((
+                    str(token),
+                    str(trading_symbol),
+                    str(name),
+                    str(expiry),
+                    str(strike),
+                    str(lotsize),
+                    str(instrumenttype),
+                    str(exch_seg),
+                    str(tick_size)
+                ))
+
+            print(f"📦 [Upstox Master] Processing {len(records)} symbols...")
             cursor.executemany("INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?)", records)
+            
+            # Indexes required by DatabaseHelper.kt queries
             cursor.execute("CREATE INDEX idx_token_fast ON symbols(token)")
             cursor.execute("CREATE INDEX idx_name_fast ON symbols(name)")
+            cursor.execute("CREATE INDEX idx_symbol_fast ON symbols(symbol)")
+            cursor.execute("CREATE INDEX idx_exch_fast ON symbols(exch_seg)")
+
             conn.commit()
             conn.close()
-            print("✅ [Master] SQLite .db file generated locally.")
+            print("✅ [Upstox Master] SQLite angel_master.db generated with Upstox Data.")
 
             # Supabase Storage Upload / Overwrite Process
             supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -92,11 +120,11 @@ def sync_master_data():
                 )
                 print("✅ [Master] Cloud File Overwritten via Update successfully.")
 
-            del json_payload, records
+            del records, decompressed_content
             gc.collect()
             return True
         else:
-            print(f"❌ [Master] Failed to fetch master JSON. HTTP Status: {response.status_code}")
+            print(f"❌ [Master] Failed to fetch Upstox master file. HTTP Status: {response.status_code}")
             return False
 
     except Exception as e:
@@ -104,13 +132,9 @@ def sync_master_data():
         return False
 
 
-def get_totp():
-    return pyotp.TOTP(TOTP_STR).now()
-
-
 # ==============================================================================
-# --- DIRECT EXECUTION (No Live Web Server) ---
+# --- DIRECT EXECUTION ---
 # ==============================================================================
 if __name__ == "__main__":
-    print("🚀 Running Script directly to download JSON, generate DB, and overwrite on Supabase...")
+    print("🚀 Running Script directly to download Upstox Data, generate DB, and overwrite angel_master.db on Supabase...")
     sync_master_data()
