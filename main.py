@@ -106,6 +106,18 @@ def update_token_candles(token_str, price_val):
                 last_candle["high"] = max(last_candle["high"], price_val)
                 last_candle["low"] = min(last_candle["low"], price_val)
 
+# Helper function to broadcast live price tick to clients
+async def broadcast_tick(token: str, price: float):
+    price_str = f"{price:.2f}"
+    LTP_CACHE[token] = price_str
+    update_token_candles(token, price)
+    
+    payload = {
+        "instrument_key": token,
+        "ltp": price_str
+    }
+    await sio.emit("live_data", payload)
+
 # --- 🌐 SOCKET.IO HANDLERS ---
 @sio.event
 async def connect(sid, environ):
@@ -113,17 +125,32 @@ async def connect(sid, environ):
     if LTP_CACHE:
         await sio.emit('initial_ltps', LTP_CACHE, room=sid)
 
-@sio.event
-async def subscribe_tokens(sid, data):
+async def handle_subscription(sid, data):
     try:
-        tokens_input = data.get("tokens", [])
+        if isinstance(data, str):
+            data = json.loads(data)
+            
+        tokens_input = data.get("instrumentKeys") or data.get("tokens", [])
         for item in tokens_input:
-            token = str(item.get("token")).strip()
+            if isinstance(item, dict):
+                token = str(item.get("token") or item.get("instrument_key", "")).strip()
+            else:
+                token = str(item).strip()
+                
             if token:
                 SUBSCRIBED_TOKENS.add(token)
+                
         logger.info(f"Subscribed to Upstox Instruments: {SUBSCRIBED_TOKENS}")
     except Exception as e:
         logger.error(f"❌ Error in subscribe_tokens: {e}")
+
+@sio.event
+async def subscribe_tokens(sid, data):
+    await handle_subscription(sid, data)
+
+@sio.event
+async def subscribe_request(sid, data):
+    await handle_subscription(sid, data)
 
 @sio.event
 async def disconnect(sid):
