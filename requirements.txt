@@ -17,3 +17,4 @@ uvicorn
 eventlet
 aiohttp
 fyers-apiv3
+upstox-totp
