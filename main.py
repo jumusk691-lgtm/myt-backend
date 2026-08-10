@@ -4,51 +4,47 @@ import logging
 import time
 import datetime
 import threading
-import sqlite3
-import gc
-import socketio
-import pyotp
 import pytz
+import socketio
 from aiohttp import web
-from requests.exceptions import ReadTimeout
 
-from SmartApi import SmartConnect
-from SmartApi.smartWebSocketV2 import SmartWebSocketV2
+# --- Upstox Official SDK ---
+import upstox_client
+from upstox_client.rest import ApiException
 
 # --- 🕒 TIMEZONE & LOGGING SETUP ---
 IST = pytz.timezone('Asia/Kolkata')
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("MUNH_TITAN_PROD")
+logger = logging.getLogger("MUNH_TITAN_PROD_UPSTOX")
 
 # --- ⚙️ INTERNAL APP STATE ENGINE ---
 class AppState:
     def __init__(self):
-        self.smart_api = None
-        self.db_path = "angel_master.db"
+        self.api_instance = None
         self.score = 0
 
 state = AppState()
 
-# --- 🔑 CREDENTIALS ---
-API_KEY = "Z80wG5Sg"
-CLIENT_CODE = "S52638556"
-MPIN = "0000"
-TOTP_STR = "XFTXZ2445N4V2UMB7EWUCBDRMU"
+# --- 🔑 UPSTOX CREDENTIALS ---
+API_KEY = "eba0a80f-c907-42fa-a926-6672a120254d"
+ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI2MkFIN0siLCJqdGkiOiI2YTc5ZTg5MTk4MWM2YjA3ZDIxNTcxY2IiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlhdCI6MTc4NjM3NDI4OSwiaXNzIjoidWRhap1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3ODYzOTkyMDB9.hvPeurdKyWsaCDE6auP9TR20QF6dxVkO0NdwMEWXMTI"
+
+# Configuration Setup
+configuration = upstox_client.Configuration()
+configuration.access_token = ACCESS_TOKEN
 
 # --- 🚀 GLOBAL STATES & SCORE TRACKING ---
 LTP_CACHE = {}               
-SUBSCRIBED_TOKENS_REGISTRY = {1: set(), 2: set(), 3: set(), 4: set(), 5: set(), 13: set()}
-BROKER_SOCKET_CONNECTED = False
+SUBSCRIBED_TOKENS = set()
 USER_SCORE = 0 
 
-# --- 📊 CANDLE ENGINE CONFIGURATION (200 CANDLES MAX) ---
+# --- 📊 CANDLE ENGINE CONFIGURATION ---
 TIMEFRAMES = {
     "1M": 60,
     "3M": 180,
     "5M": 300,
     "15M": 900,
-    "25M": 1500,
     "30M": 1800,
     "1H": 3600,
     "1D": 86400
@@ -56,44 +52,12 @@ TIMEFRAMES = {
 MAX_CANDLES_LIMIT = 200
 CANDLE_CACHE = {}
 
-BROKER_JWT_TOKEN = None
-BROKER_FEED_TOKEN = None
-LAST_BROKER_LOGIN_TIME = 0
-
 main_loop = None
-sws_client = None
 
 # Socket.IO & Aiohttp Setup
 sio = socketio.AsyncServer(async_mode='aiohttp', cors_allowed_origins='*')
 app = web.Application()
 sio.attach(app)
-
-# --- 🔄 EXCHANGE CODE NORMALIZER ---
-def normalize_exchange(exch):
-    ex_str = str(exch).upper().strip()
-    if ex_str in ["5", "MCX", "MCX_FO", "MCXFO"]:
-        return "MCX"
-    elif ex_str in ["2", "NFO", "NSE_FO"]:
-        return "NFO"
-    elif ex_str in ["3", "BSE", "BSE_CM"]:
-        return "BSE"
-    elif ex_str in ["4", "CDS", "CNO", "BFO"]:
-        return "CDS"
-    return "NSE"
-
-def get_exchange_code_num(exch):
-    ex_str = str(exch).upper().strip()
-    if ex_str in ["5", "MCX", "MCX_FO", "MCXFO"]:
-        return 5
-    elif ex_str in ["2", "NFO", "NSE_FO"]:
-        return 2
-    elif ex_str in ["3", "BSE", "BSE_CM"]:
-        return 3
-    elif ex_str in ["4", "CDS", "CNO", "BFO"]:
-        return 4
-    elif ex_str in ["13"]:
-        return 13
-    return 1
 
 # --- 🎯 SCORE LOGIC ---
 def update_user_score(points=1):
@@ -142,87 +106,6 @@ def update_token_candles(token_str, price_val):
                 last_candle["high"] = max(last_candle["high"], price_val)
                 last_candle["low"] = min(last_candle["low"], price_val)
 
-# --- 🔐 RETRY & LOGIN LOGIC ---
-def login_with_retry(smart_conn, client_code, mpin, totp, retries=3):
-    for i in range(retries):
-        try:
-            session = smart_conn.generateSession(client_code, mpin, totp)
-            if session and session.get('status'):
-                return session
-        except Exception as e:
-            logger.error(f"Login Attempt {i+1} failed: {e}")
-            time.sleep(2)
-    return None
-
-def force_broker_socket_restart():
-    global sws_client, BROKER_SOCKET_CONNECTED
-    if sws_client:
-        try:
-            sws_client.close()
-        except Exception:
-            pass
-
-# --- 📡 WEBSOCKET HANDLERS ---
-def on_data_received(ws, message):
-    try:
-        if isinstance(message, dict) and "token" in message and "last_traded_price" in message:
-            token = str(message["token"]).strip()
-            raw_ltp = float(message["last_traded_price"])
-            
-            # Angel One Paisa -> Rupee Conversion
-            ltp = raw_ltp / 100.0 if raw_ltp > 10000 else raw_ltp
-            
-            LTP_CACHE[token] = ltp
-            update_token_candles(token, ltp)
-
-            if main_loop and main_loop.is_running():
-                tick_payload = {"token": token, "price": str(ltp), "ltp": str(ltp)}
-                asyncio.run_coroutine_threadsafe(sio.emit('live_data', tick_payload), main_loop)
-                asyncio.run_coroutine_threadsafe(sio.emit('tick_update', tick_payload), main_loop)
-    except Exception as e:
-        logger.error(f"❌ Error in on_data_received: {e}")
-
-def on_websocket_open(wsapp):
-    global BROKER_SOCKET_CONNECTED
-    BROKER_SOCKET_CONNECTED = True
-    logger.info("✅ Broker WebSocket Connected!")
-    subscribe_registered_tokens()
-
-def on_websocket_close(wsapp, code, msg):
-    global BROKER_SOCKET_CONNECTED
-    BROKER_SOCKET_CONNECTED = False
-    logger.warning("⚠️ Broker WebSocket Closed. Reconnecting in 5s...")
-    threading.Thread(target=lambda: (time.sleep(5), start_angel_one_websocket_worker(BROKER_JWT_TOKEN, BROKER_FEED_TOKEN)), daemon=True).start()
-
-def subscribe_registered_tokens():
-    if not sws_client or not BROKER_SOCKET_CONNECTED:
-        return
-
-    payload = []
-    for exch_code, tokens_set in SUBSCRIBED_TOKENS_REGISTRY.items():
-        if tokens_set:
-            payload.append({"exchangeType": int(exch_code), "tokens": list(tokens_set)})
-
-    if payload:
-        try:
-            sws_client.subscribe("munh_titan_live", 1, payload)
-            logger.info(f"📡 Subscribed to tokens: {payload}")
-        except Exception as e:
-            logger.error(f"❌ WebSocket Subscription Error: {e}")
-
-def start_angel_one_websocket_worker(auth_token, feed_token):
-    global sws_client
-    if not auth_token or not feed_token:
-        return
-    try:
-        sws_client = SmartWebSocketV2(auth_token=auth_token, client_code=CLIENT_CODE, api_key=API_KEY, feed_token=feed_token)
-        sws_client.on_data = on_data_received
-        sws_client.on_open = on_websocket_open
-        sws_client.on_close = on_websocket_close
-        sws_client.connect()
-    except Exception as e:
-        logger.error(f"❌ Failed starting SmartWebSocketV2: {e}")
-
 # --- 🌐 SOCKET.IO HANDLERS ---
 @sio.event
 async def connect(sid, environ):
@@ -231,41 +114,14 @@ async def connect(sid, environ):
         await sio.emit('initial_ltps', LTP_CACHE, room=sid)
 
 @sio.event
-async def subscribe_request(sid, data):
-    try:
-        action = data.get("action", "sub")
-        exch_code = int(data.get("exchange", 1))
-        tokens = data.get("tokens", [])
-        
-        if exch_code not in SUBSCRIBED_TOKENS_REGISTRY:
-            SUBSCRIBED_TOKENS_REGISTRY[exch_code] = set()
-
-        for token in tokens:
-            tk_str = str(token).strip()
-            if tk_str:
-                if action == "sub":
-                    SUBSCRIBED_TOKENS_REGISTRY[exch_code].add(tk_str)
-                elif action == "unsub":
-                    SUBSCRIBED_TOKENS_REGISTRY[exch_code].discard(tk_str)
-
-        subscribe_registered_tokens()
-    except Exception as e:
-        logger.error(f"❌ Error in subscribe_request: {e}")
-
-@sio.event
 async def subscribe_tokens(sid, data):
     try:
         tokens_input = data.get("tokens", [])
         for item in tokens_input:
             token = str(item.get("token")).strip()
-            exch_raw = item.get("exch", "NSE")
-            exch_num = get_exchange_code_num(exch_raw)
             if token:
-                if exch_num not in SUBSCRIBED_TOKENS_REGISTRY:
-                    SUBSCRIBED_TOKENS_REGISTRY[exch_num] = set()
-                SUBSCRIBED_TOKENS_REGISTRY[exch_num].add(token)
-
-        subscribe_registered_tokens()
+                SUBSCRIBED_TOKENS.add(token)
+        logger.info(f"Subscribed to Upstox Instruments: {SUBSCRIBED_TOKENS}")
     except Exception as e:
         logger.error(f"❌ Error in subscribe_tokens: {e}")
 
@@ -273,48 +129,49 @@ async def subscribe_tokens(sid, data):
 async def disconnect(sid):
     logger.info(f"📱 Android Client Disconnected: {sid}")
 
-# --- 🌐 REST HTTP API ENDPOINTS ---
+# --- 🌐 REST HTTP API ENDPOINTS (UPSTOX HISTORICAL DATA) ---
 async def fetch_chart_data(request: web.Request):
     try:
         d = await request.json()
-        token = str(d.get('token', '')).strip()
-        exch_raw = str(d.get('exch', 'NSE')).strip()
+        instrument_key = str(d.get('token', '')).strip()  # e.g., NSE_EQ|INE009A01021
+        unit = str(d.get('interval', "1minute")).strip()  # day, 1minute, 3minute, etc.
 
-        if not token:
-            return web.json_response({"status": False, "message": "Missing token"}, status=400)
+        if not instrument_key:
+            return web.json_response({"status": False, "message": "Missing instrument_key"}, status=400)
 
-        exchange_str = normalize_exchange(exch_raw)
-        interval = str(d.get('interval', "FIVE_MINUTE")).strip()
-        from_date = d.get('fromdate')
-        to_date = d.get('todate')
+        to_date = datetime.datetime.now(IST).strftime("%Y-%m-%d")
+        from_date = (datetime.datetime.now(IST) - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
 
-        now = datetime.datetime.now(IST)
-        if not to_date:
-            to_date = now.strftime("%Y-%m-%d %H:%M")
-        if not from_date:
-            from_date = (now - datetime.timedelta(days=5)).strftime("%Y-%m-%d %H:%M")
+        history_api = upstox_client.HistoryApi(upstox_client.ApiClient(configuration))
+        
+        # Upstox Historical Candle Call
+        api_response = history_api.get_historical_candle_data1(
+            instrument_key=instrument_key,
+            interval=unit,
+            to_date=to_date,
+            from_date=from_date,
+            api_version="2.0"
+        )
 
-        historic_param = {
-            "exchange": exchange_str,
-            "symboltoken": token,
-            "interval": interval,
-            "fromdate": from_date,
-            "todate": to_date
-        }
-
-        if state.smart_api:
-            try:
-                response = state.smart_api.getCandleData(historic_param)
-                if response and response.get("status") and response.get("data"):
-                    formatted_candles = [
-                        {"time": c[0], "open": float(c[1]), "high": float(c[2]), "low": float(c[3]), "close": float(c[4])}
-                        for c in response["data"]
-                    ]
-                    return web.json_response({"status": True, "message": "SUCCESS", "data": formatted_candles})
-            except Exception as api_err:
-                logger.error(f"Historical API Error: {api_err}")
+        if api_response and api_response.status == "success":
+            raw_candles = api_response.data.candles
+            formatted_candles = [
+                {
+                    "time": c[0],
+                    "open": float(c[1]),
+                    "high": float(c[2]),
+                    "low": float(c[3]),
+                    "close": float(c[4])
+                }
+                for c in raw_candles
+            ]
+            return web.json_response({"status": True, "message": "SUCCESS", "data": formatted_candles})
 
         return web.json_response({"status": False, "message": "Historical data unavailable", "data": []})
+
+    except ApiException as e:
+        logger.error(f"Upstox API Exception: {e}")
+        return web.json_response({"status": False, "message": str(e), "data": []}, status=500)
     except Exception as e:
         logger.error(f"Exception in fetch_chart_data: {e}")
         return web.json_response({"status": False, "message": str(e), "data": []}, status=500)
@@ -322,49 +179,10 @@ async def fetch_chart_data(request: web.Request):
 app.router.add_post('/api/get_chart_data', fetch_chart_data)
 
 # --- 🔄 BACKGROUND TASKS ---
-async def broker_auto_login_task():
-    global BROKER_JWT_TOKEN, BROKER_FEED_TOKEN, LAST_BROKER_LOGIN_TIME
-    while True:
-        try:
-            if BROKER_JWT_TOKEN is None or (time.time() - LAST_BROKER_LOGIN_TIME >= 36000):
-                totp_crypto = pyotp.TOTP(TOTP_STR)
-                smart_conn = SmartConnect(api_key=API_KEY)
-                
-                session_data = login_with_retry(smart_conn, CLIENT_CODE, MPIN, totp_crypto.now())
-                
-                if session_data and isinstance(session_data, dict) and session_data.get('status'):
-                    BROKER_JWT_TOKEN = session_data['data']['jwtToken']
-                    BROKER_FEED_TOKEN = session_data['data']['feedToken']
-                    LAST_BROKER_LOGIN_TIME = time.time()
-                    smart_conn.setAccessToken(BROKER_JWT_TOKEN)
-                    state.smart_api = smart_conn
-                    force_broker_socket_restart()
-        except Exception as e:
-            logger.error(f"Broker auto-login task error: {e}")
-        await asyncio.sleep(600)
-
 async def start_background_tasks(app):
     global main_loop
     main_loop = asyncio.get_event_loop()
-    
-    try:
-        totp_crypto = pyotp.TOTP(TOTP_STR)
-        smart_conn = SmartConnect(api_key=API_KEY)
-        
-        session_data = login_with_retry(smart_conn, CLIENT_CODE, MPIN, totp_crypto.now())
-        
-        if session_data and isinstance(session_data, dict) and session_data.get('status'):
-            global BROKER_JWT_TOKEN, BROKER_FEED_TOKEN, LAST_BROKER_LOGIN_TIME
-            BROKER_JWT_TOKEN = session_data['data']['jwtToken']
-            BROKER_FEED_TOKEN = session_data['data']['feedToken']
-            LAST_BROKER_LOGIN_TIME = time.time()
-            smart_conn.setAccessToken(BROKER_JWT_TOKEN)
-            state.smart_api = smart_conn
-            threading.Thread(target=start_angel_one_websocket_worker, args=(BROKER_JWT_TOKEN, BROKER_FEED_TOKEN), daemon=True).start()
-    except Exception as e:
-        logger.error(f"Error starting background tasks: {e}")
-    
-    app['auto_login'] = asyncio.create_task(broker_auto_login_task())
+    logger.info("✅ Upstox Backend Service Initialized.")
 
 app.on_startup.append(start_background_tasks)
 
