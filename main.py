@@ -77,7 +77,7 @@ def normalize_exchange(exch):
         return "NFO"
     elif ex_str in ["3", "BSE", "BSE_CM"]:
         return "BSE"
-    elif ex_str in ["4", "CDS", "CNO"]:
+    elif ex_str in ["4", "CDS", "CNO", "BFO"]:
         return "CDS"
     return "NSE"
 
@@ -89,7 +89,9 @@ def get_exchange_code_num(exch):
         return 2
     elif ex_str in ["3", "BSE", "BSE_CM"]:
         return 3
-    elif ex_str in ["4", "CDS", "CNO", "13"]:
+    elif ex_str in ["4", "CDS", "CNO", "BFO"]:
+        return 4
+    elif ex_str in ["13"]:
         return 13
     return 1
 
@@ -174,7 +176,8 @@ def on_data_received(ws, message):
             update_token_candles(token, ltp)
 
             if main_loop and main_loop.is_running():
-                tick_payload = {"token": token, "ltp": ltp}
+                tick_payload = {"token": token, "price": str(ltp), "ltp": str(ltp)}
+                asyncio.run_coroutine_threadsafe(sio.emit('live_data', tick_payload), main_loop)
                 asyncio.run_coroutine_threadsafe(sio.emit('tick_update', tick_payload), main_loop)
     except Exception as e:
         logger.error(f"❌ Error in on_data_received: {e}")
@@ -228,6 +231,28 @@ async def connect(sid, environ):
         await sio.emit('initial_ltps', LTP_CACHE, room=sid)
 
 @sio.event
+async def subscribe_request(sid, data):
+    try:
+        action = data.get("action", "sub")
+        exch_code = int(data.get("exchange", 1))
+        tokens = data.get("tokens", [])
+        
+        if exch_code not in SUBSCRIBED_TOKENS_REGISTRY:
+            SUBSCRIBED_TOKENS_REGISTRY[exch_code] = set()
+
+        for token in tokens:
+            tk_str = str(token).strip()
+            if tk_str:
+                if action == "sub":
+                    SUBSCRIBED_TOKENS_REGISTRY[exch_code].add(tk_str)
+                elif action == "unsub":
+                    SUBSCRIBED_TOKENS_REGISTRY[exch_code].discard(tk_str)
+
+        subscribe_registered_tokens()
+    except Exception as e:
+        logger.error(f"❌ Error in subscribe_request: {e}")
+
+@sio.event
 async def subscribe_tokens(sid, data):
     try:
         tokens_input = data.get("tokens", [])
@@ -236,6 +261,8 @@ async def subscribe_tokens(sid, data):
             exch_raw = item.get("exch", "NSE")
             exch_num = get_exchange_code_num(exch_raw)
             if token:
+                if exch_num not in SUBSCRIBED_TOKENS_REGISTRY:
+                    SUBSCRIBED_TOKENS_REGISTRY[exch_num] = set()
                 SUBSCRIBED_TOKENS_REGISTRY[exch_num].add(token)
 
         subscribe_registered_tokens()
