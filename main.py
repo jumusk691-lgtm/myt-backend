@@ -167,17 +167,18 @@ async def fetch_chart_data(request: web.Request):
         # Pipe formatting for Upstox Key
         instrument_key = instrument_key.replace(":", "|")
 
-        # Normalize interval strings for Upstox standard
+        # ✅ Correct Interval Mapping for Upstox V2 Standard
         INTERVAL_MAP = {
             "1MINUTE": "1minute", "ONE_MINUTE": "1minute", "1M": "1minute", "1minute": "1minute",
-            "3MINUTE": "1minute", "THREE_MINUTE": "1minute", "3M": "1minute", "3minute": "1minute",
-            "5MINUTE": "1minute", "FIVE_MINUTE": "1minute", "5M": "1minute", "5minute": "1minute",
-            "10MINUTE": "1minute", "TEN_MINUTE": "1minute", "10M": "1minute", "10minute": "1minute",
-            "15MINUTE": "1minute", "FIFTEEN_MINUTE": "1minute", "15M": "1minute", "15minute": "1minute",
+            "3MINUTE": "3minute", "THREE_MINUTE": "3minute", "3M": "3minute", "3minute": "3minute",
+            "5MINUTE": "5minute", "FIVE_MINUTE": "5minute", "5M": "5minute", "5minute": "5minute",
+            "10MINUTE": "10minute", "TEN_MINUTE": "10minute", "10M": "10minute", "10minute": "10minute",
+            "15MINUTE": "15minute", "FIFTEEN_MINUTE": "15minute", "15M": "15minute", "15minute": "15minute",
             "30MINUTE": "30minute", "THIRTY_MINUTE": "30minute", "30M": "30minute", "30minute": "30minute",
-            "60MINUTE": "30minute", "SIXTY_MINUTE": "30minute", "1HOUR": "30minute", "60M": "30minute", "60minute": "30minute",
+            "60MINUTE": "60minute", "SIXTY_MINUTE": "60minute", "1HOUR": "60minute", "60M": "60minute", "60minute": "60minute", "1H": "60minute",
             "DAY": "day", "ONE_DAY": "day", "1D": "day", "day": "day",
-            "WEEK": "week", "1W": "week", "week": "week", "MONTH": "month", "1MON": "month", "month": "month"
+            "WEEK": "week", "1W": "week", "week": "week",
+            "MONTH": "month", "1MON": "month", "month": "month"
         }
 
         unit = INTERVAL_MAP.get(raw_interval.upper(), "1minute")
@@ -193,7 +194,7 @@ async def fetch_chart_data(request: web.Request):
         all_raw_candles = []
 
         async with aiohttp.ClientSession() as session:
-            # 1️⃣ INTRA-DAY CANDLES (Fetch today's candles up to current minute)
+            # 1️⃣ INTRA-DAY CANDLES (Fetch today's live candles till current minute)
             intraday_url = f"https://api.upstox.com/v2/historical-candle/intraday/{instrument_key}/{unit}"
             async with session.get(intraday_url, headers=headers) as resp_intra:
                 if resp_intra.status == 200:
