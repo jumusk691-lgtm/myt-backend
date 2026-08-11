@@ -67,25 +67,23 @@ async def broadcast_tick(token: str, price: float):
         LTP_CACHE["SENSEX"] = price_str
         await sio.emit("live_data", {"instrument_key": "SENSEX", "ltp": price_str})
 
-# --- 🔄 FAST LTP POLLING ENGINE (Reliable & Bypass Protobuf Parsing) ---
+# --- 🔄 FAST LTP POLLING ENGINE (ADVANCED BATCHING MODE) ---
 async def start_upstox_ltp_poller():
-    logger.info("⚡ Upstox Live LTP Fast Poller Started!")
+    logger.info("⚡ Upstox Live LTP Fast Poller (BATCHING MODE) Started!")
     headers = {
         'Accept': 'application/json',
         'Authorization': f'Bearer {ACCESS_TOKEN}'
     }
 
-    async with aiohttp.ClientSession() as session:
-        while True:
+    # Upstox Rate Limit Controller (Max 5 concurrent API hits to prevent 429)
+    concurrency_limiter = asyncio.Semaphore(5)
+
+    async def fetch_chunk(session, chunk_tokens):
+        keys_param = ",".join(chunk_tokens)
+        url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={keys_param}"
+        
+        async with concurrency_limiter:
             try:
-                current_subs = list(SUBSCRIBED_TOKENS)
-                if not current_subs:
-                    current_subs = ["NSE_INDEX|Nifty 50", "BSE_INDEX|SENSEX"]
-
-                # Upstox LTP endpoint supports comma separated keys
-                keys_param = ",".join(current_subs)
-                url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={keys_param}"
-
                 async with session.get(url, headers=headers) as resp:
                     if resp.status == 200:
                         res_data = await resp.json()
@@ -96,18 +94,41 @@ async def start_upstox_ltp_poller():
                                 last_price = float(detail.get("last_price", 0.0))
                                 if last_price > 0:
                                     await broadcast_tick(inst_key, last_price)
-                                    # Handle colon to pipe mismatch format from Upstox API
                                     if ":" in key_alias:
                                         pipe_key = key_alias.replace(":", "|")
                                         await broadcast_tick(pipe_key, last_price)
+                    elif resp.status == 429:
+                        logger.warning("⚠️ Upstox HTTP 429 in Batch! Throttling this chunk...")
+                        await asyncio.sleep(3.0) 
                     else:
                         err_txt = await resp.text()
                         logger.error(f"❌ Upstox Quote API HTTP {resp.status}: {err_txt}")
+            except Exception as e:
+                logger.error(f"❌ Error in chunk fetch: {e}")
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            start_time = time.time()
+            try:
+                current_subs = list(SUBSCRIBED_TOKENS)
+                if not current_subs:
+                    current_subs = ["NSE_INDEX|Nifty 50", "BSE_INDEX|SENSEX"]
+
+                # 1️⃣ CREATE BATCHES (Chunks of 50 tokens max to avoid URL Length limits)
+                CHUNK_SIZE = 50 
+                chunks = [current_subs[i:i + CHUNK_SIZE] for i in range(0, len(current_subs), CHUNK_SIZE)]
+
+                # 2️⃣ FIRE BATCHES ASYNCHRONOUSLY
+                tasks = [fetch_chunk(session, chunk) for chunk in chunks]
+                await asyncio.gather(*tasks)
 
             except Exception as e:
-                logger.error(f"❌ Error in Upstox Poller: {e}")
+                logger.error(f"❌ Error in Upstox Master Poller: {e}")
 
-            await asyncio.sleep(1.0) # 1-sec fast update tick
+            # 3️⃣ TIME CALCULATION: Maintain strictly 1-second interval loop
+            elapsed = time.time() - start_time
+            sleep_time = max(1.0 - elapsed, 0.1) # Minimum 0.1s sleep to prevent server CPU choke
+            await asyncio.sleep(sleep_time)
 
 # --- 🌐 SOCKET.IO HANDLERS ---
 @sio.event
@@ -131,7 +152,7 @@ async def handle_subscription(sid, data):
             if token:
                 SUBSCRIBED_TOKENS.add(token)
                 
-        logger.info(f"Subscribed Upstox Keys: {SUBSCRIBED_TOKENS}")
+        logger.info(f"Subscribed Upstox Keys Count: {len(SUBSCRIBED_TOKENS)}")
     except Exception as e:
         logger.error(f"❌ Error in subscribe_tokens: {e}")
 
@@ -316,7 +337,7 @@ app.router.add_post('/api/get_chart_data', fetch_chart_data)
 # --- 🔄 BACKGROUND TASKS ---
 async def start_background_tasks(app):
     asyncio.create_task(start_upstox_ltp_poller())
-    logger.info("✅ Upstox Backend Service Initialized with Poller Engine.")
+    logger.info("✅ Upstox Backend Service Initialized with BATCHING Poller Engine.")
 
 app.on_startup.append(start_background_tasks)
 
