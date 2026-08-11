@@ -4,6 +4,7 @@ import logging
 import time
 import datetime
 import os
+import urllib.parse
 import pytz
 import socketio
 import aiohttp
@@ -83,7 +84,7 @@ async def start_upstox_ltp_poller():
                     current_subs = ["NSE_INDEX|Nifty 50", "BSE_INDEX|SENSEX"]
 
                 # Upstox LTP endpoint supports comma separated keys
-                keys_param = ",".join(current_subs)
+                keys_param = ",".join([urllib.parse.quote(k) for k in current_subs])
                 url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={keys_param}"
 
                 async with session.get(url, headers=headers) as resp:
@@ -186,7 +187,10 @@ async def fetch_chart_data(request: web.Request):
 
         now_ist = datetime.datetime.now(IST)
         to_date = now_ist.strftime("%Y-%m-%d")
-        from_date = (now_ist - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
+        from_date = (now_ist - datetime.timedelta(days=10)).strftime("%Y-%m-%d")
+
+        # Properly URL Encode the instrument key for safe HTTP requests
+        encoded_key = urllib.parse.quote(instrument_key)
 
         headers = {
             'Accept': 'application/json',
@@ -197,22 +201,34 @@ async def fetch_chart_data(request: web.Request):
 
         async with aiohttp.ClientSession() as session:
             # 1️⃣ FETCH INTRADAY CANDLES (Today's live candles)
-            intraday_url = f"https://api.upstox.com/v2/historical-candle/intraday/{instrument_key}/{unit}"
-            async with session.get(intraday_url, headers=headers) as resp_intra:
-                if resp_intra.status == 200:
-                    res_intra = await resp_intra.json()
-                    if res_intra.get("status") == "success":
-                        intra_candles = res_intra.get("data", {}).get("candles", [])
-                        all_raw_candles.extend(intra_candles)
+            intraday_url = f"https://api.upstox.com/v2/historical-candle/intraday/{encoded_key}/{unit}"
+            try:
+                async with session.get(intraday_url, headers=headers) as resp_intra:
+                    if resp_intra.status == 200:
+                        res_intra = await resp_intra.json()
+                        if res_intra.get("status") == "success":
+                            intra_candles = res_intra.get("data", {}).get("candles", [])
+                            all_raw_candles.extend(intra_candles)
+                    else:
+                        err = await resp_intra.text()
+                        logger.warning(f"Intraday fetch warning ({resp_intra.status}): {err}")
+            except Exception as e_intra:
+                logger.error(f"Intraday API error: {e_intra}")
 
             # 2️⃣ FETCH HISTORICAL CANDLES (Past days)
-            hist_url = f"https://api.upstox.com/v2/historical-candle/{instrument_key}/{unit}/{to_date}/{from_date}"
-            async with session.get(hist_url, headers=headers) as resp_hist:
-                if resp_hist.status == 200:
-                    res_hist = await resp_hist.json()
-                    if res_hist.get("status") == "success":
-                        hist_candles = res_hist.get("data", {}).get("candles", [])
-                        all_raw_candles.extend(hist_candles)
+            hist_url = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/{unit}/{to_date}/{from_date}"
+            try:
+                async with session.get(hist_url, headers=headers) as resp_hist:
+                    if resp_hist.status == 200:
+                        res_hist = await resp_hist.json()
+                        if res_hist.get("status") == "success":
+                            hist_candles = res_hist.get("data", {}).get("candles", [])
+                            all_raw_candles.extend(hist_candles)
+                    else:
+                        err_h = await resp_hist.text()
+                        logger.warning(f"Historical fetch warning ({resp_hist.status}): {err_h}")
+            except Exception as e_hist:
+                logger.error(f"Historical API error: {e_hist}")
 
         if all_raw_candles:
             # Unique mapping by Timestamp
