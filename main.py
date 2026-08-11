@@ -159,10 +159,25 @@ async def fetch_chart_data(request: web.Request):
     try:
         d = await request.json()
         instrument_key = str(d.get('token', '')).strip()
-        unit = str(d.get('interval', "1minute")).strip()
+        raw_interval = str(d.get('interval', "1minute")).strip()
 
         if not instrument_key:
             return web.json_response({"status": False, "message": "Missing instrument_key"}, status=400)
+
+        # Map common interval formats to Upstox API standard values
+        INTERVAL_MAP = {
+            "1MINUTE": "1minute", "ONE_MINUTE": "1minute", "1M": "1minute", "1minute": "1minute",
+            "3MINUTE": "3minute", "THREE_MINUTE": "3minute", "3M": "3minute", "3minute": "3minute",
+            "5MINUTE": "5minute", "FIVE_MINUTE": "5minute", "5M": "5minute", "5minute": "5minute",
+            "15MINUTE": "15minute", "FIFTEEN_MINUTE": "15minute", "15M": "15minute", "15minute": "15minute",
+            "30MINUTE": "30minute", "THIRTY_MINUTE": "30minute", "30M": "30minute", "30minute": "30minute",
+            "60MINUTE": "60minute", "SIXTY_MINUTE": "60minute", "1HOUR": "60minute", "60M": "60minute", "60minute": "60minute",
+            "DAY": "day", "1D": "day", "day": "day",
+            "WEEK": "week", "1W": "week", "week": "week",
+            "MONTH": "month", "1MON": "month", "month": "month"
+        }
+
+        unit = INTERVAL_MAP.get(raw_interval.upper(), raw_interval.lower())
 
         to_date = datetime.datetime.now(IST).strftime("%Y-%m-%d")
         from_date = (datetime.datetime.now(IST) - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
