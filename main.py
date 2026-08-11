@@ -158,59 +158,65 @@ async def home_route(request: web.Request):
 async def fetch_chart_data(request: web.Request):
     try:
         d = await request.json()
-        instrument_key = str(d.get('token', '')).strip()
-        raw_interval = str(d.get('interval', "1minute")).strip()
+        instrument_key = str(d.get('token', '') or d.get('instrument_key', '')).strip()
+        raw_interval = str(d.get('interval', "5minute")).strip()
 
         if not instrument_key:
             return web.json_response({"status": False, "message": "Missing instrument_key"}, status=400)
 
-        # Map common interval formats to Upstox API standard values
+        # Pipe formatting for Upstox Key
+        instrument_key = instrument_key.replace(":", "|")
+
+        # Normalize interval strings for Upstox standard
         INTERVAL_MAP = {
             "1MINUTE": "1minute", "ONE_MINUTE": "1minute", "1M": "1minute", "1minute": "1minute",
-            "3MINUTE": "3minute", "THREE_MINUTE": "3minute", "3M": "3minute", "3minute": "3minute",
-            "5MINUTE": "5minute", "FIVE_MINUTE": "5minute", "5M": "5minute", "5minute": "5minute",
-            "15MINUTE": "15minute", "FIFTEEN_MINUTE": "15minute", "15M": "15minute", "15minute": "15minute",
+            "3MINUTE": "1minute", "THREE_MINUTE": "1minute", "3M": "1minute", "3minute": "1minute",
+            "5MINUTE": "1minute", "FIVE_MINUTE": "1minute", "5M": "1minute", "5minute": "1minute",
+            "10MINUTE": "1minute", "TEN_MINUTE": "1minute", "10M": "1minute", "10minute": "1minute",
+            "15MINUTE": "1minute", "FIFTEEN_MINUTE": "1minute", "15M": "1minute", "15minute": "1minute",
             "30MINUTE": "30minute", "THIRTY_MINUTE": "30minute", "30M": "30minute", "30minute": "30minute",
-            "60MINUTE": "60minute", "SIXTY_MINUTE": "60minute", "1HOUR": "60minute", "60M": "60minute", "60minute": "60minute",
-            "DAY": "day", "1D": "day", "day": "day",
+            "60MINUTE": "30minute", "SIXTY_MINUTE": "30minute", "1HOUR": "30minute", "60M": "30minute", "60minute": "30minute",
+            "DAY": "day", "ONE_DAY": "day", "1D": "day", "day": "day",
             "WEEK": "week", "1W": "week", "week": "week",
             "MONTH": "month", "1MON": "month", "month": "month"
         }
 
-        unit = INTERVAL_MAP.get(raw_interval.upper(), raw_interval.lower())
+        unit = INTERVAL_MAP.get(raw_interval.upper(), "1minute")
 
         to_date = datetime.datetime.now(IST).strftime("%Y-%m-%d")
         from_date = (datetime.datetime.now(IST) - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
 
-        history_api = upstox_client.HistoryApi(upstox_client.ApiClient(configuration))
-        
-        api_response = history_api.get_historical_candle_data1(
-            instrument_key=instrument_key,
-            interval=unit,
-            to_date=to_date,
-            from_date=from_date,
-            api_version="2.0"
-        )
+        headers = {
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {ACCESS_TOKEN}'
+        }
 
-        if api_response and api_response.status == "success":
-            raw_candles = api_response.data.candles
-            formatted_candles = [
-                {
-                    "time": c[0],
-                    "open": float(c[1]),
-                    "high": float(c[2]),
-                    "low": float(c[3]),
-                    "close": float(c[4])
-                }
-                for c in raw_candles
-            ]
-            return web.json_response({"status": True, "message": "SUCCESS", "data": formatted_candles})
+        # Direct HTTP REST Call to bypass SDK limitation for 1minute/30minute/day historical endpoint
+        url = f"https://api.upstox.com/v2/historical-candle/{instrument_key}/{unit}/{to_date}/{from_date}"
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status == 200:
+                    res_json = await resp.json()
+                    if res_json.get("status") == "success" and "data" in res_json:
+                        raw_candles = res_json.get("data", {}).get("candles", [])
+                        formatted_candles = [
+                            {
+                                "time": c[0],
+                                "open": float(c[1]),
+                                "high": float(c[2]),
+                                "low": float(c[3]),
+                                "close": float(c[4])
+                            }
+                            for c in raw_candles
+                        ]
+                        return web.json_response({"status": True, "message": "SUCCESS", "data": formatted_candles})
+
+                err_txt = await resp.text()
+                logger.error(f"Upstox Historical HTTP {resp.status}: {err_txt}")
 
         return web.json_response({"status": False, "message": "Historical data unavailable", "data": []})
 
-    except ApiException as e:
-        logger.error(f"Upstox API Exception: {e}")
-        return web.json_response({"status": False, "message": str(e), "data": []}, status=500)
     except Exception as e:
         logger.error(f"Exception in fetch_chart_data: {e}")
         return web.json_response({"status": False, "message": str(e), "data": []}, status=500)
