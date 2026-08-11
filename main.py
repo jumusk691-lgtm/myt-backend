@@ -159,7 +159,7 @@ async def fetch_chart_data(request: web.Request):
     try:
         d = await request.json()
         instrument_key = str(d.get('token', '') or d.get('instrument_key', '')).strip()
-        raw_interval = str(d.get('interval', "5minute")).strip()
+        raw_interval = str(d.get('interval', "5minute")).strip().upper()
 
         if not instrument_key:
             return web.json_response({"status": False, "message": "Missing instrument_key"}, status=400)
@@ -167,20 +167,27 @@ async def fetch_chart_data(request: web.Request):
         # Pipe formatting for Upstox Key
         instrument_key = instrument_key.replace(":", "|")
 
-        # Normalize interval strings for Upstox standard
-        INTERVAL_MAP = {
-            "1MINUTE": "1minute", "ONE_MINUTE": "1minute", "1M": "1minute", "1minute": "1minute",
-            "3MINUTE": "1minute", "THREE_MINUTE": "1minute", "3M": "1minute", "3minute": "1minute",
-            "5MINUTE": "1minute", "FIVE_MINUTE": "1minute", "5M": "1minute", "5minute": "1minute",
-            "10MINUTE": "1minute", "TEN_MINUTE": "1minute", "10M": "1minute", "10minute": "1minute",
-            "15MINUTE": "1minute", "FIFTEEN_MINUTE": "1minute", "15M": "1minute", "15minute": "1minute",
-            "30MINUTE": "30minute", "THIRTY_MINUTE": "30minute", "30M": "30minute", "30minute": "30minute",
-            "60MINUTE": "30minute", "SIXTY_MINUTE": "30minute", "1HOUR": "30minute", "60M": "30minute", "60minute": "30minute",
-            "DAY": "day", "ONE_DAY": "day", "1D": "day", "day": "day",
-            "WEEK": "week", "1W": "week", "week": "week", "MONTH": "month", "1MON": "month", "month": "month"
-        }
+        # --- 🛠️ UPDATED INTERVAL LOGIC ---
+        if raw_interval in ["DAY", "ONE_DAY", "1D"]:
+            unit = "day"
+        elif raw_interval in ["WEEK", "1W", "1WEEK"]:
+            unit = "week"
+        elif raw_interval in ["MONTH", "1MON", "1MONTH"]:
+            unit = "month"
+        else:
+            # Fetch 1-min for all intraday and resample locally for accuracy
+            unit = "1minute" 
 
-        unit = INTERVAL_MAP.get(raw_interval.upper(), "1minute")
+        # Target minutes mapping for local backend resampling
+        MINUTES_MAP = {
+            "3MINUTE": 3, "THREE_MINUTE": 3, "3M": 3, "3minute": 3,
+            "5MINUTE": 5, "FIVE_MINUTE": 5, "5M": 5, "5minute": 5,
+            "10MINUTE": 10, "TEN_MINUTE": 10, "10M": 10, "10minute": 10,
+            "15MINUTE": 15, "FIFTEEN_MINUTE": 15, "15M": 15, "15minute": 15,
+            "30MINUTE": 30, "THIRTY_MINUTE": 30, "30M": 30, "30minute": 30,
+            "60MINUTE": 60, "SIXTY_MINUTE": 60, "1HOUR": 60, "1H": 60, "60M": 60, "60minute": 60
+        }
+        target_minutes = MINUTES_MAP.get(raw_interval, 1)
 
         to_date = datetime.datetime.now(IST).strftime("%Y-%m-%d")
         from_date = (datetime.datetime.now(IST) - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
@@ -224,6 +231,65 @@ async def fetch_chart_data(request: web.Request):
 
             # Upstox returns newest first, so we sort ascending by time
             unique_candles.sort(key=lambda x: x[0])
+
+            # --- 🛠️ FIX: RESAMPLE CANDLES FOR HIGHER TIMEFRAMES ---
+            if unit == "1minute" and target_minutes > 1:
+                resampled = []
+                current_agg = None
+                
+                for c in unique_candles:
+                    t_str = c[0]
+                    try:
+                        dt = datetime.datetime.fromisoformat(t_str)
+                    except ValueError:
+                        try:
+                            # Fallback parsing if fromisoformat fails
+                            dt = datetime.datetime.strptime(t_str[:19], "%Y-%m-%dT%H:%M:%S")
+                        except ValueError:
+                            resampled.append(c)
+                            continue
+                    
+                    # Calculate minutes elapsed since market open (09:15 AM)
+                    mins_from_open = (dt.hour * 60 + dt.minute) - (9 * 60 + 15)
+                    if mins_from_open < 0:
+                        mins_from_open = 0 # Handle pre-market data safely
+                        
+                    block_idx = mins_from_open // target_minutes
+                    block_key = (dt.date(), block_idx)
+                    
+                    # Grouping Logic
+                    if current_agg is None or current_agg['key'] != block_key:
+                        if current_agg is not None:
+                            resampled.append([
+                                current_agg['time'],
+                                current_agg['open'],
+                                current_agg['high'],
+                                current_agg['low'],
+                                current_agg['close']
+                            ])
+                        current_agg = {
+                            'key': block_key,
+                            'time': t_str,
+                            'open': float(c[1]),
+                            'high': float(c[2]),
+                            'low': float(c[3]),
+                            'close': float(c[4])
+                        }
+                    else:
+                        current_agg['high'] = max(current_agg['high'], float(c[2]))
+                        current_agg['low'] = min(current_agg['low'], float(c[3]))
+                        current_agg['close'] = float(c[4])
+                
+                if current_agg is not None:
+                    resampled.append([
+                        current_agg['time'],
+                        current_agg['open'],
+                        current_agg['high'],
+                        current_agg['low'],
+                        current_agg['close']
+                    ])
+                
+                unique_candles = resampled
 
             formatted_candles = [
                 {
