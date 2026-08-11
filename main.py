@@ -256,4 +256,3 @@ app.on_startup.append(start_background_tasks)
 
 if __name__ == "__main__":
     web.run_app(app, host="0.0.0.0", port=10000)
-भाई, यह तो टाइम फ्रेम में भी सेम वही कैंडल दिख रहा है। 5 मिनट में, 10 मिनट में, 15 मिनट में, 1 घंटे में, 1 मिनट में वही कैंडल।
