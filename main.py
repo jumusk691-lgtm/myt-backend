@@ -177,8 +177,7 @@ async def fetch_chart_data(request: web.Request):
             "30MINUTE": "30minute", "THIRTY_MINUTE": "30minute", "30M": "30minute", "30minute": "30minute",
             "60MINUTE": "30minute", "SIXTY_MINUTE": "30minute", "1HOUR": "30minute", "60M": "30minute", "60minute": "30minute",
             "DAY": "day", "ONE_DAY": "day", "1D": "day", "day": "day",
-            "WEEK": "week", "1W": "week", "week": "week",
-            "MONTH": "month", "1MON": "month", "month": "month"
+            "WEEK": "week", "1W": "week", "week": "week", "MONTH": "month", "1MON": "month", "month": "month"
         }
 
         unit = INTERVAL_MAP.get(raw_interval.upper(), "1minute")
@@ -191,29 +190,53 @@ async def fetch_chart_data(request: web.Request):
             'Authorization': f'Bearer {ACCESS_TOKEN}'
         }
 
-        # Direct HTTP REST Call to bypass SDK limitation for 1minute/30minute/day historical endpoint
-        url = f"https://api.upstox.com/v2/historical-candle/{instrument_key}/{unit}/{to_date}/{from_date}"
+        all_raw_candles = []
 
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers) as resp:
-                if resp.status == 200:
-                    res_json = await resp.json()
-                    if res_json.get("status") == "success" and "data" in res_json:
-                        raw_candles = res_json.get("data", {}).get("candles", [])
-                        formatted_candles = [
-                            {
-                                "time": c[0],
-                                "open": float(c[1]),
-                                "high": float(c[2]),
-                                "low": float(c[3]),
-                                "close": float(c[4])
-                            }
-                            for c in raw_candles
-                        ]
-                        return web.json_response({"status": True, "message": "SUCCESS", "data": formatted_candles})
+            # 1️⃣ INTRA-DAY CANDLES (Fetch today's candles up to current minute)
+            intraday_url = f"https://api.upstox.com/v2/historical-candle/intraday/{instrument_key}/{unit}"
+            async with session.get(intraday_url, headers=headers) as resp_intra:
+                if resp_intra.status == 200:
+                    res_intra = await resp_intra.json()
+                    if res_intra.get("status") == "success":
+                        intra_candles = res_intra.get("data", {}).get("candles", [])
+                        all_raw_candles.extend(intra_candles)
 
-                err_txt = await resp.text()
-                logger.error(f"Upstox Historical HTTP {resp.status}: {err_txt}")
+            # 2️⃣ HISTORICAL CANDLES (Fetch past 7 days closed candles)
+            hist_url = f"https://api.upstox.com/v2/historical-candle/{instrument_key}/{unit}/{to_date}/{from_date}"
+            async with session.get(hist_url, headers=headers) as resp_hist:
+                if resp_hist.status == 200:
+                    res_hist = await resp_hist.json()
+                    if res_hist.get("status") == "success":
+                        hist_candles = res_hist.get("data", {}).get("candles", [])
+                        all_raw_candles.extend(hist_candles)
+
+        if all_raw_candles:
+            # Deduplicate by Timestamp & Sort Chronologically (Oldest to Newest)
+            seen_times = set()
+            unique_candles = []
+
+            for c in all_raw_candles:
+                timestamp = c[0]
+                if timestamp not in seen_times:
+                    seen_times.add(timestamp)
+                    unique_candles.append(c)
+
+            # Upstox returns newest first, so we sort ascending by time
+            unique_candles.sort(key=lambda x: x[0])
+
+            formatted_candles = [
+                {
+                    "time": c[0],
+                    "open": float(c[1]),
+                    "high": float(c[2]),
+                    "low": float(c[3]),
+                    "close": float(c[4])
+                }
+                for c in unique_candles
+            ]
+
+            return web.json_response({"status": True, "message": "SUCCESS", "data": formatted_candles})
 
         return web.json_response({"status": False, "message": "Historical data unavailable", "data": []})
 
