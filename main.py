@@ -67,7 +67,7 @@ async def broadcast_tick(token: str, price: float):
         LTP_CACHE["SENSEX"] = price_str
         await sio.emit("live_data", {"instrument_key": "SENSEX", "ltp": price_str})
 
-# --- 🔄 FAST LTP POLLING ENGINE (Reliable & Bypass Protobuf Parsing) ---
+# --- 🔄 FAST LTP POLLING ENGINE ---
 async def start_upstox_ltp_poller():
     logger.info("⚡ Upstox Live LTP Fast Poller Started!")
     headers = {
@@ -96,7 +96,6 @@ async def start_upstox_ltp_poller():
                                 last_price = float(detail.get("last_price", 0.0))
                                 if last_price > 0:
                                     await broadcast_tick(inst_key, last_price)
-                                    # Handle colon to pipe mismatch format from Upstox API
                                     if ":" in key_alias:
                                         pipe_key = key_alias.replace(":", "|")
                                         await broadcast_tick(pipe_key, last_price)
@@ -158,8 +157,12 @@ async def home_route(request: web.Request):
 async def fetch_chart_data(request: web.Request):
     try:
         d = await request.json()
-        instrument_key = str(d.get('token', '') or d.get('instrument_key', '')).strip()
-        raw_interval = str(d.get('interval', "5minute")).strip()
+        
+        # 🔍 Read token/instrument_key flexibly
+        instrument_key = str(d.get('token', '') or d.get('instrument_key', '') or d.get('symbol', '')).strip()
+        
+        # 🔍 Read interval/timeframe/resolution flexibly
+        raw_interval = str(d.get('interval', '') or d.get('timeframe', '') or d.get('resolution', '') or '5minute').strip()
 
         if not instrument_key:
             return web.json_response({"status": False, "message": "Missing instrument_key"}, status=400)
@@ -167,24 +170,23 @@ async def fetch_chart_data(request: web.Request):
         # Pipe formatting for Upstox Key
         instrument_key = instrument_key.replace(":", "|")
 
-        # ✅ Correct Interval Mapping for Upstox V2 Standard
+        # Map to valid Upstox V2 Supported Candle Units
         INTERVAL_MAP = {
-            "1MINUTE": "1minute", "ONE_MINUTE": "1minute", "1M": "1minute", "1minute": "1minute",
-            "3MINUTE": "3minute", "THREE_MINUTE": "3minute", "3M": "3minute", "3minute": "3minute",
-            "5MINUTE": "5minute", "FIVE_MINUTE": "5minute", "5M": "5minute", "5minute": "5minute",
-            "10MINUTE": "10minute", "TEN_MINUTE": "10minute", "10M": "10minute", "10minute": "10minute",
-            "15MINUTE": "15minute", "FIFTEEN_MINUTE": "15minute", "15M": "15minute", "15minute": "15minute",
-            "30MINUTE": "30minute", "THIRTY_MINUTE": "30minute", "30M": "30minute", "30minute": "30minute",
-            "60MINUTE": "60minute", "SIXTY_MINUTE": "60minute", "1HOUR": "60minute", "60M": "60minute", "60minute": "60minute", "1H": "60minute",
-            "DAY": "day", "ONE_DAY": "day", "1D": "day", "day": "day",
-            "WEEK": "week", "1W": "week", "week": "week",
-            "MONTH": "month", "1MON": "month", "month": "month"
+            "1": "1minute", "1M": "1minute", "1MIN": "1minute", "1MINUTE": "1minute",
+            "3": "3minute", "3M": "3minute", "3MIN": "3minute", "3MINUTE": "3minute",
+            "5": "5minute", "5M": "5minute", "5MIN": "5minute", "5MINUTE": "5minute",
+            "10": "5minute", "10M": "5minute", "10MIN": "5minute", "10MINUTE": "5minute",
+            "15": "15minute", "15M": "15minute", "15MIN": "15minute", "15MINUTE": "15minute",
+            "30": "30minute", "30M": "30minute", "30MIN": "30minute", "30MINUTE": "30minute",
+            "60": "30minute", "60M": "30minute", "1H": "30minute", "1HOUR": "30minute", "60MINUTE": "30minute",
+            "D": "day", "1D": "day", "DAY": "day", "ONEDAY": "day"
         }
 
-        unit = INTERVAL_MAP.get(raw_interval.upper(), "1minute")
+        unit = INTERVAL_MAP.get(raw_interval.upper(), "5minute")
 
-        to_date = datetime.datetime.now(IST).strftime("%Y-%m-%d")
-        from_date = (datetime.datetime.now(IST) - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
+        now_ist = datetime.datetime.now(IST)
+        to_date = now_ist.strftime("%Y-%m-%d")
+        from_date = (now_ist - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
 
         headers = {
             'Accept': 'application/json',
@@ -194,7 +196,7 @@ async def fetch_chart_data(request: web.Request):
         all_raw_candles = []
 
         async with aiohttp.ClientSession() as session:
-            # 1️⃣ INTRA-DAY CANDLES (Fetch today's live candles till current minute)
+            # 1️⃣ FETCH INTRADAY CANDLES (Today's live candles)
             intraday_url = f"https://api.upstox.com/v2/historical-candle/intraday/{instrument_key}/{unit}"
             async with session.get(intraday_url, headers=headers) as resp_intra:
                 if resp_intra.status == 200:
@@ -203,7 +205,7 @@ async def fetch_chart_data(request: web.Request):
                         intra_candles = res_intra.get("data", {}).get("candles", [])
                         all_raw_candles.extend(intra_candles)
 
-            # 2️⃣ HISTORICAL CANDLES (Fetch past 7 days closed candles)
+            # 2️⃣ FETCH HISTORICAL CANDLES (Past days)
             hist_url = f"https://api.upstox.com/v2/historical-candle/{instrument_key}/{unit}/{to_date}/{from_date}"
             async with session.get(hist_url, headers=headers) as resp_hist:
                 if resp_hist.status == 200:
@@ -213,29 +215,21 @@ async def fetch_chart_data(request: web.Request):
                         all_raw_candles.extend(hist_candles)
 
         if all_raw_candles:
-            # Deduplicate by Timestamp & Sort Chronologically (Oldest to Newest)
-            seen_times = set()
-            unique_candles = []
-
+            # Unique mapping by Timestamp
+            candle_dict = {}
             for c in all_raw_candles:
-                timestamp = c[0]
-                if timestamp not in seen_times:
-                    seen_times.add(timestamp)
-                    unique_candles.append(c)
+                t_str = c[0]
+                if t_str not in candle_dict:
+                    candle_dict[t_str] = {
+                        "time": t_str,
+                        "open": float(c[1]),
+                        "high": float(c[2]),
+                        "low": float(c[3]),
+                        "close": float(c[4])
+                    }
 
-            # Upstox returns newest first, so we sort ascending by time
-            unique_candles.sort(key=lambda x: x[0])
-
-            formatted_candles = [
-                {
-                    "time": c[0],
-                    "open": float(c[1]),
-                    "high": float(c[2]),
-                    "low": float(c[3]),
-                    "close": float(c[4])
-                }
-                for c in unique_candles
-            ]
+            # Sort chronologically by ISO String time
+            formatted_candles = sorted(candle_dict.values(), key=lambda x: x["time"])
 
             return web.json_response({"status": True, "message": "SUCCESS", "data": formatted_candles})
 
