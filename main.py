@@ -30,7 +30,10 @@ SUBSCRIBED_TOKENS = set(["NSE_INDEX|Nifty 50", "BSE_INDEX|SENSEX"])
 PENDING_TOKENS_QUEUE = set()
 upstox_ws_app = None
 main_loop = None
-is_ws_connected = False  # 🟢 Connection status flag
+is_ws_connected = False
+
+# Thread lock for safe queue handling
+queue_lock = threading.Lock()
 
 # Socket.IO & Aiohttp Setup
 sio = socketio.AsyncServer(async_mode='aiohttp', cors_allowed_origins='*')
@@ -55,16 +58,18 @@ async def broadcast_tick(token: str, price: float):
         LTP_CACHE["SENSEX"] = price_str
         await sio.emit("live_data", {"instrument_key": "SENSEX", "ltp": price_str})
 
-# --- 🛡️ BATCHED SUBSCRIPTION SENDER (Safe Check) ---
+# --- 🛡️ SLOWED & THROTTLE-PROTECTED BATCH SENDER ---
 def process_pending_subscriptions():
     global upstox_ws_app, is_ws_connected
     while True:
-        time.sleep(3.0)
+        # Increased sleep to 10 seconds to completely avoid Upstox 429 Rate Limits
+        time.sleep(10.0) 
         if PENDING_TOKENS_QUEUE and upstox_ws_app and is_ws_connected:
-            try:
+            with queue_lock:
                 tokens_to_send = list(PENDING_TOKENS_QUEUE)
                 PENDING_TOKENS_QUEUE.clear()
-                
+            
+            try:
                 sub_msg = {
                     "guid": f"batch_sub_{int(time.time())}",
                     "method": "sub",
@@ -74,7 +79,7 @@ def process_pending_subscriptions():
                     }
                 }
                 upstox_ws_app.send(json.dumps(sub_msg))
-                logger.info(f"🚀 Sent New Batch Subscription for {len(tokens_to_send)} tokens to Upstox WS.")
+                logger.info(f"🚀 Successfully Sent Batch Subscription for {len(tokens_to_send)} tokens.")
             except Exception as e:
                 logger.error(f"❌ Batch Subscription Error: {e}")
 
@@ -182,14 +187,15 @@ async def subscribe_request(sid, data):
             if token:
                 if token not in SUBSCRIBED_TOKENS:
                     SUBSCRIBED_TOKENS.add(token)
-                    PENDING_TOKENS_QUEUE.add(token)
+                    with queue_lock:
+                        PENDING_TOKENS_QUEUE.add(token)
                     new_tokens_added += 1
                 
                 cached_price = LTP_CACHE.get(token, "0.00")
                 await sio.emit("live_data", {"instrument_key": token, "ltp": cached_price}, room=sid)
                 
         if new_tokens_added > 0:
-            logger.info(f"📥 Added {new_tokens_added} brand new tokens. Total Unique Subscribed: {len(SUBSCRIBED_TOKENS)}")
+            logger.info(f"📥 Added {new_tokens_added} new tokens to queue.")
     except Exception as e:
         logger.error(f"❌ Error in subscribe_request: {e}")
 
@@ -202,7 +208,7 @@ async def home_route(request: web.Request):
     return web.json_response({
         "status": True,
         "message": "MUNH Titan Backend Service is Live & Running!",
-        "version": "1.0.1"
+        "version": "1.0.2"
     })
 
 app.router.add_get('/', home_route)
