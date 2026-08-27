@@ -188,27 +188,21 @@ async def fetch_chart_data(request: web.Request):
         # Pipe formatting for Upstox Key
         instrument_key = instrument_key.replace(":", "|")
 
-        # --- 🛠️ UPDATED INTERVAL LOGIC ---
-        if raw_interval in ["DAY", "ONE_DAY", "1D"]:
-            unit = "day"
-        elif raw_interval in ["WEEK", "1W", "1WEEK"]:
-            unit = "week"
-        elif raw_interval in ["MONTH", "1MON", "1MONTH"]:
-            unit = "month"
-        else:
-            # Fetch 1-min for all intraday and resample locally for accuracy
-            unit = "1minute" 
-
-        # Target minutes mapping for local backend resampling
-        MINUTES_MAP = {
-            "3MINUTE": 3, "THREE_MINUTE": 3, "3M": 3, "3minute": 3,
-            "5MINUTE": 5, "FIVE_MINUTE": 5, "5M": 5, "5minute": 5,
-            "10MINUTE": 10, "TEN_MINUTE": 10, "10M": 10, "10minute": 10,
-            "15MINUTE": 15, "FIFTEEN_MINUTE": 15, "15M": 15, "15minute": 15,
-            "30MINUTE": 30, "THIRTY_MINUTE": 30, "30M": 30, "30minute": 30,
-            "60MINUTE": 60, "SIXTY_MINUTE": 60, "1HOUR": 60, "1H": 60, "60M": 60, "60minute": 60
+        # --- 🛠️ 60-DAY MULTI-TIMEFRAME INTERVAL MAPPING ---
+        INTERVAL_API_MAP = {
+            "1MINUTE": "1minute", "1M": "1minute", "1minute": "1minute",
+            "3MINUTE": "3minute", "3M": "3minute", "3minute": "3minute",
+            "5MINUTE": "5minute", "5M": "5minute", "5minute": "5minute",
+            "10MINUTE": "10minute", "10M": "10minute", "10minute": "10minute",
+            "15MINUTE": "15minute", "15M": "15minute", "15minute": "15minute",
+            "30MINUTE": "30minute", "30M": "30minute", "30minute": "30minute",
+            "60MINUTE": "60minute", "1HOUR": "60minute", "1H": "60minute", "60M": "60minute", "60minute": "60minute",
+            "DAY": "day", "ONE_DAY": "day", "1D": "day",
+            "WEEK": "week", "1W": "week", "1WEEK": "week",
+            "MONTH": "month", "1MON": "month", "1MONTH": "month"
         }
-        target_minutes = MINUTES_MAP.get(raw_interval, 1)
+        
+        unit = INTERVAL_API_MAP.get(raw_interval, "5minute")
 
         to_date = datetime.datetime.now(IST).strftime("%Y-%m-%d")
         from_date = (datetime.datetime.now(IST) - datetime.timedelta(days=60)).strftime("%Y-%m-%d")
@@ -221,7 +215,7 @@ async def fetch_chart_data(request: web.Request):
         all_raw_candles = []
 
         async with aiohttp.ClientSession() as session:
-            # 1️⃣ INTRA-DAY CANDLES (Fetch today's candles up to current minute)
+            # 1️⃣ INTRA-DAY CANDLES (Fetch today's candles)
             intraday_url = f"https://api.upstox.com/v2/historical-candle/intraday/{instrument_key}/{unit}"
             async with session.get(intraday_url, headers=headers) as resp_intra:
                 if resp_intra.status == 200:
@@ -230,7 +224,7 @@ async def fetch_chart_data(request: web.Request):
                         intra_candles = res_intra.get("data", {}).get("candles", [])
                         all_raw_candles.extend(intra_candles)
 
-            # 2️⃣ HISTORICAL CANDLES (Fetch past 7 days closed candles)
+            # 2️⃣ HISTORICAL CANDLES (Fetch past 60 days closed candles)
             hist_url = f"https://api.upstox.com/v2/historical-candle/{instrument_key}/{unit}/{to_date}/{from_date}"
             async with session.get(hist_url, headers=headers) as resp_hist:
                 if resp_hist.status == 200:
@@ -252,65 +246,6 @@ async def fetch_chart_data(request: web.Request):
 
             # Upstox returns newest first, so we sort ascending by time
             unique_candles.sort(key=lambda x: x[0])
-
-            # --- 🛠️ FIX: RESAMPLE CANDLES FOR HIGHER TIMEFRAMES ---
-            if unit == "1minute" and target_minutes > 1:
-                resampled = []
-                current_agg = None
-                
-                for c in unique_candles:
-                    t_str = c[0]
-                    try:
-                        dt = datetime.datetime.fromisoformat(t_str)
-                    except ValueError:
-                        try:
-                            # Fallback parsing if fromisoformat fails
-                            dt = datetime.datetime.strptime(t_str[:19], "%Y-%m-%dT%H:%M:%S")
-                        except ValueError:
-                            resampled.append(c)
-                            continue
-                    
-                    # Calculate minutes elapsed since market open (09:15 AM)
-                    mins_from_open = (dt.hour * 60 + dt.minute) - (9 * 60 + 15)
-                    if mins_from_open < 0:
-                        mins_from_open = 0 # Handle pre-market data safely
-                        
-                    block_idx = mins_from_open // target_minutes
-                    block_key = (dt.date(), block_idx)
-                    
-                    # Grouping Logic
-                    if current_agg is None or current_agg['key'] != block_key:
-                        if current_agg is not None:
-                            resampled.append([
-                                current_agg['time'],
-                                current_agg['open'],
-                                current_agg['high'],
-                                current_agg['low'],
-                                current_agg['close']
-                            ])
-                        current_agg = {
-                            'key': block_key,
-                            'time': t_str,
-                            'open': float(c[1]),
-                            'high': float(c[2]),
-                            'low': float(c[3]),
-                            'close': float(c[4])
-                        }
-                    else:
-                        current_agg['high'] = max(current_agg['high'], float(c[2]))
-                        current_agg['low'] = min(current_agg['low'], float(c[3]))
-                        current_agg['close'] = float(c[4])
-                
-                if current_agg is not None:
-                    resampled.append([
-                        current_agg['time'],
-                        current_agg['open'],
-                        current_agg['high'],
-                        current_agg['low'],
-                        current_agg['close']
-                    ])
-                
-                unique_candles = resampled
 
             formatted_candles = [
                 {
