@@ -75,7 +75,6 @@ async def start_upstox_ltp_poller():
         'Authorization': f'Bearer {ACCESS_TOKEN}'
     }
 
-    # Upstox Rate Limit Controller (Max 5 concurrent API hits to prevent 429)
     concurrency_limiter = asyncio.Semaphore(5)
 
     async def fetch_chunk(session, chunk_tokens):
@@ -114,20 +113,17 @@ async def start_upstox_ltp_poller():
                 if not current_subs:
                     current_subs = ["NSE_INDEX|Nifty 50", "BSE_INDEX|SENSEX"]
 
-                # 1️⃣ CREATE BATCHES (Chunks of 50 tokens max to avoid URL Length limits)
                 CHUNK_SIZE = 50 
                 chunks = [current_subs[i:i + CHUNK_SIZE] for i in range(0, len(current_subs), CHUNK_SIZE)]
 
-                # 2️⃣ FIRE BATCHES ASYNCHRONOUSLY
                 tasks = [fetch_chunk(session, chunk) for chunk in chunks]
                 await asyncio.gather(*tasks)
 
             except Exception as e:
                 logger.error(f"❌ Error in Upstox Master Poller: {e}")
 
-            # 3️⃣ TIME CALCULATION: Maintain strictly 1-second interval loop
             elapsed = time.time() - start_time
-            sleep_time = max(1.0 - elapsed, 0.1) # Minimum 0.1s sleep to prevent server CPU choke
+            sleep_time = max(1.0 - elapsed, 0.1)
             await asyncio.sleep(sleep_time)
 
 # --- 🌐 SOCKET.IO HANDLERS ---
@@ -188,16 +184,16 @@ async def fetch_chart_data(request: web.Request):
         # Pipe formatting for Upstox Key
         instrument_key = instrument_key.replace(":", "|")
 
-        # --- 🛠️ 60-DAY MULTI-TIMEFRAME INTERVAL MAPPING ---
+        # --- 🛠️ ROBUST MULTI-TIMEFRAME INTERVAL MAPPING (Supports Android ONE_MINUTE, FIVE_MINUTE etc.) ---
         INTERVAL_API_MAP = {
-            "1MINUTE": "1minute", "1M": "1minute", "1minute": "1minute",
-            "3MINUTE": "3minute", "3M": "3minute", "3minute": "3minute",
-            "5MINUTE": "5minute", "5M": "5minute", "5minute": "5minute",
-            "10MINUTE": "10minute", "10M": "10minute", "10minute": "10minute",
-            "15MINUTE": "15minute", "15M": "15minute", "15minute": "15minute",
-            "30MINUTE": "30minute", "30M": "30minute", "30minute": "30minute",
-            "60MINUTE": "60minute", "1HOUR": "60minute", "1H": "60minute", "60M": "60minute", "60minute": "60minute",
-            "DAY": "day", "ONE_DAY": "day", "1D": "day",
+            "ONE_MINUTE": "1minute", "1MINUTE": "1minute", "1M": "1minute", "1minute": "1minute",
+            "THREE_MINUTE": "3minute", "3MINUTE": "3minute", "3M": "3minute", "3minute": "3minute",
+            "FIVE_MINUTE": "5minute", "5MINUTE": "5minute", "5M": "5minute", "5minute": "5minute",
+            "TEN_MINUTE": "10minute", "10MINUTE": "10minute", "10M": "10minute", "10minute": "10minute",
+            "FIFTEEN_MINUTE": "15minute", "15MINUTE": "15minute", "15M": "15minute", "15minute": "15minute",
+            "THIRTY_MINUTE": "30minute", "30MINUTE": "30minute", "30M": "30minute", "30minute": "30minute",
+            "ONE_HOUR": "60minute", "60MINUTE": "60minute", "1H": "60minute", "60M": "60minute", "60minute": "60minute",
+            "ONE_DAY": "day", "DAY": "day", "1D": "day",
             "WEEK": "week", "1W": "week", "1WEEK": "week",
             "MONTH": "month", "1MON": "month", "1MONTH": "month"
         }
@@ -244,7 +240,6 @@ async def fetch_chart_data(request: web.Request):
                     seen_times.add(timestamp)
                     unique_candles.append(c)
 
-            # Upstox returns newest first, so we sort ascending by time
             unique_candles.sort(key=lambda x: x[0])
 
             formatted_candles = [
