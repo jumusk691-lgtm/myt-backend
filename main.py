@@ -211,7 +211,7 @@ async def fetch_chart_data(request: web.Request):
         target_minutes = MINUTES_MAP.get(raw_interval, 1)
 
         to_date = datetime.datetime.now(IST).strftime("%Y-%m-%d")
-        from_date = (datetime.datetime.now(IST) - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
+        from_date = (datetime.datetime.now(IST) - datetime.timedelta(days=60)).strftime("%Y-%m-%d")
 
         headers = {
             'Accept': 'application/json',
