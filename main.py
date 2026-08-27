@@ -67,7 +67,7 @@ async def broadcast_tick(token: str, price: float):
         LTP_CACHE["SENSEX"] = price_str
         await sio.emit("live_data", {"instrument_key": "SENSEX", "ltp": price_str})
 
-# --- 🔄 FAST LTP POLLING ENGINE (ORIGINAL BATCHING MODE) ---
+# --- 🔄 FAST LTP POLLING ENGINE (ADVANCED BATCHING MODE) ---
 async def start_upstox_ltp_poller():
     logger.info("⚡ Upstox Live LTP Fast Poller (BATCHING MODE) Started!")
     headers = {
@@ -75,6 +75,7 @@ async def start_upstox_ltp_poller():
         'Authorization': f'Bearer {ACCESS_TOKEN}'
     }
 
+    # Upstox Rate Limit Controller (Max 5 concurrent API hits to prevent 429)
     concurrency_limiter = asyncio.Semaphore(5)
 
     async def fetch_chunk(session, chunk_tokens):
@@ -113,17 +114,20 @@ async def start_upstox_ltp_poller():
                 if not current_subs:
                     current_subs = ["NSE_INDEX|Nifty 50", "BSE_INDEX|SENSEX"]
 
+                # 1️⃣ CREATE BATCHES (Chunks of 50 tokens max to avoid URL Length limits)
                 CHUNK_SIZE = 50 
                 chunks = [current_subs[i:i + CHUNK_SIZE] for i in range(0, len(current_subs), CHUNK_SIZE)]
 
+                # 2️⃣ FIRE BATCHES ASYNCHRONOUSLY
                 tasks = [fetch_chunk(session, chunk) for chunk in chunks]
                 await asyncio.gather(*tasks)
 
             except Exception as e:
                 logger.error(f"❌ Error in Upstox Master Poller: {e}")
 
+            # 3️⃣ TIME CALCULATION: Maintain strictly 1-second interval loop
             elapsed = time.time() - start_time
-            sleep_time = max(1.0 - elapsed, 0.1)
+            sleep_time = max(1.0 - elapsed, 0.1) # Minimum 0.1s sleep to prevent server CPU choke
             await asyncio.sleep(sleep_time)
 
 # --- 🌐 SOCKET.IO HANDLERS ---
@@ -181,9 +185,10 @@ async def fetch_chart_data(request: web.Request):
         if not instrument_key:
             return web.json_response({"status": False, "message": "Missing instrument_key"}, status=400)
 
+        # Pipe formatting for Upstox Key
         instrument_key = instrument_key.replace(":", "|")
 
-        # Interval mapping to handle Android timeframe changes correctly
+        # --- 🛠️ COMPREHENSIVE INTERVAL MAPPING ---
         INTERVAL_API_MAP = {
             "ONE_MINUTE": "1minute", "1MINUTE": "1minute", "1M": "1minute", "1minute": "1minute",
             "THREE_MINUTE": "3minute", "3MINUTE": "3minute", "3M": "3minute", "3minute": "3minute",
@@ -192,6 +197,7 @@ async def fetch_chart_data(request: web.Request):
             "FIFTEEN_MINUTE": "15minute", "15MINUTE": "15minute", "15M": "15minute", "15minute": "15minute",
             "THIRTY_MINUTE": "30minute", "30MINUTE": "30minute", "30M": "30minute", "30minute": "30minute",
             "ONE_HOUR": "60minute", "60MINUTE": "60minute", "1H": "60minute", "60M": "60minute", "60minute": "60minute",
+            "SIXTY_MINUTE": "60minute", "1HOUR": "60minute",
             "ONE_DAY": "day", "DAY": "day", "1D": "day",
             "WEEK": "week", "1W": "week", "1WEEK": "week",
             "MONTH": "month", "1MON": "month", "1MONTH": "month"
@@ -210,6 +216,7 @@ async def fetch_chart_data(request: web.Request):
         all_raw_candles = []
 
         async with aiohttp.ClientSession() as session:
+            # 1️⃣ INTRA-DAY CANDLES (Fetch today's candles up to current minute)
             intraday_url = f"https://api.upstox.com/v2/historical-candle/intraday/{instrument_key}/{unit}"
             async with session.get(intraday_url, headers=headers) as resp_intra:
                 if resp_intra.status == 200:
@@ -218,6 +225,7 @@ async def fetch_chart_data(request: web.Request):
                         intra_candles = res_intra.get("data", {}).get("candles", [])
                         all_raw_candles.extend(intra_candles)
 
+            # 2️⃣ HISTORICAL CANDLES (Fetch past 60 days closed candles)
             hist_url = f"https://api.upstox.com/v2/historical-candle/{instrument_key}/{unit}/{to_date}/{from_date}"
             async with session.get(hist_url, headers=headers) as resp_hist:
                 if resp_hist.status == 200:
@@ -227,6 +235,7 @@ async def fetch_chart_data(request: web.Request):
                         all_raw_candles.extend(hist_candles)
 
         if all_raw_candles:
+            # Deduplicate by Timestamp & Sort Chronologically (Oldest to Newest)
             seen_times = set()
             unique_candles = []
 
@@ -236,6 +245,7 @@ async def fetch_chart_data(request: web.Request):
                     seen_times.add(timestamp)
                     unique_candles.append(c)
 
+            # Upstox returns newest first, so we sort ascending by time
             unique_candles.sort(key=lambda x: x[0])
 
             formatted_candles = [
