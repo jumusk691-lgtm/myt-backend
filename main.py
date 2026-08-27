@@ -8,6 +8,9 @@ import threading
 import pytz
 import socketio
 import aiohttp
+import ssl
+import websocket
+import requests
 from aiohttp import web
 
 # --- Upstox Official SDK ---
@@ -43,7 +46,7 @@ configuration.access_token = ACCESS_TOKEN
 # --- 🚀 GLOBAL STATES & SCORE TRACKING ---
 LTP_CACHE = {}               
 SUBSCRIBED_TOKENS = set(["NSE_INDEX|Nifty 50", "BSE_INDEX|SENSEX"])
-upstox_ws_client = None
+upstox_ws_app = None
 
 # Socket.IO & Aiohttp Setup
 sio = socketio.AsyncServer(async_mode='aiohttp', cors_allowed_origins='*')
@@ -72,41 +75,57 @@ async def broadcast_tick(token: str, price: float):
 # --- 🌐 UPSTOX WEBSOCKET STREAM CONNECTOR ---
 def start_upstox_websocket():
     try:
-        import upstox_client
-        from upstox_client.feeder import UpstoxFeeder
-
-        def on_open():
+        def on_open(ws):
             logger.info("✅ Upstox Market Feed WebSocket Connected Successfully!")
             if SUBSCRIBED_TOKENS:
-                upstox_ws_client.subscribe(list(SUBSCRIBED_TOKENS), mode="full")
+                sub_msg = {
+                    "guid": "some_guid",
+                    "method": "sub",
+                    "data": {
+                        "mode": "full",
+                        "instrumentKeys": list(SUBSCRIBED_TOKENS)
+                    }
+                }
+                ws.send(json.dumps(sub_msg))
 
-        def on_message(message):
+        def on_message(ws, message):
             try:
-                # Parse incoming market feed message
-                if isinstance(message, dict):
-                    feeds = message.get("feeds", {})
+                # Agar message text/json format me aaye toh parse karein
+                if isinstance(message, str):
+                    data_dict = json.loads(message)
+                    feeds = data_dict.get("feeds", {})
                     for instrument_key, data in feeds.items():
                         ltp = data.get("ff", {}).get("marketFF", {}).get("ltp")
-                        if ltp:
+                        if ltp and main_loop:
                             asyncio.run_coroutine_threadsafe(broadcast_tick(instrument_key, float(ltp)), main_loop)
             except Exception as e:
                 logger.error(f"❌ WS Message Parse Error: {e}")
 
-        def on_error(error):
+        def on_error(ws, error):
             logger.error(f"❌ Upstox WS Error: {error}")
 
-        def on_close(code, reason):
+        def on_close(ws, code, reason):
             logger.warning(f"⚠️ Upstox WS Closed: {reason} (Code: {code})")
 
-        global upstox_ws_client
-        upstox_ws_client = UpstoxFeeder(
-            access_token=ACCESS_TOKEN,
-            on_open=on_open,
-            on_message=on_message,
-            on_error=on_error,
-            on_close=on_close
-        )
-        upstox_ws_client.connect()
+        # Upstox API se authorized WebSocket URI fetch karein
+        headers = {'Accept': 'application/json', 'Authorization': f'Bearer {ACCESS_TOKEN}'}
+        auth_resp = requests.get("https://api.upstox.com/v3/feed/market-data-feed/authorize", headers=headers)
+        
+        if auth_resp.status_code == 200:
+            socket_uri = auth_resp.json().get("data", {}).get("authorizedRedirectUri")
+            if socket_uri:
+                global upstox_ws_app
+                upstox_ws_app = websocket.WebSocketApp(
+                    socket_uri,
+                    on_open=on_open,
+                    on_message=on_message,
+                    on_error=on_error,
+                    on_close=on_close
+                )
+                upstox_ws_app.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE})
+        else:
+            logger.error(f"❌ Failed to authorize Upstox feed: {auth_resp.text}")
+
     except Exception as e:
         logger.error(f"❌ Failed to start Upstox WebSocket: {e}")
 
@@ -136,10 +155,18 @@ async def handle_subscription(sid, data):
                 new_tokens.append(token)
                 
         # Dynamically subscribe new tokens to Upstox WS if active
-        global upstox_ws_client
-        if upstox_ws_client and new_tokens:
+        global upstox_ws_app
+        if upstox_ws_app and new_tokens:
             try:
-                upstox_ws_client.subscribe(new_tokens, mode="full")
+                sub_msg = {
+                    "guid": "dynamic_sub",
+                    "method": "sub",
+                    "data": {
+                        "mode": "full",
+                        "instrumentKeys": new_tokens
+                    }
+                }
+                upstox_ws_app.send(json.dumps(sub_msg))
             except Exception:
                 pass
                 
