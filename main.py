@@ -30,6 +30,7 @@ SUBSCRIBED_TOKENS = set(["NSE_INDEX|Nifty 50", "BSE_INDEX|SENSEX"])
 PENDING_TOKENS_QUEUE = set()
 upstox_ws_app = None
 main_loop = None
+is_ws_connected = False  # 🟢 Connection status flag
 
 # Socket.IO & Aiohttp Setup
 sio = socketio.AsyncServer(async_mode='aiohttp', cors_allowed_origins='*')
@@ -46,7 +47,6 @@ async def broadcast_tick(token: str, price: float):
         "ltp": price_str
     }
     await sio.emit("live_data", payload)
-    logger.info(f"📡 Broadcasted Tick -> {token} : {price_str}")
 
     if token == "NSE_INDEX|Nifty 50":
         LTP_CACHE["NIFTY"] = price_str
@@ -55,12 +55,12 @@ async def broadcast_tick(token: str, price: float):
         LTP_CACHE["SENSEX"] = price_str
         await sio.emit("live_data", {"instrument_key": "SENSEX", "ltp": price_str})
 
-# --- 🛡️ BATCHED SUBSCRIPTION SENDER ---
+# --- 🛡️ BATCHED SUBSCRIPTION SENDER (Safe Check) ---
 def process_pending_subscriptions():
-    global upstox_ws_app
+    global upstox_ws_app, is_ws_connected
     while True:
         time.sleep(3.0)
-        if PENDING_TOKENS_QUEUE and upstox_ws_app:
+        if PENDING_TOKENS_QUEUE and upstox_ws_app and is_ws_connected:
             try:
                 tokens_to_send = list(PENDING_TOKENS_QUEUE)
                 PENDING_TOKENS_QUEUE.clear()
@@ -80,12 +80,15 @@ def process_pending_subscriptions():
 
 # --- 🌐 UPSTOX WEBSOCKET STREAM CONNECTOR ---
 def start_upstox_websocket():
+    global is_ws_connected
     try:
         import MarketDataFeedV3_pb2 as pb
     except ImportError:
         pb = None
 
     def on_open(ws):
+        global is_ws_connected
+        is_ws_connected = True
         logger.info("✅ Upstox Market Feed WebSocket Connected Successfully!")
         if SUBSCRIBED_TOKENS:
             try:
@@ -127,9 +130,13 @@ def start_upstox_websocket():
             logger.error(f"❌ WS Message Parse Error: {e}")
 
     def on_error(ws, error):
+        global is_ws_connected
+        is_ws_connected = False
         logger.error(f"❌ Upstox WS Error: {error}")
 
     def on_close(ws, code, reason):
+        global is_ws_connected
+        is_ws_connected = False
         logger.warning(f"⚠️ Upstox WS Closed: {reason} (Code: {code})")
 
     while True:
@@ -151,6 +158,7 @@ def start_upstox_websocket():
         except Exception as e:
             logger.error(f"❌ Upstox Connection Exception: {e}")
             
+        is_ws_connected = False
         time.sleep(30)
 
 # --- 🌐 SOCKET.IO CLIENT HANDLERS ---
@@ -175,7 +183,7 @@ async def subscribe_request(sid, data):
                 if token not in SUBSCRIBED_TOKENS:
                     SUBSCRIBED_TOKENS.add(token)
                     PENDING_TOKENS_QUEUE.add(token)
-                    new_tokens_added += 5
+                    new_tokens_added += 1
                 
                 cached_price = LTP_CACHE.get(token, "0.00")
                 await sio.emit("live_data", {"instrument_key": token, "ltp": cached_price}, room=sid)
@@ -194,7 +202,7 @@ async def home_route(request: web.Request):
     return web.json_response({
         "status": True,
         "message": "MUNH Titan Backend Service is Live & Running!",
-        "version": "1.0.0"
+        "version": "1.0.1"
     })
 
 app.router.add_get('/', home_route)
