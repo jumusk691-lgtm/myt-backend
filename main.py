@@ -59,7 +59,6 @@ async def broadcast_tick(token: str, price: float):
     }
     await sio.emit("live_data", payload)
 
-    # Standardize Index aliases for Android Client mapping
     if token == "NSE_INDEX|Nifty 50":
         LTP_CACHE["NIFTY"] = price_str
         await sio.emit("live_data", {"instrument_key": "NIFTY", "ltp": price_str})
@@ -67,9 +66,9 @@ async def broadcast_tick(token: str, price: float):
         LTP_CACHE["SENSEX"] = price_str
         await sio.emit("live_data", {"instrument_key": "SENSEX", "ltp": price_str})
 
-# --- 🔄 FAST LTP POLLING ENGINE (ADVANCED BATCHING MODE) ---
+# --- 🔄 FAST LTP POLLING ENGINE ---
 async def start_upstox_ltp_poller():
-    logger.info("⚡ Upstox Live LTP Fast Poller (BATCHING MODE) Started!")
+    logger.info("⚡ Upstox Live LTP Fast Poller Started!")
     headers = {
         'Accept': 'application/json',
         'Authorization': f'Bearer {ACCESS_TOKEN}'
@@ -97,11 +96,7 @@ async def start_upstox_ltp_poller():
                                         pipe_key = key_alias.replace(":", "|")
                                         await broadcast_tick(pipe_key, last_price)
                     elif resp.status == 429:
-                        logger.warning("⚠️ Upstox HTTP 429 in Batch! Throttling this chunk...")
                         await asyncio.sleep(3.0) 
-                    else:
-                        err_txt = await resp.text()
-                        logger.error(f"❌ Upstox Quote API HTTP {resp.status}: {err_txt}")
             except Exception as e:
                 logger.error(f"❌ Error in chunk fetch: {e}")
 
@@ -147,8 +142,6 @@ async def handle_subscription(sid, data):
                 
             if token:
                 SUBSCRIBED_TOKENS.add(token)
-                
-        logger.info(f"Subscribed Upstox Keys Count: {len(SUBSCRIBED_TOKENS)}")
     except Exception as e:
         logger.error(f"❌ Error in subscribe_tokens: {e}")
 
@@ -183,7 +176,6 @@ async def fetch_chart_data(request: web.Request):
 
         instrument_key = instrument_key.replace(":", "|")
 
-        # --- 🛠️ ORIGINAL INTERVAL & RESAMPLED LOGIC ---
         if raw_interval in ["DAY", "ONE_DAY", "1D"]:
             unit = "day"
         elif raw_interval in ["WEEK", "1W", "1WEEK"]:
@@ -191,7 +183,7 @@ async def fetch_chart_data(request: web.Request):
         elif raw_interval in ["MONTH", "1MON", "1MONTH"]:
             unit = "month"
         else:
-            unit = "1minute" 
+            unit = "minute"  # Upstox historical API expects 'minute' for intraday sub-intervals
 
         MINUTES_MAP = {
             "3MINUTE": 3, "THREE_MINUTE": 3, "3M": 3, "3minute": 3,
@@ -203,9 +195,6 @@ async def fetch_chart_data(request: web.Request):
         }
         target_minutes = MINUTES_MAP.get(raw_interval, 1)
 
-        to_date = datetime.datetime.now(IST).strftime("%Y-%m-%d")
-        from_date = (datetime.datetime.now(IST) - datetime.timedelta(days=70)).strftime("%Y-%m-%d")
-
         headers = {
             'Accept': 'application/json',
             'Authorization': f'Bearer {ACCESS_TOKEN}'
@@ -214,21 +203,40 @@ async def fetch_chart_data(request: web.Request):
         all_raw_candles = []
 
         async with aiohttp.ClientSession() as session:
-            intraday_url = f"https://api.upstox.com/v2/historical-candle/intraday/{instrument_key}/{unit}"
-            async with session.get(intraday_url, headers=headers) as resp_intra:
-                if resp_intra.status == 200:
-                    res_intra = await resp_intra.json()
-                    if res_intra.get("status") == "success":
-                        intra_candles = res_intra.get("data", {}).get("candles", [])
-                        all_raw_candles.extend(intra_candles)
-
-            hist_url = f"https://api.upstox.com/v2/historical-candle/{instrument_key}/{unit}/{to_date}/{from_date}"
-            async with session.get(hist_url, headers=headers) as resp_hist:
-                if resp_hist.status == 200:
-                    res_hist = await resp_hist.json()
-                    if res_hist.get("status") == "success":
-                        hist_candles = res_hist.get("data", {}).get("candles", [])
-                        all_raw_candles.extend(hist_candles)
+            if unit == "day" or unit == "week" or unit == "month":
+                # For higher timeframes, 60 days / 1 year query works directly
+                to_date = datetime.datetime.now(IST).strftime("%Y-%m-%d")
+                from_date = (datetime.datetime.now(IST) - datetime.timedelta(days=60)).strftime("%Y-%m-%d")
+                hist_url = f"https://api.upstox.com/v2/historical-candle/{instrument_key}/{unit}/{to_date}/{from_date}"
+                async with session.get(hist_url, headers=headers) as resp_hist:
+                    if resp_hist.status == 200:
+                        res_hist = await resp_hist.json()
+                        if res_hist.get("status") == "success":
+                            all_raw_candles.extend(res_hist.get("data", {}).get("candles", []))
+            else:
+                # --- 🛠️ 60-DAY MULTI-DAY CHUNK FETCHING FOR INTRADAY/MINUTE DATA ---
+                # Upstox needs historical-candle API with date ranges for 60 days minute data
+                end_date = datetime.datetime.now(IST)
+                start_date = end_date - datetime.timedelta(days=60)
+                
+                # Fetch in blocks of 7 days to prevent Upstox API timeouts/rejections
+                current_chunk_end = end_date
+                while current_chunk_end > start_date:
+                    current_chunk_start = max(start_date, current_chunk_end - datetime.timedelta(days=7))
+                    
+                    t_str = current_chunk_end.strftime("%Y-%m-%d")
+                    f_str = current_chunk_start.strftime("%Y-%m-%d")
+                    
+                    hist_url = f"https://api.upstox.com/v2/historical-candle/{instrument_key}/1minute/{t_str}/{f_str}"
+                    async with session.get(hist_url, headers=headers) as resp_chunk:
+                        if resp_chunk.status == 200:
+                            res_chunk = await resp_chunk.json()
+                            if res_chunk.get("status") == "success":
+                                chunk_candles = res_chunk.get("data", {}).get("candles", [])
+                                all_raw_candles.extend(chunk_candles)
+                    
+                    current_chunk_end = current_chunk_start - datetime.timedelta(days=1)
+                    await asyncio.sleep(0.05) # Prevent hammering API limits
 
         if all_raw_candles:
             seen_times = set()
@@ -242,8 +250,8 @@ async def fetch_chart_data(request: web.Request):
 
             unique_candles.sort(key=lambda x: x[0])
 
-            # --- 🛠️ RESTORED RESAMPLE LOGIC FOR MULTI-CANDLE VIEW ---
-            if unit == "1minute" and target_minutes > 1:
+            # --- 🛠️ RESAMPLE LOGIC FOR CUSTOM MINUTES (3M, 5M, 15M, etc.) ---
+            if unit == "minute" and target_minutes > 1:
                 resampled = []
                 current_agg = None
                 
@@ -258,6 +266,7 @@ async def fetch_chart_data(request: web.Request):
                             resampled.append(c)
                             continue
                     
+                    # Group by trading session interval blocks
                     mins_from_open = (dt.hour * 60 + dt.minute) - (9 * 60 + 15)
                     if mins_from_open < 0:
                         mins_from_open = 0
@@ -323,7 +332,7 @@ app.router.add_post('/api/get_chart_data', fetch_chart_data)
 # --- 🔄 BACKGROUND TASKS ---
 async def start_background_tasks(app):
     asyncio.create_task(start_upstox_ltp_poller())
-    logger.info("✅ Upstox Backend Service Initialized with BATCHING Poller Engine.")
+    logger.info("✅ Upstox Backend Service Initialized with 60-Day Chunk Engine.")
 
 app.on_startup.append(start_background_tasks)
 
