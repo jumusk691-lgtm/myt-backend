@@ -4,43 +4,52 @@ import logging
 import time
 import datetime
 import os
-import threading
 import pytz
 import socketio
 import aiohttp
-import ssl
-import websocket
-import requests
 from aiohttp import web
+
+# --- Upstox Official SDK ---
+import upstox_client
+from upstox_client.rest import ApiException
+import UpstoxClient as UpstoxWebsocket  # Official Upstox WebSocket module
 
 # --- 🕒 TIMEZONE & LOGGING SETUP ---
 IST = pytz.timezone('Asia/Kolkata')
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("MUNH_TITAN_BACKEND")
+logger = logging.getLogger("MUNH_TITAN_PROD_UPSTOX")
+
+# --- ⚙️ INTERNAL APP STATE ENGINE ---
+class AppState:
+    def __init__(self):
+        self.api_instance = None
+        self.score = 0
+
+state = AppState()
 
 # --- 🔑 UPSTOX CREDENTIALS ---
 API_KEY = "eba0a80f-c907-42fa-a926-6672a120254d"
 API_SECRET = os.getenv("UPSTOX_API_SECRET", "cg0pdqyg8t")
+
+# 1-YEAR ANALYTICS ACCESS TOKEN
 NEW_ANALYTICS_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI2MkFIN0siLCJqdGkiOiI2YTdhMTJlZjk1YjgyYzEzZjc5OWEyMmIiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlzRXh0ZW5kZWQiOnRydWUsImlhdCI6MTc4NjM4NTEzNSwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxODE3OTM1MjAwfQ.0z7HMMUZUwJ6mRkzY3EUE1bB36_i1c7M-6yiNc8clgs"
+
 ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", NEW_ANALYTICS_TOKEN).strip()
 
-# --- 🚀 GLOBAL STATES & TRACKING ---
-LTP_CACHE = {}               
-SUBSCRIBED_TOKENS = set(["NSE_INDEX|Nifty 50", "BSE_INDEX|SENSEX"])
-PENDING_TOKENS_QUEUE = set()
-upstox_ws_app = None
-main_loop = None
-is_ws_connected = False
+configuration = upstox_client.Configuration()
+configuration.access_token = ACCESS_TOKEN
 
-# Thread lock for safe queue handling
-queue_lock = threading.Lock()
+# --- 🚀 GLOBAL STATES & SCORE TRACKING ---
+LTP_CACHE = {}                 
+SUBSCRIBED_TOKENS = set(["NSE_INDEX|Nifty 50", "BSE_INDEX|SENSEX"])
 
 # Socket.IO & Aiohttp Setup
 sio = socketio.AsyncServer(async_mode='aiohttp', cors_allowed_origins='*')
 app = web.Application()
 sio.attach(app)
 
-# --- 📡 BROADCAST TICK TO ANDROID CLIENTS ---
+# Helper function to broadcast live price tick to clients
 async def broadcast_tick(token: str, price: float):
     price_str = f"{price:.2f}"
     LTP_CACHE[token] = price_str
@@ -51,6 +60,7 @@ async def broadcast_tick(token: str, price: float):
     }
     await sio.emit("live_data", payload)
 
+    # Standardize Index aliases for Android Client mapping
     if token == "NSE_INDEX|Nifty 50":
         LTP_CACHE["NIFTY"] = price_str
         await sio.emit("live_data", {"instrument_key": "NIFTY", "ltp": price_str})
@@ -58,168 +68,294 @@ async def broadcast_tick(token: str, price: float):
         LTP_CACHE["SENSEX"] = price_str
         await sio.emit("live_data", {"instrument_key": "SENSEX", "ltp": price_str})
 
-# --- 🛡️ SLOWED & THROTTLE-PROTECTED BATCH SENDER ---
-def process_pending_subscriptions():
-    global upstox_ws_app, is_ws_connected
-    while True:
-        # Increased sleep to 10 seconds to completely avoid Upstox 429 Rate Limits
-        time.sleep(10.0) 
-        if PENDING_TOKENS_QUEUE and upstox_ws_app and is_ws_connected:
-            with queue_lock:
-                tokens_to_send = list(PENDING_TOKENS_QUEUE)
-                PENDING_TOKENS_QUEUE.clear()
-            
-            try:
-                sub_msg = {
-                    "guid": f"batch_sub_{int(time.time())}",
-                    "method": "sub",
-                    "data": {
-                        "mode": "full",
-                        "instrumentKeys": tokens_to_send
-                    }
-                }
-                upstox_ws_app.send(json.dumps(sub_msg))
-                logger.info(f"🚀 Successfully Sent Batch Subscription for {len(tokens_to_send)} tokens.")
-            except Exception as e:
-                logger.error(f"❌ Batch Subscription Error: {e}")
-
-# --- 🌐 UPSTOX WEBSOCKET STREAM CONNECTOR ---
-def start_upstox_websocket():
-    global is_ws_connected
-    try:
-        import MarketDataFeedV3_pb2 as pb
-    except ImportError:
-        pb = None
-
-    def on_open(ws):
-        global is_ws_connected
-        is_ws_connected = True
-        logger.info("✅ Upstox Market Feed WebSocket Connected Successfully!")
-        if SUBSCRIBED_TOKENS:
-            try:
-                sub_msg = {
-                    "guid": "initial_sub",
-                    "method": "sub",
-                    "data": {
-                        "mode": "full",
-                        "instrumentKeys": list(SUBSCRIBED_TOKENS)
-                    }
-                }
-                ws.send(json.dumps(sub_msg))
-            except Exception as e:
-                logger.error(f"❌ Initial WS Sub Send Error: {e}")
-
-    def on_message(ws, message):
+# --- 🔄 UPSTOX WEBSOCKET STREAMING ENGINE ---
+async def start_upstox_websocket_feed():
+    logger.info("⚡ Upstox Live WebSocket Feed Initializing...")
+    
+    # Fetch Authorized WebSocket URL from Upstox API
+    def get_market_data_feed_authorize():
+        configuration = upstox_client.Configuration()
+        configuration.access_token = ACCESS_TOKEN
+        api_instance = upstox_client.WebsocketApi(upstox_client.ApiClient(configuration))
         try:
-            if isinstance(message, bytes):
-                if pb:
-                    feed_response = pb.FeedResponse()
-                    feed_response.ParseFromString(message)
-                    for instrument_key, feed_val in feed_response.feeds.items():
-                        ltp = None
-                        if feed_val.HasField("market_ff"):
-                            ltp = getattr(feed_val.market_ff, 'ltp', None)
-                        if not ltp and feed_val.HasField("ff"):
-                            ltp = feed_val.ff.market_ff.ltp
-                        
-                        if ltp and main_loop:
-                            asyncio.run_coroutine_threadsafe(broadcast_tick(instrument_key, float(ltp)), main_loop)
-            elif isinstance(message, str):
-                data_dict = json.loads(message)
-                feeds = data_dict.get("feeds", {})
-                for instrument_key, data in feeds.items():
-                    ltp = data.get("ff", {}).get("marketFF", {}).get("ltp")
-                    if ltp and main_loop:
-                        asyncio.run_coroutine_threadsafe(broadcast_tick(instrument_key, float(ltp)), main_loop)
-        except Exception as e:
-            logger.error(f"❌ WS Message Parse Error: {e}")
-
-    def on_error(ws, error):
-        global is_ws_connected
-        is_ws_connected = False
-        logger.error(f"❌ Upstox WS Error: {error}")
-
-    def on_close(ws, code, reason):
-        global is_ws_connected
-        is_ws_connected = False
-        logger.warning(f"⚠️ Upstox WS Closed: {reason} (Code: {code})")
+            response = api_instance.get_market_data_feed_authorize('2.0')
+            return response.data.authorized_redirect_uri
+        except ApiException as e:
+            logger.error(f"❌ Error getting websocket auth URL: {e}")
+            return None
 
     while True:
         try:
-            headers = {'Accept': 'application/json', 'Authorization': f'Bearer {ACCESS_TOKEN}'}
-            auth_resp = requests.get("https://api.upstox.com/v3/feed/market-data-feed/authorize", headers=headers, timeout=10)
-            
-            if auth_resp.status_code == 200:
-                socket_uri = auth_resp.json().get("data", {}).get("authorizedRedirectUri")
-                if socket_uri:
-                    global upstox_ws_app
-                    upstox_ws_app = websocket.WebSocketApp(
-                        socket_uri, on_open=on_open, on_message=on_message,
-                        on_error=on_error, on_close=on_close
-                    )
-                    upstox_ws_app.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE})
-            else:
-                logger.error(f"❌ Upstox Authorization Failed (Status {auth_resp.status_code}): {auth_resp.text}")
-        except Exception as e:
-            logger.error(f"❌ Upstox Connection Exception: {e}")
-            
-        is_ws_connected = False
-        time.sleep(30)
+            redirect_uri = get_market_data_feed_authorize()
+            if not redirect_uri:
+                logger.warning("⚠️ Failed to get WebSocket URL. Retrying in 5 seconds...")
+                await asyncio.sleep(5)
+                continue
 
-# --- 🌐 SOCKET.IO CLIENT HANDLERS ---
+            # Initialize Upstox V3 Market Data Streamer
+            subscription_mode = UpstoxWebsocket.Mode.LTP
+            ml_client = UpstoxWebsocket.MarketDataFeedV3(redirect_uri)
+
+            async def on_open():
+                logger.info("🟢 Upstox WebSocket Connected Successfully!")
+                if SUBSCRIBED_TOKENS:
+                    tokens_list = list(SUBSCRIBED_TOKENS)
+                    ml_client.subscribe(tokens_list, subscription_mode)
+                    logger.info(f"📡 Subscribed initial {len(tokens_list)} tokens to WebSocket.")
+
+            async def on_message(message):
+                try:
+                    # Parse incoming binary/json market tick data from Upstox Streamer
+                    if isinstance(message, bytes):
+                        # If SDK returns protobuf/binary, handle it using standard Upstox parser structure
+                        pass
+                    # If standard dictionary/json payload:
+                    data_dict = json.loads(message) if isinstance(message, str) else message
+                    feeds = data_dict.get("feeds", {})
+                    for instrument_key, feed_data in feeds.items():
+                        ltp = float(feed_data.get("ltp", 0.0) or feed_data.get("ff", {}).get("marketFF", {}).get("ltp", 0.0))
+                        if ltp > 0:
+                            await broadcast_tick(instrument_key, ltp)
+                            if ":" in instrument_key:
+                                await broadcast_tick(instrument_key.replace(":", "|"), ltp)
+                except Exception as ex:
+                    # Fallback for standard SDK feed structure callbacks if message is parsed object
+                    try:
+                        for instrument_key, details in getattr(message, "feeds", {}).items():
+                            ltp = float(getattr(details, "ltp", 0.0))
+                            if ltp > 0:
+                                await broadcast_tick(instrument_key, ltp)
+                                pipe_key = instrument_key.replace(":", "|")
+                                await broadcast_tick(pipe_key, ltp)
+                    except Exception as inner_ex:
+                        pass
+
+            async def on_error(error):
+                logger.error(f"❌ Upstox WebSocket Error: {error}")
+
+            async def on_close(close_code, reason):
+                logger.warning(f"⚠️ Upstox WebSocket Closed: {close_code} - {reason}")
+
+            ml_client.on("open", on_open)
+            ml_client.on("message", on_message)
+            ml_client.on("error", on_error)
+            ml_client.on("close", on_close)
+
+            # Connect and keep the stream alive
+            await ml_client.connect()
+
+        except Exception as e:
+            logger.error(f"❌ Critical error in Upstox WebSocket loop: {e}")
+            await asyncio.sleep(5)
+
+# --- 🌐 SOCKET.IO HANDLERS ---
 @sio.event
 async def connect(sid, environ):
     logger.info(f"📱 Android Client Connected: {sid}")
     if LTP_CACHE:
         await sio.emit('initial_ltps', LTP_CACHE, room=sid)
 
-@sio.event
-async def subscribe_request(sid, data):
+async def handle_subscription(sid, data):
     try:
         if isinstance(data, str):
             data = json.loads(data)
             
         tokens_input = data.get("instrumentKeys") or data.get("tokens", [])
-        new_tokens_added = 0
-        
         for item in tokens_input:
-            token = str(item).strip().replace(":", "|")
+            if isinstance(item, dict):
+                token = str(item.get("token") or item.get("instrument_key", "")).strip()
+            else:
+                token = str(item).strip()
+                
             if token:
-                if token not in SUBSCRIBED_TOKENS:
-                    SUBSCRIBED_TOKENS.add(token)
-                    with queue_lock:
-                        PENDING_TOKENS_QUEUE.add(token)
-                    new_tokens_added += 1
+                SUBSCRIBED_TOKENS.add(token)
                 
-                cached_price = LTP_CACHE.get(token, "0.00")
-                await sio.emit("live_data", {"instrument_key": token, "ltp": cached_price}, room=sid)
-                
-        if new_tokens_added > 0:
-            logger.info(f"📥 Added {new_tokens_added} new tokens to queue.")
+        logger.info(f"Subscribed Upstox Keys Count: {len(SUBSCRIBED_TOKENS)}")
     except Exception as e:
-        logger.error(f"❌ Error in subscribe_request: {e}")
+        logger.error(f"❌ Error in subscribe_tokens: {e}")
+
+@sio.event
+async def subscribe_tokens(sid, data):
+    await handle_subscription(sid, data)
+
+@sio.event
+async def subscribe_request(sid, data):
+    await handle_subscription(sid, data)
 
 @sio.event
 async def disconnect(sid):
     logger.info(f"📱 Android Client Disconnected: {sid}")
 
-# --- 🌐 REST HTTP ENDPOINTS ---
+# --- 🌐 REST HTTP API ENDPOINTS ---
 async def home_route(request: web.Request):
     return web.json_response({
         "status": True,
-        "message": "MUNH Titan Backend Service is Live & Running!",
-        "version": "1.0.2"
+        "message": "MUNH Titan Upstox Backend Service is Live & Running!",
+        "version": "1.0.1"
     })
 
+async def fetch_chart_data(request: web.Request):
+    try:
+        d = await request.json()
+        instrument_key = str(d.get('token', '') or d.get('instrument_key', '')).strip()
+        raw_interval = str(d.get('interval', "5minute")).strip().upper()
+
+        if not instrument_key:
+            return web.json_response({"status": False, "message": "Missing instrument_key"}, status=400)
+
+        # Pipe formatting for Upstox Key
+        instrument_key = instrument_key.replace(":", "|")
+
+        # --- 🛠️ UPDATED INTERVAL LOGIC ---
+        if raw_interval in ["DAY", "ONE_DAY", "1D"]:
+            unit = "day"
+        elif raw_interval in ["WEEK", "1W", "1WEEK"]:
+            unit = "week"
+        elif raw_interval in ["MONTH", "1MON", "1MONTH"]:
+            unit = "month"
+        else:
+            # Fetch 1-min for all intraday and resample locally for accuracy
+            unit = "1minute" 
+
+        # Target minutes mapping for local backend resampling
+        MINUTES_MAP = {
+            "3MINUTE": 3, "THREE_MINUTE": 3, "3M": 3, "3minute": 3,
+            "5MINUTE": 5, "FIVE_MINUTE": 5, "5M": 5, "5minute": 5,
+            "10MINUTE": 10, "TEN_MINUTE": 10, "10M": 10, "10minute": 10,
+            "15MINUTE": 15, "FIFTEEN_MINUTE": 15, "15M": 15, "15minute": 15,
+            "30MINUTE": 30, "THIRTY_MINUTE": 30, "30M": 30, "30minute": 30,
+            "60MINUTE": 60, "SIXTY_MINUTE": 60, "1HOUR": 60, "1H": 60, "60M": 60, "60minute": 60
+        }
+        target_minutes = MINUTES_MAP.get(raw_interval, 1)
+
+        to_date = datetime.datetime.now(IST).strftime("%Y-%m-%d")
+        from_date = (datetime.datetime.now(IST) - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
+
+        headers = {
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {ACCESS_TOKEN}'
+        }
+
+        all_raw_candles = []
+
+        async with aiohttp.ClientSession() as session:
+            # 1️⃣ INTRA-DAY CANDLES (Fetch today's candles up to current minute)
+            intraday_url = f"https://api.upstox.com/v2/historical-candle/intraday/{instrument_key}/{unit}"
+            async with session.get(intraday_url, headers=headers) as resp_intra:
+                if resp_intra.status == 200:
+                    res_intra = await resp_intra.json()
+                    if res_intra.get("status") == "success":
+                        intra_candles = res_intra.get("data", {}).get("candles", [])
+                        all_raw_candles.extend(intra_candles)
+
+            # 2️⃣ HISTORICAL CANDLES (Fetch past 7 days closed candles)
+            hist_url = f"https://api.upstox.com/v2/historical-candle/{instrument_key}/{unit}/{to_date}/{from_date}"
+            async with session.get(hist_url, headers=headers) as resp_hist:
+                if resp_hist.status == 200:
+                    res_hist = await resp_hist.json()
+                    if res_hist.get("status") == "success":
+                        hist_candles = res_hist.get("data", {}).get("candles", [])
+                        all_raw_candles.extend(hist_candles)
+
+        if all_raw_candles:
+            # Deduplicate by Timestamp & Sort Chronologically (Oldest to Newest)
+            seen_times = set()
+            unique_candles = []
+
+            for c in all_raw_candles:
+                timestamp = c[0]
+                if timestamp not in seen_times:
+                    seen_times.add(timestamp)
+                    unique_candles.append(c)
+
+            # Upstox returns newest first, so we sort ascending by time
+            unique_candles.sort(key=lambda x: x[0])
+
+            # --- 🛠️ FIX: RESAMPLE CANDLES FOR HIGHER TIMEFRAMES ---
+            if unit == "1minute" and target_minutes > 1:
+                resampled = []
+                current_agg = None
+                
+                for c in unique_candles:
+                    t_str = c[0]
+                    try:
+                        dt = datetime.datetime.fromisoformat(t_str)
+                    except ValueError:
+                        try:
+                            # Fallback parsing if fromisoformat fails
+                            dt = datetime.datetime.strptime(t_str[:19], "%Y-%m-%dT%H:%M:%S")
+                        except ValueError:
+                            resampled.append(c)
+                            continue
+                    
+                    # Calculate minutes elapsed since market open (09:15 AM)
+                    mins_from_open = (dt.hour * 60 + dt.minute) - (9 * 60 + 15)
+                    if mins_from_open < 0:
+                        mins_from_open = 0 # Handle pre-market data safely
+                        
+                    block_idx = mins_from_open // target_minutes
+                    block_key = (dt.date(), block_idx)
+                    
+                    # Grouping Logic
+                    if current_agg is None or current_agg['key'] != block_key:
+                        if current_agg is not None:
+                            resampled.append([
+                                current_agg['time'],
+                                current_agg['open'],
+                                current_agg['high'],
+                                current_agg['low'],
+                                current_agg['close']
+                            ])
+                        current_agg = {
+                            'key': block_key,
+                            'time': t_str,
+                            'open': float(c[1]),
+                            'high': float(c[2]),
+                            'low': float(c[3]),
+                            'close': float(c[4])
+                        }
+                    else:
+                        current_agg['high'] = max(current_agg['high'], float(c[2]))
+                        current_agg['low'] = min(current_agg['low'], float(c[3]))
+                        current_agg['close'] = float(c[4])
+                
+                if current_agg is not None:
+                    resampled.append([
+                        current_agg['time'],
+                        current_agg['open'],
+                        current_agg['high'],
+                        current_agg['low'],
+                        current_agg['close']
+                    ])
+                
+                unique_candles = resampled
+
+            formatted_candles = [
+                {
+                    "time": c[0],
+                    "open": float(c[1]),
+                    "high": float(c[2]),
+                    "low": float(c[3]),
+                    "close": float(c[4])
+                }
+                for c in unique_candles
+            ]
+
+            return web.json_response({"status": True, "message": "SUCCESS", "data": formatted_candles})
+
+        return web.json_response({"status": False, "message": "Historical data unavailable", "data": []})
+
+    except Exception as e:
+        logger.error(f"Exception in fetch_chart_data: {e}")
+        return web.json_response({"status": False, "message": str(e), "data": []}, status=500)
+
 app.router.add_get('/', home_route)
+app.router.add_post('/api/get_chart_data', fetch_chart_data)
 
 # --- 🔄 BACKGROUND TASKS ---
 async def start_background_tasks(app):
-    global main_loop
-    main_loop = asyncio.get_running_loop()
-    threading.Thread(target=start_upstox_websocket, daemon=True).start()
-    threading.Thread(target=process_pending_subscriptions, daemon=True).start()
-    logger.info("✅ Fully Automated Backend Service Initialized.")
+    asyncio.create_task(start_upstox_websocket_feed())
+    logger.info("✅ Upstox Backend Service Initialized with WebSocket Feed Engine.")
 
 app.on_startup.append(start_background_tasks)
 
