@@ -48,7 +48,6 @@ async def broadcast_tick(token: str, price: float):
     await sio.emit("live_data", payload)
     logger.info(f"📡 Broadcasted Tick -> {token} : {price_str}")
 
-    # Android client aliases mapping
     if token == "NSE_INDEX|Nifty 50":
         LTP_CACHE["NIFTY"] = price_str
         await sio.emit("live_data", {"instrument_key": "NIFTY", "ltp": price_str})
@@ -133,23 +132,26 @@ def start_upstox_websocket():
     def on_close(ws, code, reason):
         logger.warning(f"⚠️ Upstox WS Closed: {reason} (Code: {code})")
 
-    try:
-        headers = {'Accept': 'application/json', 'Authorization': f'Bearer {ACCESS_TOKEN}'}
-        auth_resp = requests.get("https://api.upstox.com/v3/feed/market-data-feed/authorize", headers=headers)
-        
-        if auth_resp.status_code == 200:
-            socket_uri = auth_resp.json().get("data", {}).get("authorizedRedirectUri")
-            if socket_uri:
-                global upstox_ws_app
-                upstox_ws_app = websocket.WebSocketApp(
-                    socket_uri, on_open=on_open, on_message=on_message,
-                    on_error=on_error, on_close=on_close
-                )
-                upstox_ws_app.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE})
-        else:
-            logger.error(f"❌ Failed to authorize Upstox feed: {auth_resp.text}")
-    except Exception as e:
-        logger.error(f"❌ Failed to start Upstox WebSocket: {e}")
+    while True:
+        try:
+            headers = {'Accept': 'application/json', 'Authorization': f'Bearer {ACCESS_TOKEN}'}
+            auth_resp = requests.get("https://api.upstox.com/v3/feed/market-data-feed/authorize", headers=headers, timeout=10)
+            
+            if auth_resp.status_code == 200:
+                socket_uri = auth_resp.json().get("data", {}).get("authorizedRedirectUri")
+                if socket_uri:
+                    global upstox_ws_app
+                    upstox_ws_app = websocket.WebSocketApp(
+                        socket_uri, on_open=on_open, on_message=on_message,
+                        on_error=on_error, on_close=on_close
+                    )
+                    upstox_ws_app.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE})
+            else:
+                logger.error(f"❌ Upstox Authorization Failed (Status {auth_resp.status_code}): {auth_resp.text}")
+        except Exception as e:
+            logger.error(f"❌ Upstox Connection Exception: {e}")
+            
+        time.sleep(30)
 
 # --- 🌐 SOCKET.IO CLIENT HANDLERS ---
 @sio.event
@@ -173,9 +175,8 @@ async def subscribe_request(sid, data):
                 if token not in SUBSCRIBED_TOKENS:
                     SUBSCRIBED_TOKENS.add(token)
                     PENDING_TOKENS_QUEUE.add(token)
-                    new_tokens_added += 1
+                    new_tokens_added += 5
                 
-                # Agar cache me price hai toh turant bhejo, nahi toh 0.00 ya default bhejo taaki UI update ho
                 cached_price = LTP_CACHE.get(token, "0.00")
                 await sio.emit("live_data", {"instrument_key": token, "ltp": cached_price}, room=sid)
                 
@@ -204,7 +205,7 @@ async def start_background_tasks(app):
     main_loop = asyncio.get_running_loop()
     threading.Thread(target=start_upstox_websocket, daemon=True).start()
     threading.Thread(target=process_pending_subscriptions, daemon=True).start()
-    logger.info("✅ Backend Service Initialized with Debug Ticks & Instant Sync.")
+    logger.info("✅ Fully Automated Backend Service Initialized.")
 
 app.on_startup.append(start_background_tasks)
 
