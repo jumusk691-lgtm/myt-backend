@@ -1,4 +1,4 @@
-import asyncio
+Import asyncio
 import json
 import logging
 import time
@@ -75,6 +75,7 @@ async def start_upstox_ltp_poller():
         'Authorization': f'Bearer {ACCESS_TOKEN}'
     }
 
+    # Upstox Rate Limit Controller (Max 5 concurrent API hits to prevent 429)
     concurrency_limiter = asyncio.Semaphore(5)
 
     async def fetch_chunk(session, chunk_tokens):
@@ -113,17 +114,20 @@ async def start_upstox_ltp_poller():
                 if not current_subs:
                     current_subs = ["NSE_INDEX|Nifty 50", "BSE_INDEX|SENSEX"]
 
+                # 1️⃣ CREATE BATCHES (Chunks of 50 tokens max to avoid URL Length limits)
                 CHUNK_SIZE = 50 
                 chunks = [current_subs[i:i + CHUNK_SIZE] for i in range(0, len(current_subs), CHUNK_SIZE)]
 
+                # 2️⃣ FIRE BATCHES ASYNCHRONOUSLY
                 tasks = [fetch_chunk(session, chunk) for chunk in chunks]
                 await asyncio.gather(*tasks)
 
             except Exception as e:
                 logger.error(f"❌ Error in Upstox Master Poller: {e}")
 
+            # 3️⃣ TIME CALCULATION: Maintain strictly 1-second interval loop
             elapsed = time.time() - start_time
-            sleep_time = max(1.0 - elapsed, 0.1)
+            sleep_time = max(1.0 - elapsed, 0.1) # Minimum 0.1s sleep to prevent server CPU choke
             await asyncio.sleep(sleep_time)
 
 # --- 🌐 SOCKET.IO HANDLERS ---
@@ -181,9 +185,10 @@ async def fetch_chart_data(request: web.Request):
         if not instrument_key:
             return web.json_response({"status": False, "message": "Missing instrument_key"}, status=400)
 
+        # Pipe formatting for Upstox Key
         instrument_key = instrument_key.replace(":", "|")
 
-        # --- 🛠️ ORIGINAL INTERVAL & RESAMPLED LOGIC ---
+        # --- 🛠️ UPDATED INTERVAL LOGIC ---
         if raw_interval in ["DAY", "ONE_DAY", "1D"]:
             unit = "day"
         elif raw_interval in ["WEEK", "1W", "1WEEK"]:
@@ -191,8 +196,10 @@ async def fetch_chart_data(request: web.Request):
         elif raw_interval in ["MONTH", "1MON", "1MONTH"]:
             unit = "month"
         else:
+            # Fetch 1-min for all intraday and resample locally for accuracy
             unit = "1minute" 
 
+        # Target minutes mapping for local backend resampling
         MINUTES_MAP = {
             "3MINUTE": 3, "THREE_MINUTE": 3, "3M": 3, "3minute": 3,
             "5MINUTE": 5, "FIVE_MINUTE": 5, "5M": 5, "5minute": 5,
@@ -204,7 +211,7 @@ async def fetch_chart_data(request: web.Request):
         target_minutes = MINUTES_MAP.get(raw_interval, 1)
 
         to_date = datetime.datetime.now(IST).strftime("%Y-%m-%d")
-        from_date = (datetime.datetime.now(IST) - datetime.timedelta(days=15)).strftime("%Y-%m-%d")
+        from_date = (datetime.datetime.now(IST) - datetime.timedelta(days=17)).strftime("%Y-%m-%d")
 
         headers = {
             'Accept': 'application/json',
@@ -214,6 +221,7 @@ async def fetch_chart_data(request: web.Request):
         all_raw_candles = []
 
         async with aiohttp.ClientSession() as session:
+            # 1️⃣ INTRA-DAY CANDLES (Fetch today's candles up to current minute)
             intraday_url = f"https://api.upstox.com/v2/historical-candle/intraday/{instrument_key}/{unit}"
             async with session.get(intraday_url, headers=headers) as resp_intra:
                 if resp_intra.status == 200:
@@ -222,6 +230,7 @@ async def fetch_chart_data(request: web.Request):
                         intra_candles = res_intra.get("data", {}).get("candles", [])
                         all_raw_candles.extend(intra_candles)
 
+            # 2️⃣ HISTORICAL CANDLES (Fetch past 7 days closed candles)
             hist_url = f"https://api.upstox.com/v2/historical-candle/{instrument_key}/{unit}/{to_date}/{from_date}"
             async with session.get(hist_url, headers=headers) as resp_hist:
                 if resp_hist.status == 200:
@@ -231,6 +240,7 @@ async def fetch_chart_data(request: web.Request):
                         all_raw_candles.extend(hist_candles)
 
         if all_raw_candles:
+            # Deduplicate by Timestamp & Sort Chronologically (Oldest to Newest)
             seen_times = set()
             unique_candles = []
 
@@ -240,9 +250,10 @@ async def fetch_chart_data(request: web.Request):
                     seen_times.add(timestamp)
                     unique_candles.append(c)
 
+            # Upstox returns newest first, so we sort ascending by time
             unique_candles.sort(key=lambda x: x[0])
 
-            # --- 🛠️ RESTORED RESAMPLE LOGIC FOR MULTI-CANDLE VIEW ---
+            # --- 🛠️ FIX: RESAMPLE CANDLES FOR HIGHER TIMEFRAMES ---
             if unit == "1minute" and target_minutes > 1:
                 resampled = []
                 current_agg = None
@@ -253,18 +264,21 @@ async def fetch_chart_data(request: web.Request):
                         dt = datetime.datetime.fromisoformat(t_str)
                     except ValueError:
                         try:
+                            # Fallback parsing if fromisoformat fails
                             dt = datetime.datetime.strptime(t_str[:19], "%Y-%m-%dT%H:%M:%S")
                         except ValueError:
                             resampled.append(c)
                             continue
                     
+                    # Calculate minutes elapsed since market open (09:15 AM)
                     mins_from_open = (dt.hour * 60 + dt.minute) - (9 * 60 + 15)
                     if mins_from_open < 0:
-                        mins_from_open = 0
+                        mins_from_open = 0 # Handle pre-market data safely
                         
                     block_idx = mins_from_open // target_minutes
                     block_key = (dt.date(), block_idx)
                     
+                    # Grouping Logic
                     if current_agg is None or current_agg['key'] != block_key:
                         if current_agg is not None:
                             resampled.append([
