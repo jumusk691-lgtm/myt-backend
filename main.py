@@ -46,6 +46,7 @@ async def broadcast_tick(token: str, price: float):
         "ltp": price_str
     }
     await sio.emit("live_data", payload)
+    logger.info(f"📡 Broadcasted Tick -> {token} : {price_str}")
 
     # Android client aliases mapping
     if token == "NSE_INDEX|Nifty 50":
@@ -55,11 +56,11 @@ async def broadcast_tick(token: str, price: float):
         LTP_CACHE["SENSEX"] = price_str
         await sio.emit("live_data", {"instrument_key": "SENSEX", "ltp": price_str})
 
-# --- 🛡️ BATCHED SUBSCRIPTION SENDER (Prevents Rate Limiting) ---
+# --- 🛡️ BATCHED SUBSCRIPTION SENDER ---
 def process_pending_subscriptions():
     global upstox_ws_app
     while True:
-        time.sleep(3.0) # Har 3 seconds me check karega agar koi naya token bacha ho
+        time.sleep(3.0)
         if PENDING_TOKENS_QUEUE and upstox_ws_app:
             try:
                 tokens_to_send = list(PENDING_TOKENS_QUEUE)
@@ -87,7 +88,6 @@ def start_upstox_websocket():
 
     def on_open(ws):
         logger.info("✅ Upstox Market Feed WebSocket Connected Successfully!")
-        # Initial default tokens send karna
         if SUBSCRIBED_TOKENS:
             try:
                 sub_msg = {
@@ -155,7 +155,6 @@ def start_upstox_websocket():
 @sio.event
 async def connect(sid, environ):
     logger.info(f"📱 Android Client Connected: {sid}")
-    # Client connect hote hi jo bhi LTP cache me hoga, turant bhej denge
     if LTP_CACHE:
         await sio.emit('initial_ltps', LTP_CACHE, room=sid)
 
@@ -170,16 +169,19 @@ async def subscribe_request(sid, data):
         
         for item in tokens_input:
             token = str(item).strip().replace(":", "|")
-            # Sirf tabhi add karenge jab wo pehle se subscribed na ho!
-            if token and token not in SUBSCRIBED_TOKENS:
-                SUBSCRIBED_TOKENS.add(token)
-                PENDING_TOKENS_QUEUE.add(token)
-                new_tokens_added += 1
+            if token:
+                if token not in SUBSCRIBED_TOKENS:
+                    SUBSCRIBED_TOKENS.add(token)
+                    PENDING_TOKENS_QUEUE.add(token)
+                    new_tokens_added += 1
+                
+                # Agar cache me price hai toh turant bhejo, nahi toh 0.00 ya default bhejo taaki UI update ho
+                cached_price = LTP_CACHE.get(token, "0.00")
+                await sio.emit("live_data", {"instrument_key": token, "ltp": cached_price}, room=sid)
                 
         if new_tokens_added > 0:
             logger.info(f"📥 Added {new_tokens_added} brand new tokens. Total Unique Subscribed: {len(SUBSCRIBED_TOKENS)}")
     except Exception as e:
-    
         logger.error(f"❌ Error in subscribe_request: {e}")
 
 @sio.event
@@ -200,11 +202,9 @@ app.router.add_get('/', home_route)
 async def start_background_tasks(app):
     global main_loop
     main_loop = asyncio.get_running_loop()
-    # 1. Upstox Feed WebSocket Thread Start
     threading.Thread(target=start_upstox_websocket, daemon=True).start()
-    # 2. Batch Queue Processor Thread Start
     threading.Thread(target=process_pending_subscriptions, daemon=True).start()
-    logger.info("✅ Backend Service Initialized with Smart Deduplication & Batching.")
+    logger.info("✅ Backend Service Initialized with Debug Ticks & Instant Sync.")
 
 app.on_startup.append(start_background_tasks)
 
