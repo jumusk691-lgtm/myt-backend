@@ -75,7 +75,6 @@ async def start_upstox_ltp_poller():
         'Authorization': f'Bearer {ACCESS_TOKEN}'
     }
 
-    # Upstox Rate Limit Controller (Max 5 concurrent API hits to prevent 429)
     concurrency_limiter = asyncio.Semaphore(5)
 
     async def fetch_chunk(session, chunk_tokens):
@@ -114,20 +113,17 @@ async def start_upstox_ltp_poller():
                 if not current_subs:
                     current_subs = ["NSE_INDEX|Nifty 50", "BSE_INDEX|SENSEX"]
 
-                # 1️⃣ CREATE BATCHES (Chunks of 50 tokens max to avoid URL Length limits)
                 CHUNK_SIZE = 50 
                 chunks = [current_subs[i:i + CHUNK_SIZE] for i in range(0, len(current_subs), CHUNK_SIZE)]
 
-                # 2️⃣ FIRE BATCHES ASYNCHRONOUSLY
                 tasks = [fetch_chunk(session, chunk) for chunk in chunks]
                 await asyncio.gather(*tasks)
 
             except Exception as e:
                 logger.error(f"❌ Error in Upstox Master Poller: {e}")
 
-            # 3️⃣ TIME CALCULATION: Maintain strictly 1-second interval loop
             elapsed = time.time() - start_time
-            sleep_time = max(1.0 - elapsed, 0.1) # Minimum 0.1s sleep to prevent server CPU choke
+            sleep_time = max(1.0 - elapsed, 0.1)
             await asyncio.sleep(sleep_time)
 
 # --- 🌐 SOCKET.IO HANDLERS ---
@@ -185,28 +181,30 @@ async def fetch_chart_data(request: web.Request):
         if not instrument_key:
             return web.json_response({"status": False, "message": "Missing instrument_key"}, status=400)
 
-        # Pipe formatting for Upstox Key
         instrument_key = instrument_key.replace(":", "|")
 
-        # --- 🛠️ COMPREHENSIVE INTERVAL MAPPING ---
-        INTERVAL_API_MAP = {
-            "ONE_MINUTE": "1minute", "1MINUTE": "1minute", "1M": "1minute", "1minute": "1minute",
-            "THREE_MINUTE": "3minute", "3MINUTE": "3minute", "3M": "3minute", "3minute": "3minute",
-            "FIVE_MINUTE": "5minute", "5MINUTE": "5minute", "5M": "5minute", "5minute": "5minute",
-            "TEN_MINUTE": "10minute", "10MINUTE": "10minute", "10M": "10minute", "10minute": "10minute",
-            "FIFTEEN_MINUTE": "15minute", "15MINUTE": "15minute", "15M": "15minute", "15minute": "15minute",
-            "THIRTY_MINUTE": "30minute", "30MINUTE": "30minute", "30M": "30minute", "30minute": "30minute",
-            "ONE_HOUR": "60minute", "60MINUTE": "60minute", "1H": "60minute", "60M": "60minute", "60minute": "60minute",
-            "SIXTY_MINUTE": "60minute", "1HOUR": "60minute",
-            "ONE_DAY": "day", "DAY": "day", "1D": "day",
-            "WEEK": "week", "1W": "week", "1WEEK": "week",
-            "MONTH": "month", "1MON": "month", "1MONTH": "month"
+        # --- 🛠️ ORIGINAL INTERVAL & RESAMPLED LOGIC ---
+        if raw_interval in ["DAY", "ONE_DAY", "1D"]:
+            unit = "day"
+        elif raw_interval in ["WEEK", "1W", "1WEEK"]:
+            unit = "week"
+        elif raw_interval in ["MONTH", "1MON", "1MONTH"]:
+            unit = "month"
+        else:
+            unit = "1minute" 
+
+        MINUTES_MAP = {
+            "3MINUTE": 3, "THREE_MINUTE": 3, "3M": 3, "3minute": 3,
+            "5MINUTE": 5, "FIVE_MINUTE": 5, "5M": 5, "5minute": 5,
+            "10MINUTE": 10, "TEN_MINUTE": 10, "10M": 10, "10minute": 10,
+            "15MINUTE": 15, "FIFTEEN_MINUTE": 15, "15M": 15, "15minute": 15,
+            "30MINUTE": 30, "THIRTY_MINUTE": 30, "30M": 30, "30minute": 30,
+            "60MINUTE": 60, "SIXTY_MINUTE": 60, "1HOUR": 60, "1H": 60, "60M": 60, "60minute": 60
         }
-        
-        unit = INTERVAL_API_MAP.get(raw_interval, "5minute")
+        target_minutes = MINUTES_MAP.get(raw_interval, 1)
 
         to_date = datetime.datetime.now(IST).strftime("%Y-%m-%d")
-        from_date = (datetime.datetime.now(IST) - datetime.timedelta(days=60)).strftime("%Y-%m-%d")
+        from_date = (datetime.datetime.now(IST) - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
 
         headers = {
             'Accept': 'application/json',
@@ -216,7 +214,6 @@ async def fetch_chart_data(request: web.Request):
         all_raw_candles = []
 
         async with aiohttp.ClientSession() as session:
-            # 1️⃣ INTRA-DAY CANDLES (Fetch today's candles up to current minute)
             intraday_url = f"https://api.upstox.com/v2/historical-candle/intraday/{instrument_key}/{unit}"
             async with session.get(intraday_url, headers=headers) as resp_intra:
                 if resp_intra.status == 200:
@@ -225,7 +222,6 @@ async def fetch_chart_data(request: web.Request):
                         intra_candles = res_intra.get("data", {}).get("candles", [])
                         all_raw_candles.extend(intra_candles)
 
-            # 2️⃣ HISTORICAL CANDLES (Fetch past 60 days closed candles)
             hist_url = f"https://api.upstox.com/v2/historical-candle/{instrument_key}/{unit}/{to_date}/{from_date}"
             async with session.get(hist_url, headers=headers) as resp_hist:
                 if resp_hist.status == 200:
@@ -235,7 +231,6 @@ async def fetch_chart_data(request: web.Request):
                         all_raw_candles.extend(hist_candles)
 
         if all_raw_candles:
-            # Deduplicate by Timestamp & Sort Chronologically (Oldest to Newest)
             seen_times = set()
             unique_candles = []
 
@@ -245,8 +240,63 @@ async def fetch_chart_data(request: web.Request):
                     seen_times.add(timestamp)
                     unique_candles.append(c)
 
-            # Upstox returns newest first, so we sort ascending by time
             unique_candles.sort(key=lambda x: x[0])
+
+            # --- 🛠️ RESTORED RESAMPLE LOGIC FOR MULTI-CANDLE VIEW ---
+            if unit == "1minute" and target_minutes > 1:
+                resampled = []
+                current_agg = None
+                
+                for c in unique_candles:
+                    t_str = c[0]
+                    try:
+                        dt = datetime.datetime.fromisoformat(t_str)
+                    except ValueError:
+                        try:
+                            dt = datetime.datetime.strptime(t_str[:19], "%Y-%m-%dT%H:%M:%S")
+                        except ValueError:
+                            resampled.append(c)
+                            continue
+                    
+                    mins_from_open = (dt.hour * 60 + dt.minute) - (9 * 60 + 15)
+                    if mins_from_open < 0:
+                        mins_from_open = 0
+                        
+                    block_idx = mins_from_open // target_minutes
+                    block_key = (dt.date(), block_idx)
+                    
+                    if current_agg is None or current_agg['key'] != block_key:
+                        if current_agg is not None:
+                            resampled.append([
+                                current_agg['time'],
+                                current_agg['open'],
+                                current_agg['high'],
+                                current_agg['low'],
+                                current_agg['close']
+                            ])
+                        current_agg = {
+                            'key': block_key,
+                            'time': t_str,
+                            'open': float(c[1]),
+                            'high': float(c[2]),
+                            'low': float(c[3]),
+                            'close': float(c[4])
+                        }
+                    else:
+                        current_agg['high'] = max(current_agg['high'], float(c[2]))
+                        current_agg['low'] = min(current_agg['low'], float(c[3]))
+                        current_agg['close'] = float(c[4])
+                
+                if current_agg is not None:
+                    resampled.append([
+                        current_agg['time'],
+                        current_agg['open'],
+                        current_agg['high'],
+                        current_agg['low'],
+                        current_agg['close']
+                    ])
+                
+                unique_candles = resampled
 
             formatted_candles = [
                 {
