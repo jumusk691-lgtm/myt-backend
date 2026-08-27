@@ -73,22 +73,20 @@ async def start_upstox_websocket_feed():
 
     while True:
         try:
-            # Initialize Upstox V3 Market Data Streamer using the official SDK pattern
             api_client = upstox_client.ApiClient(configuration)
-            
-            # Convert token list to list format for streamer
             tokens_list = list(SUBSCRIBED_TOKENS) if SUBSCRIBED_TOKENS else ["NSE_INDEX|Nifty 50"]
             
-            # Instantiating MarketDataStreamerV3 with api_client, instrument_keys, and mode
+            # Use correct Upstox SDK Mode enum or fallback safely
+            sub_mode = getattr(upstox_client.Mode, 'LTP', "ltp")
+            
             streamer = upstox_client.MarketDataStreamerV3(
                 api_client, 
                 tokens_list, 
-                "ltp"
+                sub_mode
             )
 
             async def on_message(message):
                 try:
-                    # Handle incoming message dictionary or string/binary stream
                     data_dict = json.loads(message) if isinstance(message, str) else message
                     feeds = data_dict.get("feeds", {})
                     for instrument_key, feed_data in feeds.items():
@@ -109,11 +107,8 @@ async def start_upstox_websocket_feed():
                         pass
 
             streamer.on("message", on_message)
-            
-            # Connect to the stream
             streamer.connect()
             
-            # Keep alive loop if connected successfully
             while True:
                 await asyncio.sleep(10)
 
