@@ -67,7 +67,7 @@ async def broadcast_tick(token: str, price: float):
         LTP_CACHE["SENSEX"] = price_str
         await sio.emit("live_data", {"instrument_key": "SENSEX", "ltp": price_str})
 
-# --- 🔄 FAST LTP POLLING ENGINE (ADVANCED BATCHING MODE) ---
+# --- 🔄 FAST LTP POLLING ENGINE (ORIGINAL BATCHING MODE) ---
 async def start_upstox_ltp_poller():
     logger.info("⚡ Upstox Live LTP Fast Poller (BATCHING MODE) Started!")
     headers = {
@@ -181,10 +181,9 @@ async def fetch_chart_data(request: web.Request):
         if not instrument_key:
             return web.json_response({"status": False, "message": "Missing instrument_key"}, status=400)
 
-        # Pipe formatting for Upstox Key
         instrument_key = instrument_key.replace(":", "|")
 
-        # --- 🛠️ ROBUST MULTI-TIMEFRAME INTERVAL MAPPING (Supports Android ONE_MINUTE, FIVE_MINUTE etc.) ---
+        # Interval mapping to handle Android timeframe changes correctly
         INTERVAL_API_MAP = {
             "ONE_MINUTE": "1minute", "1MINUTE": "1minute", "1M": "1minute", "1minute": "1minute",
             "THREE_MINUTE": "3minute", "3MINUTE": "3minute", "3M": "3minute", "3minute": "3minute",
@@ -211,7 +210,6 @@ async def fetch_chart_data(request: web.Request):
         all_raw_candles = []
 
         async with aiohttp.ClientSession() as session:
-            # 1️⃣ INTRA-DAY CANDLES (Fetch today's candles)
             intraday_url = f"https://api.upstox.com/v2/historical-candle/intraday/{instrument_key}/{unit}"
             async with session.get(intraday_url, headers=headers) as resp_intra:
                 if resp_intra.status == 200:
@@ -220,7 +218,6 @@ async def fetch_chart_data(request: web.Request):
                         intra_candles = res_intra.get("data", {}).get("candles", [])
                         all_raw_candles.extend(intra_candles)
 
-            # 2️⃣ HISTORICAL CANDLES (Fetch past 60 days closed candles)
             hist_url = f"https://api.upstox.com/v2/historical-candle/{instrument_key}/{unit}/{to_date}/{from_date}"
             async with session.get(hist_url, headers=headers) as resp_hist:
                 if resp_hist.status == 200:
@@ -230,7 +227,6 @@ async def fetch_chart_data(request: web.Request):
                         all_raw_candles.extend(hist_candles)
 
         if all_raw_candles:
-            # Deduplicate by Timestamp & Sort Chronologically (Oldest to Newest)
             seen_times = set()
             unique_candles = []
 
