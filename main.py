@@ -24,9 +24,10 @@ API_SECRET = os.getenv("UPSTOX_API_SECRET", "cg0pdqyg8t")
 NEW_ANALYTICS_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI2MkFIN0siLCJqdGkiOiI2YTdhMTJlZjk1YjgyYzEzZjc5OWEyMmIiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlzRXh0ZW5kZWQiOnRydWUsImlhdCI6MTc4NjM4NTEzNSwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxODE3OTM1MjAwfQ.0z7HMMUZUwJ6mRkzY3EUE1bB36_i1c7M-6yiNc8clgs"
 ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", NEW_ANALYTICS_TOKEN).strip()
 
-# --- 🚀 GLOBAL STATES ---
+# --- 🚀 GLOBAL STATES & TRACKING ---
 LTP_CACHE = {}               
 SUBSCRIBED_TOKENS = set(["NSE_INDEX|Nifty 50", "BSE_INDEX|SENSEX"])
+PENDING_TOKENS_QUEUE = set()
 upstox_ws_app = None
 main_loop = None
 
@@ -46,13 +47,36 @@ async def broadcast_tick(token: str, price: float):
     }
     await sio.emit("live_data", payload)
 
-    # Android client mapping ke liye aliases
+    # Android client aliases mapping
     if token == "NSE_INDEX|Nifty 50":
         LTP_CACHE["NIFTY"] = price_str
         await sio.emit("live_data", {"instrument_key": "NIFTY", "ltp": price_str})
     elif token == "BSE_INDEX|SENSEX":
         LTP_CACHE["SENSEX"] = price_str
         await sio.emit("live_data", {"instrument_key": "SENSEX", "ltp": price_str})
+
+# --- 🛡️ BATCHED SUBSCRIPTION SENDER (Prevents Rate Limiting) ---
+def process_pending_subscriptions():
+    global upstox_ws_app
+    while True:
+        time.sleep(3.0) # Har 3 seconds me check karega agar koi naya token bacha ho
+        if PENDING_TOKENS_QUEUE and upstox_ws_app:
+            try:
+                tokens_to_send = list(PENDING_TOKENS_QUEUE)
+                PENDING_TOKENS_QUEUE.clear()
+                
+                sub_msg = {
+                    "guid": f"batch_sub_{int(time.time())}",
+                    "method": "sub",
+                    "data": {
+                        "mode": "full",
+                        "instrumentKeys": tokens_to_send
+                    }
+                }
+                upstox_ws_app.send(json.dumps(sub_msg))
+                logger.info(f"🚀 Sent New Batch Subscription for {len(tokens_to_send)} tokens to Upstox WS.")
+            except Exception as e:
+                logger.error(f"❌ Batch Subscription Error: {e}")
 
 # --- 🌐 UPSTOX WEBSOCKET STREAM CONNECTOR ---
 def start_upstox_websocket():
@@ -63,16 +87,20 @@ def start_upstox_websocket():
 
     def on_open(ws):
         logger.info("✅ Upstox Market Feed WebSocket Connected Successfully!")
+        # Initial default tokens send karna
         if SUBSCRIBED_TOKENS:
-            sub_msg = {
-                "guid": "some_guid",
-                "method": "sub",
-                "data": {
-                    "mode": "full",
-                    "instrumentKeys": list(SUBSCRIBED_TOKENS)
+            try:
+                sub_msg = {
+                    "guid": "initial_sub",
+                    "method": "sub",
+                    "data": {
+                        "mode": "full",
+                        "instrumentKeys": list(SUBSCRIBED_TOKENS)
+                    }
                 }
-            }
-            ws.send(json.dumps(sub_msg))
+                ws.send(json.dumps(sub_msg))
+            except Exception as e:
+                logger.error(f"❌ Initial WS Sub Send Error: {e}")
 
     def on_message(ws, message):
         try:
@@ -123,10 +151,11 @@ def start_upstox_websocket():
     except Exception as e:
         logger.error(f"❌ Failed to start Upstox WebSocket: {e}")
 
-# --- 🌐 SOCKET.IO CLIENT HANDLERS (Matching Android App Events) ---
+# --- 🌐 SOCKET.IO CLIENT HANDLERS ---
 @sio.event
 async def connect(sid, environ):
     logger.info(f"📱 Android Client Connected: {sid}")
+    # Client connect hote hi jo bhi LTP cache me hoga, turant bhej denge
     if LTP_CACHE:
         await sio.emit('initial_ltps', LTP_CACHE, room=sid)
 
@@ -137,30 +166,20 @@ async def subscribe_request(sid, data):
             data = json.loads(data)
             
         tokens_input = data.get("instrumentKeys") or data.get("tokens", [])
-        new_tokens = []
+        new_tokens_added = 0
+        
         for item in tokens_input:
             token = str(item).strip().replace(":", "|")
+            # Sirf tabhi add karenge jab wo pehle se subscribed na ho!
             if token and token not in SUBSCRIBED_TOKENS:
                 SUBSCRIBED_TOKENS.add(token)
-                new_tokens.append(token)
+                PENDING_TOKENS_QUEUE.add(token)
+                new_tokens_added += 1
                 
-        global upstox_ws_app
-        if upstox_ws_app and new_tokens:
-            try:
-                sub_msg = {
-                    "guid": "dynamic_sub",
-                    "method": "sub",
-                    "data": {
-                        "mode": "full",
-                        "instrumentKeys": new_tokens
-                    }
-                }
-                upstox_ws_app.send(json.dumps(sub_msg))
-            except Exception:
-                pass
-                
-        logger.info(f"Subscribed Upstox Keys Count: {len(SUBSCRIBED_TOKENS)}")
+        if new_tokens_added > 0:
+            logger.info(f"📥 Added {new_tokens_added} brand new tokens. Total Unique Subscribed: {len(SUBSCRIBED_TOKENS)}")
     except Exception as e:
+    
         logger.error(f"❌ Error in subscribe_request: {e}")
 
 @sio.event
@@ -181,8 +200,11 @@ app.router.add_get('/', home_route)
 async def start_background_tasks(app):
     global main_loop
     main_loop = asyncio.get_running_loop()
+    # 1. Upstox Feed WebSocket Thread Start
     threading.Thread(target=start_upstox_websocket, daemon=True).start()
-    logger.info("✅ Backend Service Initialized with Socket.IO & Upstox Feed.")
+    # 2. Batch Queue Processor Thread Start
+    threading.Thread(target=process_pending_subscriptions, daemon=True).start()
+    logger.info("✅ Backend Service Initialized with Smart Deduplication & Batching.")
 
 app.on_startup.append(start_background_tasks)
 
