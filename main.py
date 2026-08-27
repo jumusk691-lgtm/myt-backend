@@ -48,21 +48,28 @@ sio = socketio.AsyncServer(async_mode='aiohttp', cors_allowed_origins='*')
 app = web.Application()
 sio.attach(app)
 
-# Helper function to broadcast live price tick to clients
+# Helper function to broadcast live price tick to clients in both formats
 async def broadcast_tick(token: str, price: float):
     price_str = f"{price:.2f}"
     LTP_CACHE[token] = price_str
     
-    payload = {
-        "instrument_key": token,
-        "ltp": price_str
-    }
-    await sio.emit("live_data", payload)
+    # Broadcast standard key
+    await sio.emit("live_data", {"instrument_key": token, "ltp": price_str})
+    
+    # Also broadcast alternative format (pipe <-> colon) to ensure app catches it
+    if "|" in token:
+        alt_token = token.replace("|", ":")
+        LTP_CACHE[alt_token] = price_str
+        await sio.emit("live_data", {"instrument_key": alt_token, "ltp": price_str})
+    elif ":" in token:
+        alt_token = token.replace(":", "|")
+        LTP_CACHE[alt_token] = price_str
+        await sio.emit("live_data", {"instrument_key": alt_token, "ltp": price_str})
 
-    if token == "NSE_INDEX|Nifty 50":
+    if token in ["NSE_INDEX|Nifty 50", "NSE_INDEX:Nifty 50"]:
         LTP_CACHE["NIFTY"] = price_str
         await sio.emit("live_data", {"instrument_key": "NIFTY", "ltp": price_str})
-    elif token == "BSE_INDEX|SENSEX":
+    elif token in ["BSE_INDEX|SENSEX", "BSE_INDEX:SENSEX"]:
         LTP_CACHE["SENSEX"] = price_str
         await sio.emit("live_data", {"instrument_key": "SENSEX", "ltp": price_str})
 
@@ -77,7 +84,9 @@ async def start_upstox_ltp_poller():
     concurrency_limiter = asyncio.Semaphore(5)
 
     async def fetch_chunk(session, chunk_tokens):
-        keys_param = ",".join(chunk_tokens)
+        # Upstox API accepts comma-separated keys (can use colon or pipe, let's normalize to comma with colon/pipe as required)
+        formatted_tokens = [t.replace("|", ":") for t in chunk_tokens]
+        keys_param = ",".join(formatted_tokens)
         url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={keys_param}"
         
         async with concurrency_limiter:
@@ -88,13 +97,10 @@ async def start_upstox_ltp_poller():
                         if res_data.get("status") == "success" and "data" in res_data:
                             data_map = res_data["data"]
                             for key_alias, detail in data_map.items():
-                                inst_key = detail.get("instrument_token") or key_alias.replace(":", "|")
+                                inst_key = detail.get("instrument_token") or key_alias
                                 last_price = float(detail.get("last_price", 0.0))
                                 if last_price > 0:
                                     await broadcast_tick(inst_key, last_price)
-                                    if ":" in key_alias:
-                                        pipe_key = key_alias.replace(":", "|")
-                                        await broadcast_tick(pipe_key, last_price)
                     elif resp.status == 429:
                         await asyncio.sleep(3.0) 
             except Exception as e:
@@ -142,6 +148,12 @@ async def handle_subscription(sid, data):
                 
             if token:
                 SUBSCRIBED_TOKENS.add(token)
+                SUBSCRIBED_TOKENS.add(token.replace("|", ":"))
+                SUBSCRIBED_TOKENS.add(token.replace(":", "|"))
+        
+        # Instantly push whatever cached prices we have for these tokens to the client
+        if LTP_CACHE:
+            await sio.emit('initial_ltps', LTP_CACHE, room=sid)
     except Exception as e:
         logger.error(f"❌ Error in subscribe_tokens: {e}")
 
@@ -183,7 +195,7 @@ async def fetch_chart_data(request: web.Request):
         elif raw_interval in ["MONTH", "1MON", "1MONTH"]:
             unit = "month"
         else:
-            unit = "minute"  # Upstox historical API expects 'minute' for intraday sub-intervals
+            unit = "minute" 
 
         MINUTES_MAP = {
             "3MINUTE": 3, "THREE_MINUTE": 3, "3M": 3, "3minute": 3,
@@ -203,8 +215,7 @@ async def fetch_chart_data(request: web.Request):
         all_raw_candles = []
 
         async with aiohttp.ClientSession() as session:
-            if unit == "day" or unit == "week" or unit == "month":
-                # For higher timeframes, 60 days / 1 year query works directly
+            if unit in ["day", "week", "month"]:
                 to_date = datetime.datetime.now(IST).strftime("%Y-%m-%d")
                 from_date = (datetime.datetime.now(IST) - datetime.timedelta(days=60)).strftime("%Y-%m-%d")
                 hist_url = f"https://api.upstox.com/v2/historical-candle/{instrument_key}/{unit}/{to_date}/{from_date}"
@@ -214,12 +225,9 @@ async def fetch_chart_data(request: web.Request):
                         if res_hist.get("status") == "success":
                             all_raw_candles.extend(res_hist.get("data", {}).get("candles", []))
             else:
-                # --- 🛠️ 60-DAY MULTI-DAY CHUNK FETCHING FOR INTRADAY/MINUTE DATA ---
-                # Upstox needs historical-candle API with date ranges for 60 days minute data
                 end_date = datetime.datetime.now(IST)
                 start_date = end_date - datetime.timedelta(days=60)
                 
-                # Fetch in blocks of 7 days to prevent Upstox API timeouts/rejections
                 current_chunk_end = end_date
                 while current_chunk_end > start_date:
                     current_chunk_start = max(start_date, current_chunk_end - datetime.timedelta(days=7))
@@ -236,7 +244,7 @@ async def fetch_chart_data(request: web.Request):
                                 all_raw_candles.extend(chunk_candles)
                     
                     current_chunk_end = current_chunk_start - datetime.timedelta(days=1)
-                    await asyncio.sleep(0.05) # Prevent hammering API limits
+                    await asyncio.sleep(0.05)
 
         if all_raw_candles:
             seen_times = set()
@@ -250,7 +258,6 @@ async def fetch_chart_data(request: web.Request):
 
             unique_candles.sort(key=lambda x: x[0])
 
-            # --- 🛠️ RESAMPLE LOGIC FOR CUSTOM MINUTES (3M, 5M, 15M, etc.) ---
             if unit == "minute" and target_minutes > 1:
                 resampled = []
                 current_agg = None
@@ -266,7 +273,6 @@ async def fetch_chart_data(request: web.Request):
                             resampled.append(c)
                             continue
                     
-                    # Group by trading session interval blocks
                     mins_from_open = (dt.hour * 60 + dt.minute) - (9 * 60 + 15)
                     if mins_from_open < 0:
                         mins_from_open = 0
@@ -329,10 +335,9 @@ async def fetch_chart_data(request: web.Request):
 app.router.add_get('/', home_route)
 app.router.add_post('/api/get_chart_data', fetch_chart_data)
 
-# --- 🔄 BACKGROUND TASKS ---
 async def start_background_tasks(app):
     asyncio.create_task(start_upstox_ltp_poller())
-    logger.info("✅ Upstox Backend Service Initialized with 60-Day Chunk Engine.")
+    logger.info("✅ Upstox Backend Service Initialized.")
 
 app.on_startup.append(start_background_tasks)
 
