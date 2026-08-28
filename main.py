@@ -6,7 +6,6 @@ import os
 import pytz
 import socketio
 import aiohttp
-from aiohttp import web
 
 # --- Upstox Official SDK ---
 import upstox_client
@@ -16,15 +15,7 @@ from upstox_client.rest import ApiException
 IST = pytz.timezone('Asia/Kolkata')
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("MUNH_TITAN_PROD_UPSTOX")
-
-# --- ⚙️ INTERNAL APP STATE ENGINE ---
-class AppState:
-    def __init__(self):
-        self.api_instance = None
-        self.score = 0
-
-state = AppState()
+logger = logging.getLogger("MUNH_TITAN_REAL_DATA")
 
 # --- 🔑 UPSTOX CREDENTIALS ---
 API_KEY = "eba0a80f-c907-42fa-a926-6672a120254d"
@@ -38,13 +29,8 @@ ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", NEW_ANALYTICS_TOKEN).strip()
 configuration = upstox_client.Configuration()
 configuration.access_token = ACCESS_TOKEN
 
-# --- 🚀 GLOBAL STATES & PRE-POPULATED CACHE ---
-LTP_CACHE = {
-    "NSE_INDEX|Nifty 50": "24500.00",
-    "BSE_INDEX|SENSEX": "80500.00",
-    "NIFTY": "24500.00",
-    "SENSEX": "80500.00"
-}                 
+# --- 🚀 REAL DATA STORAGE (NO DEMO DATA) ---
+LTP_CACHE = {}                 
 SUBSCRIBED_TOKENS = set(["NSE_INDEX|Nifty 50", "BSE_INDEX|SENSEX"])
 MAIN_EVENT_LOOP = None
 streamer = None
@@ -54,7 +40,50 @@ sio = socketio.AsyncServer(async_mode='aiohttp', cors_allowed_origins='*')
 app = web.Application()
 sio.attach(app)
 
-# Helper function to broadcast live price tick to clients
+# --- 🌐 FETCH REAL LTP FROM UPSTOX REST API ---
+async def fetch_real_ltps_via_rest(tokens_list):
+    """
+    Fetches 100% real LTPs directly from Upstox REST API 
+    so that no demo or dummy data ever appears in the app.
+    """
+    if not tokens_list:
+        return
+    
+    try:
+        formatted_keys = ",".join([t.replace(":", "|") for t in tokens_list])
+        url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={formatted_keys}"
+        headers = {
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {ACCESS_TOKEN}'
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status == 200:
+                    res_json = await resp.json()
+                    if res_json.get("status") == "success":
+                        data = res_json.get("data", {})
+                        for inst_key, details in data.items():
+                            ltp = details.get("last_price")
+                            if ltp is not None:
+                                price_str = f"{float(ltp):.2f}"
+                                LTP_CACHE[inst_key] = price_str
+                                
+                                # Broadcast real tick to clients
+                                await sio.emit("live_data", {"instrument_key": inst_key, "ltp": price_str})
+                                
+                                # Handle Index aliases for Nifty / Sensex headers
+                                if "Nifty 50" in inst_key:
+                                    LTP_CACHE["NIFTY"] = price_str
+                                    await sio.emit("live_data", {"instrument_key": "NIFTY", "ltp": price_str})
+                                elif "SENSEX" in inst_key:
+                                    LTP_CACHE["SENSEX"] = price_str
+                                    await sio.emit("live_data", {"instrument_key": "SENSEX", "ltp": price_str})
+        logger.info(f"📊 Real LTPs fetched via REST for: {tokens_list}")
+    except Exception as e:
+        logger.error(f"❌ Error fetching real LTP via REST: {e}")
+
+# Helper function to broadcast live price tick from WebSocket
 async def broadcast_tick(token: str, price: float):
     price_str = f"{price:.2f}"
     LTP_CACHE[token] = price_str
@@ -66,10 +95,10 @@ async def broadcast_tick(token: str, price: float):
     await sio.emit("live_data", payload)
 
     # Standardize Index aliases for Android Client mapping
-    if token == "NSE_INDEX|Nifty 50" or "Nifty 50" in token:
+    if "Nifty 50" in token:
         LTP_CACHE["NIFTY"] = price_str
         await sio.emit("live_data", {"instrument_key": "NIFTY", "ltp": price_str})
-    elif token == "BSE_INDEX|SENSEX" or "SENSEX" in token:
+    elif "SENSEX" in token:
         LTP_CACHE["SENSEX"] = price_str
         await sio.emit("live_data", {"instrument_key": "SENSEX", "ltp": price_str})
 
@@ -134,6 +163,10 @@ async def start_upstox_websocket_streamer():
 @sio.event
 async def connect(sid, environ):
     logger.info(f"📱 Android Client Connected: {sid}")
+    # Fetch real initial data immediately on connection
+    if SUBSCRIBED_TOKENS:
+        await fetch_real_ltps_via_rest(list(SUBSCRIBED_TOKENS))
+    
     if LTP_CACHE:
         await sio.emit('initial_ltps', LTP_CACHE, room=sid)
 
@@ -143,6 +176,8 @@ async def handle_subscription(sid, data):
             data = json.loads(data)
             
         tokens_input = data.get("instrumentKeys") or data.get("tokens", [])
+        new_tokens_to_fetch = []
+        
         for item in tokens_input:
             if isinstance(item, dict):
                 token = str(item.get("token") or item.get("instrument_key", "")).strip()
@@ -152,12 +187,17 @@ async def handle_subscription(sid, data):
             if token:
                 norm_token = token.replace(":", "|")
                 SUBSCRIBED_TOKENS.add(norm_token)
+                new_tokens_to_fetch.append(norm_token)
                 try:
                     if streamer:
                         streamer.subscribe([norm_token], "ltpc")
                 except Exception as sub_err:
                     logger.error(f"❌ Dynamic subscription error for {norm_token}: {sub_err}")
                 
+        # Fetch real LTP via REST immediately for newly subscribed tokens
+        if new_tokens_to_fetch:
+            await fetch_real_ltps_via_rest(new_tokens_to_fetch)
+            
         logger.info(f"Subscribed Upstox Keys Count: {len(SUBSCRIBED_TOKENS)}")
     except Exception as e:
         logger.error(f"❌ Error in subscribe_tokens: {e}")
@@ -178,8 +218,8 @@ async def disconnect(sid):
 async def home_route(request: web.Request):
     return web.json_response({
         "status": True,
-        "message": "MUNH Titan Upstox Backend Service is Live & Running!",
-        "version": "1.0.3"
+        "message": "MUNH Titan Real-Data Upstox Backend Service is Live!",
+        "version": "1.0.4"
     })
 
 async def fetch_chart_data(request: web.Request):
@@ -223,7 +263,7 @@ async def fetch_chart_data(request: web.Request):
         all_raw_candles = []
 
         async with aiohttp.ClientSession() as session:
-            # 1️⃣ INTRA-DAY CANDLES
+            # 1️⃣ REAL INTRA-DAY CANDLES FROM UPSTOX
             intraday_url = f"https://api.upstox.com/v2/historical-candle/intraday/{instrument_key}/{unit}"
             async with session.get(intraday_url, headers=headers) as resp_intra:
                 if resp_intra.status == 200:
@@ -232,7 +272,7 @@ async def fetch_chart_data(request: web.Request):
                         intra_candles = res_intra.get("data", {}).get("candles", [])
                         all_raw_candles.extend(intra_candles)
 
-            # 2️⃣ HISTORICAL CANDLES
+            # 2️⃣ REAL HISTORICAL CANDLES FROM UPSTOX
             hist_url = f"https://api.upstox.com/v2/historical-candle/{instrument_key}/{unit}/{to_date}/{from_date}"
             async with session.get(hist_url, headers=headers) as resp_hist:
                 if resp_hist.status == 200:
@@ -253,7 +293,7 @@ async def fetch_chart_data(request: web.Request):
 
             unique_candles.sort(key=lambda x: x[0])
 
-            # --- 🛠️ RESAMPLE CANDLES FOR HIGHER TIMEFRAMES ---
+            # --- 🛠️ RESAMPLE REAL CANDLES FOR HIGHER TIMEFRAMES ---
             if unit == "1minute" and target_minutes > 1:
                 resampled = []
                 current_agg = None
@@ -309,7 +349,7 @@ async def fetch_chart_data(request: web.Request):
                 
                 unique_candles = resampled
 
-            # --- 🕒 CONVERT TIMESTAMPS TO EPOCH SECONDS FOR ANDROID CHARTS ---
+            # --- 🕒 CONVERT REAL TIMESTAMPS TO EPOCH SECONDS ---
             formatted_candles = []
             for c in unique_candles:
                 t_raw = c[0]
@@ -317,7 +357,6 @@ async def fetch_chart_data(request: web.Request):
                     if isinstance(t_raw, (int, float)):
                         t_val = int(t_raw)
                     elif isinstance(t_raw, str):
-                        # Handle ISO timestamp string from Upstox
                         dt = datetime.datetime.fromisoformat(t_raw.replace('Z', '+00:00'))
                         t_val = int(dt.timestamp())
                     else:
@@ -335,7 +374,7 @@ async def fetch_chart_data(request: web.Request):
 
             return web.json_response({"status": True, "message": "SUCCESS", "data": formatted_candles})
 
-        return web.json_response({"status": False, "message": "Historical data unavailable", "data": []})
+        return web.json_response({"status": False, "message": "Real historical data unavailable from Upstox", "data": []})
 
     except Exception as e:
         logger.error(f"Exception in fetch_chart_data: {e}")
@@ -349,7 +388,7 @@ async def start_background_tasks(app):
     global MAIN_EVENT_LOOP
     MAIN_EVENT_LOOP = asyncio.get_running_loop()
     asyncio.create_task(start_upstox_websocket_streamer())
-    logger.info("✅ Upstox Backend Service Initialized with WebSocket Streamer.")
+    logger.info("✅ Upstox Real-Data Backend Service Initialized.")
 
 app.on_startup.append(start_background_tasks)
 
