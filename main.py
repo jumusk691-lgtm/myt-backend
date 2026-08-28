@@ -41,6 +41,7 @@ configuration.access_token = ACCESS_TOKEN
 LTP_CACHE = {} 
 SUBSCRIBED_TOKENS = set(["NSE_INDEX|Nifty 50", "BSE_INDEX|SENSEX"])
 MAIN_EVENT_LOOP = None
+streamer = None
 
 # Socket.IO & Aiohttp Setup
 sio = socketio.AsyncServer(async_mode='aiohttp', cors_allowed_origins='*')
@@ -67,6 +68,7 @@ async def broadcast_tick(token: str, price: float):
 
 # --- 🔄 UPSTOX OFFICIAL SDK MARKET DATA STREAMER V3 ---
 async def start_upstox_websocket_streamer():
+    global streamer
     logger.info("⚡ Upstox MarketDataStreamerV3 Initializing...")
     
     def on_open():
@@ -74,6 +76,7 @@ async def start_upstox_websocket_streamer():
         if SUBSCRIBED_TOKENS:
             try:
                 streamer.subscribe(list(SUBSCRIBED_TOKENS), "ltpc")
+                logger.info(f"📡 Initial Subscribed Tokens Sent: {list(SUBSCRIBED_TOKENS)}")
             except Exception as e:
                 logger.error(f"❌ Error in initial subscription: {e}")
 
@@ -106,7 +109,6 @@ async def start_upstox_websocket_streamer():
 
     try:
         api_client = upstox_client.ApiClient(configuration)
-        global streamer
         streamer = upstox_client.MarketDataStreamerV3(api_client)
 
         streamer.on("open", on_open)
@@ -139,13 +141,13 @@ async def handle_subscription(sid, data):
             else:
                 token = str(item).strip()
             if token:
+                token = token.replace(":", "|") # Fix format compatibility
                 SUBSCRIBED_TOKENS.add(token)
                 try:
-                    global streamer
-                    if 'streamer' in globals() and streamer:
+                    if streamer:
                         streamer.subscribe([token], "ltpc")
-                except Exception:
-                    pass
+                except Exception as sub_err:
+                    logger.error(f"❌ Dynamic subscription error for {token}: {sub_err}")
         logger.info(f"Subscribed Upstox Keys Count: {len(SUBSCRIBED_TOKENS)}")
     except Exception as e:
         logger.error(f"❌ Error in subscribe_tokens: {e}")
