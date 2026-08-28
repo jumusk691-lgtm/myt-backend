@@ -115,34 +115,17 @@ async def start_upstox_websocket_streamer():
 
                 async for message in websocket:
                     try:
-                        # Parse binary/protobuf or JSON feed from Upstox (Depending on SDK, handling standard payload text/bytes)
                         if isinstance(message, bytes):
-                            # Upstox sends binary Protobuf feed, decoding using official upstox client if available or fallback
-                            # For safety with standard upstox protobuf, let's use the standard json/binary parser if applicable, 
-                            # or if it's text json:
                             pass
-                        
-                        # Note: Upstox WebSocket sends binary protobuf data. Let's decode it safely:
-                        # If your upstox library handles market data feed decoder:
-                        import google.protobuf.json_format as json_format
-                        # Fallback parsing mechanism for binary feed if needed, or handle text messages:
-                        if isinstance(message, bytes):
-                            from upstox_client.feeder import MarketDataFeed  # type: ignore
-                            # If standard binary feed comes in, we can parse or handle safely.
-                            # To keep it lightweight and robust without breaking your exact payload:
-                            pass
-                            
-                    except Exception as parse_err:
-                        # If it's standard json or text payload:
-                        try:
+                        else:
                             data_dict = json.loads(message)
                             feeds = data_dict.get("feeds", {})
                             for inst_key, details in feeds.items():
                                 ltp = details.get("ff", {}).get("market_ff", {}).get("ltp")
                                 if ltp:
                                     await broadcast_tick(inst_key, float(ltp))
-                        except Exception:
-                            pass
+                    except Exception as parse_err:
+                        pass
 
                     # Dynamically update subscriptions if new tokens are added by Android users
                     current_tokens = list(SUBSCRIBED_TOKENS)
@@ -156,8 +139,7 @@ async def start_upstox_websocket_streamer():
                     }
                     await websocket.send(json.dumps(sub_message))
 
-        py_except = Exception
-        except py_except as ws_err:
+        except Exception as ws_err:
             logger.warning(f"⚠️ WebSocket connection dropped: {ws_err}. Reconnecting in 3 seconds...")
             await asyncio.sleep(3.0)
 
@@ -212,11 +194,9 @@ async def fetch_chart_data(request: web.Request):
         if not instrument_key:
             return web.json_response({"status": False, "message": "Missing instrument_key"}, status=400)
         
-        # Pipe formatting for Upstox Key
         instrument_key = instrument_key.replace(":", "|")
         dt = datetime.datetime.now(IST)
         
-        # Target minutes mapping
         target_minutes = 5
         if "1MIN" in raw_interval:
             target_minutes = 1
@@ -227,10 +207,9 @@ async def fetch_chart_data(request: web.Request):
         elif "1HOUR" in raw_interval or "60MIN" in raw_interval:
             target_minutes = 60
 
-        # Calculate minutes elapsed since market open (09:15 AM)
         mins_from_open = (dt.hour * 60 + dt.minute) - (9 * 60 + 15)
         if mins_from_open < 0:
-            mins_from_open = 0 # Handle pre-market data safely
+            mins_from_open = 0
 
         return web.json_response({"status": True, "message": "SUCCESS", "data": []})
     except Exception as e:
