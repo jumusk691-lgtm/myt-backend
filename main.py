@@ -72,13 +72,13 @@ async def start_upstox_websocket_streamer():
         logger.info("🟢 Connected to Upstox Market Data Feed V3 WebSocket successfully!")
         if SUBSCRIBED_TOKENS:
             try:
-                streamer.subscribe(list(SUBSCRIBED_TOKENS), "ltp")
+                # 🛠️ यहाँ "ltp" की जगह "ltpc" कर दिया गया है
+                streamer.subscribe(list(SUBSCRIBED_TOKENS), "ltpc")
             except Exception as e:
                 logger.error(f"❌ Error in initial subscription: {e}")
 
     def on_message(message):
         try:
-            # Handling incoming feed data safely from SDK streamer
             if isinstance(message, dict):
                 feeds = message.get("feeds", {})
                 for inst_key, details in feeds.items():
@@ -110,7 +110,6 @@ async def start_upstox_websocket_streamer():
         streamer.on("error", on_error)
         streamer.on("close", on_close)
 
-        # Run streamer connection asynchronously without blocking the event loop
         await asyncio.to_thread(streamer.connect)
 
     except Exception as e:
@@ -140,7 +139,8 @@ async def handle_subscription(sid, data):
                 try:
                     global streamer
                     if 'streamer' in globals() and streamer:
-                        streamer.subscribe([token], "ltp")
+                        # 🛠️ यहाँ भी "ltp" की जगह "ltpc" कर दिया गया है
+                        streamer.subscribe([token], "ltpc")
                 except Exception:
                     pass
         logger.info(f"Subscribed Upstox Keys Count: {len(SUBSCRIBED_TOKENS)}")
@@ -159,7 +159,7 @@ async def subscribe_request(sid, data):
 async def disconnect(sid):
     logger.info(f"📱 Android Client Disconnected: {sid}")
 
-# --- 🌐 REST HTTP API ENDPOINTS ---
+# --- 🌐 REST HTTP API ENDPOINTS (FULL HISTORICAL CANDLE FETCHING) ---
 async def home_route(request: web.Request):
     return web.json_response({
         "status": True,
@@ -178,7 +178,36 @@ async def fetch_chart_data(request: web.Request):
         instrument_key = instrument_key.replace(":", "|")
         dt = datetime.datetime.now(IST)
         
-        return web.json_response({"status": True, "message": "SUCCESS", "data": []})
+        interval_map = {
+            "1MIN": "1minute", "1MINUTE": "1minute",
+            "5MIN": "5minute", "5MINUTE": "5minute",
+            "15MIN": "15minute", "15MINUTE": "15minute",
+            "30MIN": "30minute", "30MINUTE": "30minute",
+            "1HOUR": "60minute", "60MIN": "60minute",
+            "DAY": "day", "1DAY": "day"
+        }
+        interval = interval_map.get(raw_interval, "5minute")
+        
+        to_date = dt.strftime("%Y-%m-%d")
+        from_date = (dt - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
+        
+        historical_url = f"https://api.upstox.com/v2/historical-candle/{instrument_key}/{interval}/{to_date}/{from_date}"
+        headers = {
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {ACCESS_TOKEN}'
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(historical_url, headers=headers) as resp:
+                if resp.status == 200:
+                    res_json = await resp.json()
+                    if res_json.get("status") == "success":
+                        candles = res_json.get("data", {}).get("candles", [])
+                        return web.json_response({"status": True, "message": "SUCCESS", "data": candles})
+                
+                logger.warning(f"⚠️ Failed to fetch historical candles from Upstox, status: {resp.status}")
+                return web.json_response({"status": False, "message": "Failed to fetch from Upstox", "data": []}, status=resp.status)
+
     except Exception as e:
         logger.error(f"Exception in fetch_chart_data: {e}")
         return web.json_response({"status": False, "message": str(e), "data": []}, status=500)
