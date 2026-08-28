@@ -72,19 +72,23 @@ async def start_upstox_websocket_streamer():
         logger.info("🟢 Connected to Upstox Market Data Feed V3 WebSocket successfully!")
         if SUBSCRIBED_TOKENS:
             try:
-                # 🛠️ यहाँ "ltp" की जगह "ltpc" कर दिया गया है
                 streamer.subscribe(list(SUBSCRIBED_TOKENS), "ltpc")
             except Exception as e:
                 logger.error(f"❌ Error in initial subscription: {e}")
 
     def on_message(message):
         try:
+            if isinstance(message, str):
+                message = json.loads(message)
+
             if isinstance(message, dict):
                 feeds = message.get("feeds", {})
                 for inst_key, details in feeds.items():
                     ltp_val = None
                     if "ltpc" in details:
                         ltp_val = details["ltpc"].get("ltp")
+                    elif "market_ff" in details:
+                        ltp_val = details.get("market_ff", {}).get("ltp")
                     elif "ff" in details:
                         ltp_val = details.get("ff", {}).get("market_ff", {}).get("ltp")
                     
@@ -92,7 +96,7 @@ async def start_upstox_websocket_streamer():
                         loop = asyncio.get_event_loop()
                         loop.create_task(broadcast_tick(inst_key, float(ltp_val)))
         except Exception as e:
-            pass
+            logger.error(f"❌ Error parsing message: {e}")
 
     def on_error(error):
         logger.error(f"❌ Upstox Streamer Error: {error}")
@@ -139,7 +143,6 @@ async def handle_subscription(sid, data):
                 try:
                     global streamer
                     if 'streamer' in globals() and streamer:
-                        # 🛠️ यहाँ भी "ltp" की जगह "ltpc" कर दिया गया है
                         streamer.subscribe([token], "ltpc")
                 except Exception:
                     pass
