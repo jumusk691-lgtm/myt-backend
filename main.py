@@ -38,8 +38,13 @@ ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", NEW_ANALYTICS_TOKEN).strip()
 configuration = upstox_client.Configuration()
 configuration.access_token = ACCESS_TOKEN
 
-# --- 🚀 GLOBAL STATES & SCORE TRACKING ---
-LTP_CACHE = {}                 
+# --- 🚀 GLOBAL STATES & PRE-POPULATED CACHE ---
+LTP_CACHE = {
+    "NSE_INDEX|Nifty 50": "24500.00",
+    "BSE_INDEX|SENSEX": "80500.00",
+    "NIFTY": "24500.00",
+    "SENSEX": "80500.00"
+}                 
 SUBSCRIBED_TOKENS = set(["NSE_INDEX|Nifty 50", "BSE_INDEX|SENSEX"])
 MAIN_EVENT_LOOP = None
 streamer = None
@@ -68,7 +73,7 @@ async def broadcast_tick(token: str, price: float):
         LTP_CACHE["SENSEX"] = price_str
         await sio.emit("live_data", {"instrument_key": "SENSEX", "ltp": price_str})
 
-# --- 🔄 UPSTOX OFFICIAL WEBSOCKET STREAMER (REPLACING POLLER) ---
+# --- 🔄 UPSTOX OFFICIAL WEBSOCKET STREAMER ---
 async def start_upstox_websocket_streamer():
     global streamer
     logger.info("⚡ Upstox MarketDataStreamerV3 WebSocket Connecting...")
@@ -174,7 +179,7 @@ async def home_route(request: web.Request):
     return web.json_response({
         "status": True,
         "message": "MUNH Titan Upstox Backend Service is Live & Running!",
-        "version": "1.0.2"
+        "version": "1.0.3"
     })
 
 async def fetch_chart_data(request: web.Request):
@@ -184,12 +189,10 @@ async def fetch_chart_data(request: web.Request):
         raw_interval = str(d.get('interval', "5minute")).strip().upper()
 
         if not instrument_key:
-            return web.json_response({"status": False, "message": "Missing instrument_key"}, status=400)
+            return web.json_response({"status": False, "message": "Missing instrument_key", "data": []}, status=400)
 
-        # Pipe formatting for Upstox Key
         instrument_key = instrument_key.replace(":", "|")
 
-        # --- 🛠️ UPDATED INTERVAL LOGIC (ORIGINAL) ---
         if raw_interval in ["DAY", "ONE_DAY", "1D"]:
             unit = "day"
         elif raw_interval in ["WEEK", "1W", "1WEEK"]:
@@ -258,10 +261,10 @@ async def fetch_chart_data(request: web.Request):
                 for c in unique_candles:
                     t_str = c[0]
                     try:
-                        dt = datetime.datetime.fromisoformat(t_str)
+                        dt = datetime.datetime.fromisoformat(str(t_str).replace('Z', '+00:00'))
                     except ValueError:
                         try:
-                            dt = datetime.datetime.strptime(t_str[:19], "%Y-%m-%dT%H:%M:%S")
+                            dt = datetime.datetime.strptime(str(t_str)[:19], "%Y-%m-%dT%H:%M:%S")
                         except ValueError:
                             resampled.append(c)
                             continue
@@ -306,16 +309,29 @@ async def fetch_chart_data(request: web.Request):
                 
                 unique_candles = resampled
 
-            formatted_candles = [
-                {
-                    "time": c[0],
+            # --- 🕒 CONVERT TIMESTAMPS TO EPOCH SECONDS FOR ANDROID CHARTS ---
+            formatted_candles = []
+            for c in unique_candles:
+                t_raw = c[0]
+                try:
+                    if isinstance(t_raw, (int, float)):
+                        t_val = int(t_raw)
+                    elif isinstance(t_raw, str):
+                        # Handle ISO timestamp string from Upstox
+                        dt = datetime.datetime.fromisoformat(t_raw.replace('Z', '+00:00'))
+                        t_val = int(dt.timestamp())
+                    else:
+                        t_val = int(time.time())
+                except Exception:
+                    t_val = int(time.time())
+
+                formatted_candles.append({
+                    "time": t_val,
                     "open": float(c[1]),
                     "high": float(c[2]),
                     "low": float(c[3]),
                     "close": float(c[4])
-                }
-                for c in unique_candles
-            ]
+                })
 
             return web.json_response({"status": True, "message": "SUCCESS", "data": formatted_candles})
 
