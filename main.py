@@ -47,13 +47,12 @@ sio = socketio.AsyncServer(async_mode='aiohttp', cors_allowed_origins='*')
 app = web.Application()
 sio.attach(app)
 
-# REST Fallback fetcher to grab instant index prices if websocket feed hasn't ticked yet
+# REST Fallback fetcher to grab instant index prices via Upstox Market Quote API
 async def fetch_initial_index_prices():
     headers = {
         'Accept': 'application/json',
         'Authorization': f'Bearer {ACCESS_TOKEN}'
     }
-    # Upstox V2 Market Quote LTP API endpoint
     quote_url = "https://api.upstox.com/v2/market-quote/ltp?instrument_key=NSE_INDEX%7CNifty%2050,BSE_INDEX%7CSENSEX"
     try:
         async with aiohttp.ClientSession() as session:
@@ -66,34 +65,47 @@ async def fetch_initial_index_prices():
                             ltp = val.get("last_price")
                             if ltp is not None:
                                 price_str = f"{float(ltp):.2f}"
+                                # Map both pipe and colon variations so Android client catches them instantly
+                                alt_key = key.replace("|", ":")
                                 LTP_CACHE[key] = price_str
-                                if key == "NSE_INDEX|Nifty 50":
+                                LTP_CACHE[alt_key] = price_str
+                                
+                                if "Nifty 50" in key:
                                     LTP_CACHE["NIFTY"] = price_str
                                     await sio.emit("live_data", {"instrument_key": "NIFTY", "ltp": price_str})
-                                    await sio.emit("live_data", {"instrument_key": "NSE_INDEX|Nifty 50", "ltp": price_str})
-                                elif key == "BSE_INDEX|SENSEX":
+                                    await sio.emit("live_data", {"instrument_key": key, "ltp": price_str})
+                                    await sio.emit("live_data", {"instrument_key": alt_key, "ltp": price_str})
+                                elif "SENSEX" in key:
                                     LTP_CACHE["SENSEX"] = price_str
                                     await sio.emit("live_data", {"instrument_key": "SENSEX", "ltp": price_str})
-                                    await sio.emit("live_data", {"instrument_key": "BSE_INDEX|SENSEX", "ltp": price_str})
-                        logger.info(f"📊 Initial REST Indices LTP Fetched: {LTP_CACHE}")
+                                    await sio.emit("live_data", {"instrument_key": key, "ltp": price_str})
+                                    await sio.emit("live_data", {"instrument_key": alt_key, "ltp": price_str})
+                        logger.info(f"📊 Initial REST Indices LTP Fetched & Broadcasted: {LTP_CACHE}")
     except Exception as e:
         logger.error(f"❌ Error fetching REST initial quote: {e}")
 
-# Helper function to broadcast live price tick to clients
+# Helper function to broadcast live price tick to clients with multi-format keys
 async def broadcast_tick(token: str, price: float):
     price_str = f"{price:.2f}"
+    alt_token = token.replace("|", ":") if "|" in token else token.replace(":", "|")
+    
     LTP_CACHE[token] = price_str
+    LTP_CACHE[alt_token] = price_str
+    
     payload = {
         "instrument_key": token,
         "ltp": price_str
     }
     await sio.emit("live_data", payload)
+    
+    # Also emit with alternate token formatting
+    await sio.emit("live_data", {"instrument_key": alt_token, "ltp": price_str})
 
     # Standardize Index aliases for Android Client mapping
-    if token == "NSE_INDEX|Nifty 50":
+    if "Nifty 50" in token or token == "NIFTY":
         LTP_CACHE["NIFTY"] = price_str
         await sio.emit("live_data", {"instrument_key": "NIFTY", "ltp": price_str})
-    elif token == "BSE_INDEX|SENSEX":
+    elif "SENSEX" in token or token == "SENSEX":
         LTP_CACHE["SENSEX"] = price_str
         await sio.emit("live_data", {"instrument_key": "SENSEX", "ltp": price_str})
 
@@ -161,7 +173,7 @@ async def connect(sid, environ):
     SUBSCRIBED_TOKENS.add("NSE_INDEX|Nifty 50")
     SUBSCRIBED_TOKENS.add("BSE_INDEX|SENSEX")
     
-    # Fetch fresh REST quote immediately upon client connection to populate instant indices
+    # Fetch and push immediate LTP data via REST fallback
     await fetch_initial_index_prices()
     
     if LTP_CACHE:
@@ -178,13 +190,14 @@ async def handle_subscription(sid, data):
             else:
                 token = str(item).strip()
             if token:
-                token = token.replace(":", "|") 
-                SUBSCRIBED_TOKENS.add(token)
+                # Handle both delimiters for Upstox compatibility
+                norm_token = token.replace(":", "|")
+                SUBSCRIBED_TOKENS.add(norm_token)
                 try:
                     if streamer:
-                        streamer.subscribe([token], "ltpc")
+                        streamer.subscribe([norm_token], "ltpc")
                 except Exception as sub_err:
-                    logger.error(f"❌ Dynamic subscription error for {token}: {sub_err}")
+                    logger.error(f"❌ Dynamic subscription error for {norm_token}: {sub_err}")
         logger.info(f"Subscribed Upstox Keys Count: {len(SUBSCRIBED_TOKENS)}")
     except Exception as e:
         logger.error(f"❌ Error in subscribe_tokens: {e}")
@@ -206,7 +219,7 @@ async def home_route(request: web.Request):
     return web.json_response({
         "status": True,
         "message": "MUNH Titan Upstox Backend Service is Live & Running via MarketDataStreamerV3!",
-        "version": "1.0.3"
+        "version": "1.0.4"
     })
 
 async def fetch_chart_data(request: web.Request):
@@ -257,11 +270,8 @@ async def fetch_chart_data(request: web.Request):
                     status_val = res_json.get("status")
                     if status_val == "success" or status_val is True:
                         candles = res_json.get("data", {}).get("candles", [])
-                        
-                        # Upstox returns candles in descending order. Reverse to ascending for Lightweight Charts.
                         candles.reverse()
                         
-                        # Format each candle explicitly into [timestamp, open, high, low, close, volume]
                         formatted_candles = []
                         for c in candles:
                             if len(c) >= 6:
