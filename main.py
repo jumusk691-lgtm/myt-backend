@@ -31,7 +31,7 @@ API_SECRET = os.getenv("UPSTOX_API_SECRET", "cg0pdqyg8t")
 
 # 1-YEAR ANALYTICS ACCESS TOKEN
 NEW_ANALYTICS_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI2MkFIN0siLCJqdGkiOiI2YTdhMTJlZjk1YjgyYzEzZjc5OWEyMmIiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlzRXh0ZW5kZWQiOnRydWUsImlhdCI6MTc4NjM4NTEzNSwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxODE3OTM1MjAwfQ.0z7HMMUZUwJ6mRkzY3EUE1bB36_i1c7M-6yiNc8clgs"
-ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", NEW_ANALYTICS_TOKEN).strip()
+ACCESS_TOKEN = os.getenv("UPSTox_ACCESS_TOKEN", NEW_ANALYTICS_TOKEN).strip()
 
 configuration = upstox_client.Configuration()
 configuration.access_token = ACCESS_TOKEN
@@ -57,7 +57,7 @@ async def broadcast_tick(token: str, price: float):
     }
     await sio.emit("live_data", payload)
 
-    # Standardize Index aliases for Android Client mapping
+    # Standardize Index aliases for Android Client mapping (Ensures both exact tokens & aliases broadcast)
     if token == "NSE_INDEX|Nifty 50":
         LTP_CACHE["NIFTY"] = price_str
         await sio.emit("live_data", {"instrument_key": "NIFTY", "ltp": price_str})
@@ -126,6 +126,9 @@ async def start_upstox_websocket_streamer():
 @sio.event
 async def connect(sid, environ):
     logger.info(f"📱 Android Client Connected: {sid}")
+    # Force auto-subscribe Nifty and Sensex on every client connection
+    SUBSCRIBED_TOKENS.add("NSE_INDEX|Nifty 50")
+    SUBSCRIBED_TOKENS.add("BSE_INDEX|SENSEX")
     if LTP_CACHE:
         await sio.emit('initial_ltps', LTP_CACHE, room=sid)
 
@@ -168,7 +171,7 @@ async def home_route(request: web.Request):
     return web.json_response({
         "status": True,
         "message": "MUNH Titan Upstox Backend Service is Live & Running via MarketDataStreamerV3!",
-        "version": "1.0.1"
+        "version": "1.0.2"
     })
 
 async def fetch_chart_data(request: web.Request):
@@ -177,7 +180,6 @@ async def fetch_chart_data(request: web.Request):
         instrument_key = str(d.get('token', '') or d.get('instrument_key', '')).strip()
         raw_interval = str(d.get('interval', "FIVE_MINUTE")).strip().upper()
         
-        # Accept dynamic limit/fromdate/todate requested by Android app
         limit = int(d.get('limit', 150))
         passed_from = d.get('fromdate')
         passed_to = d.get('todate')
@@ -187,7 +189,6 @@ async def fetch_chart_data(request: web.Request):
         
         instrument_key = instrument_key.replace(":", "|")
         
-        # Comprehensive interval mapping matching Upstox V2 API specifications
         interval_map = {
             "ONE_MINUTE": "1minute", "1M": "1minute", "1MIN": "1minute",
             "THREE_MINUTE": "3minute", "3M": "3minute", "3MIN": "3minute",
@@ -222,18 +223,32 @@ async def fetch_chart_data(request: web.Request):
                     if status_val == "success" or status_val is True:
                         candles = res_json.get("data", {}).get("candles", [])
                         
-                        # Upstox returns candles in descending order (latest first). 
-                        # Reverse them to chronological ascending order so lightweight-charts plots properly.
+                        # Upstox returns candles in descending order. Reverse to ascending for Lightweight Charts.
                         candles.reverse()
                         
-                        # Respect requested limit slice
-                        if len(candles) > limit:
-                            candles = candles[-limit:]
+                        # Format each candle explicitly into [timestamp, open, high, low, close, volume]
+                        formatted_candles = []
+                        for c in candles:
+                            if len(c) >= 6:
+                                try:
+                                    formatted_candles.append([
+                                        str(c[0]),
+                                        float(c[1]),
+                                        float(c[2]),
+                                        float(c[3]),
+                                        float(c[4]),
+                                        float(c[5])
+                                    ])
+                                except (ValueError, TypeError):
+                                    continue
+
+                        if len(formatted_candles) > limit:
+                            formatted_candles = formatted_candles[-limit:]
 
                         return web.json_response({
                             "status": True, 
                             "message": "SUCCESS", 
-                            "data": candles
+                            "data": formatted_candles
                         })
                 
                 resp_text = await resp.text()
