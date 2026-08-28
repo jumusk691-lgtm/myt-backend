@@ -29,8 +29,9 @@ ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", DEFAULT_TOKEN).strip()
 configuration = upstox_client.Configuration()
 configuration.access_token = ACCESS_TOKEN
 
-# --- 🚀 REAL WEBSOCKET DATA STORAGE ---
+# --- 🚀 REAL WEBSOCKET DATA & LIVE CANDLE STORAGE ---
 LTP_CACHE = {}                 
+LIVE_CANDLES_CACHE = {}        # Real-time candle builder cache from websocket ticks
 SUBSCRIBED_TOKENS = set(["NSE_INDEX|Nifty 50", "BSE_INDEX|SENSEX"])
 CONNECTED_CLIENTS = set()
 MAIN_EVENT_LOOP = None
@@ -39,15 +40,56 @@ streamer = None
 # Aiohttp App Setup
 app = web.Application()
 
-# --- 📡 BROADCAST LIVE TICK & OHLC TO NATIVE WEBSOCKET CLIENTS ---
-async def broadcast_tick(token: str, price: float, ohlc_data: dict = None):
+# --- 🕒 MARKET STATUS CHECKER (ON / OFF) ---
+def is_market_open() -> bool:
+    now = datetime.datetime.now(IST)
+    # Weekend check (Saturday = 5, Sunday = 6)
+    if now.weekday() >= 5:
+        return False
+    
+    market_start = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    market_end = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    
+    return market_start <= now <= market_end
+
+# --- 📡 BROADCAST LIVE TICK & REAL-TIME CANDLE TO NATIVE WEBSOCKET CLIENTS ---
+async def broadcast_tick(token: str, price: float):
     price_str = f"{price:.2f}"
     LTP_CACHE[token] = price_str
     
+    # Real-time 1-minute Candle Aggregation from WebSocket Ticks
+    now_dt = datetime.datetime.now(IST)
+    current_minute_key = now_dt.strftime("%Y-%m-%d %H:%M")
+    
+    if token not in LIVE_CANDLES_CACHE:
+        LIVE_CANDLES_CACHE[token] = {}
+        
+    if current_minute_key not in LIVE_CANDLES_CACHE[token]:
+        LIVE_CANDLES_CACHE[token][current_minute_key] = {
+            "time": int(now_dt.timestamp()),
+            "open": price,
+            "high": price,
+            "low": price,
+            "close": price
+        }
+    else:
+        candle = LIVE_CANDLES_CACHE[token][current_minute_key]
+        candle["high"] = max(candle["high"], price)
+        candle["low"] = min(candle["low"], price)
+        candle["close"] = price
+
+    current_candle = LIVE_CANDLES_CACHE[token][current_minute_key]
+
     payload = {
         "instrument_key": token,
         "ltp": price_str,
-        "ohlc": ohlc_data if ohlc_data else {}
+        "live_candle": {
+            "time": current_candle["time"],
+            "open": f"{current_candle['open']:.2f}",
+            "high": f"{current_candle['high']:.2f}",
+            "low": f"{current_candle['low']:.2f}",
+            "close": f"{current_candle['close']:.2f}"
+        }
     }
     
     # Standardize Index aliases for Android Client mapping
@@ -69,18 +111,17 @@ async def broadcast_tick(token: str, price: float, ohlc_data: dict = None):
         for ws in disconnected:
             CONNECTED_CLIENTS.discard(ws)
 
-# --- 🔄 UPSTOX OFFICIAL WEBSOCKET STREAMER (FULL MODE FOR OHLC & CANDLES) ---
+# --- 🔄 UPSTOX OFFICIAL WEBSOCKET STREAMER (100% REAL-TIME) ---
 async def start_upstox_websocket_streamer():
     global streamer
-    logger.info("⚡ Upstox MarketDataStreamerV3 WebSocket Connecting (Full Mode)...")
+    logger.info("⚡ Upstox MarketDataStreamerV3 WebSocket Connecting...")
     
     def on_open():
         logger.info("🟢 Upstox WebSocket Connected Successfully via SDK!")
         if SUBSCRIBED_TOKENS:
             try:
-                # Subscribing with 'full' mode so we get LTP + OHLC directly via WS
-                streamer.subscribe(list(SUBSCRIBED_TOKENS), "full")
-                logger.info(f"📡 Subscribed Tokens on WS Open (Full Mode): {list(SUBSCRIBED_TOKENS)}")
+                streamer.subscribe(list(SUBSCRIBED_TOKENS), "ltpc")
+                logger.info(f"📡 Subscribed Tokens on WS Open: {list(SUBSCRIBED_TOKENS)}")
             except Exception as e:
                 logger.error(f"❌ Error in streamer subscription: {e}")
 
@@ -93,29 +134,15 @@ async def start_upstox_websocket_streamer():
                 feeds = message.get("feeds", {})
                 for inst_key, details in feeds.items():
                     ltp_val = None
-                    ohlc_val = {}
-                    
-                    # Extracting data from 'full' mode or alternative feed structures
-                    if "full" in details:
-                        market_full = details["full"].get("market_full", {})
-                        ltp_val = market_full.get("ltp")
-                        ohlc_val = market_full.get("ohlc", {})
-                    elif "market_ff" in details:
-                        market_ff = details.get("market_ff", {})
-                        ltp_val = market_ff.get("ltp")
-                        ohlc_val = market_ff.get("ohlc", {})
-                    elif "ff" in details:
-                        ff_data = details.get("ff", {}).get("market_ff", {})
-                        ltp_val = ff_data.get("ltp")
-                        ohlc_val = ff_data.get("ohlc", {})
-                    elif "ltpc" in details:
+                    if "ltpc" in details:
                         ltp_val = details["ltpc"].get("ltp")
+                    elif "market_ff" in details:
+                        ltp_val = details.get("market_ff", {}).get("ltp")
+                    elif "ff" in details:
+                        ltp_val = details.get("ff", {}).get("market_ff", {}).get("ltp")
                     
                     if ltp_val is not None and MAIN_EVENT_LOOP and MAIN_EVENT_LOOP.is_running():
-                        asyncio.run_coroutine_threadsafe(
-                            broadcast_tick(inst_key, float(ltp_val), ohlc_val), 
-                            MAIN_EVENT_LOOP
-                        )
+                        asyncio.run_coroutine_threadsafe(broadcast_tick(inst_key, float(ltp_val)), MAIN_EVENT_LOOP)
         except Exception as e:
             logger.error(f"❌ Error parsing websocket message: {e}")
 
@@ -175,9 +202,9 @@ async def websocket_handler(request: web.Request):
                             SUBSCRIBED_TOKENS.add(norm_token)
                             new_tokens.append(norm_token)
                             try:
-                                if streamer:
-                                    streamer.subscribe([norm_token], "full")
-                                    logger.info(f"📡 Dynamically Subscribed via Upstox WS (Full Mode): {norm_token}")
+                                if streamer and is_market_open():
+                                    streamer.subscribe([norm_token], "ltpc")
+                                    logger.info(f"📡 Dynamically Subscribed via Upstox WS: {norm_token}")
                             except Exception as sub_err:
                                 logger.error(f"❌ Dynamic WebSocket subscription error for {norm_token}: {sub_err}")
 
@@ -194,23 +221,193 @@ async def websocket_handler(request: web.Request):
 
     return ws
 
-# --- 🌐 HEALTH CHECK ROUTE ---
+# --- 🌐 REST HTTP API ENDPOINTS (STATUS & CHART HISTORICAL DATA) ---
 async def home_route(request: web.Request):
+    market_status = is_market_open()
+    
+    # Dynamic mode indicator for Render home page
+    if market_status:
+        active_mode = "100% Pure WebSocket Mode (Market is OPEN)"
+    else:
+        active_mode = "REST API v2 / Historical Mode (Market is CLOSED)"
+
     return web.json_response({
         "status": True,
-        "message": "MUNH Titan Upstox Pure WebSocket & Full Candle Streamer Service is Live!",
-        "version": "1.2.0"
+        "message": "MUNH Titan Upstox Streamer Service is Live!",
+        "market_is_open": market_status,
+        "active_stream_mode": active_mode,
+        "subscribed_tokens_count": len(SUBSCRIBED_TOKENS),
+        "connected_android_clients": len(CONNECTED_CLIENTS),
+        "version": "1.3.0"
     })
+
+async def fetch_chart_data(request: web.Request):
+    try:
+        d = await request.json()
+        instrument_key = str(d.get('token', '') or d.get('instrument_key', '')).strip()
+        raw_interval = str(d.get('interval', "FIVE_MINUTE")).strip().upper()
+
+        if not instrument_key:
+            return web.json_response({"status": False, "message": "Missing instrument_key", "data": []}, status=400)
+
+        instrument_key = instrument_key.replace(":", "|")
+
+        if raw_interval in ["DAY", "ONE_DAY", "1D"]:
+            unit = "day"
+            target_minutes = 1440
+        elif raw_interval in ["THIRTY_MINUTE", "30M", "30MIN", "30minute"]:
+            unit = "30minute"
+            target_minutes = 30
+        else:
+            unit = "1minute"
+            MINUTES_MAP = {
+                "ONE_MINUTE": 1, "1M": 1, "1MIN": 1, "1minute": 1,
+                "THREE_MINUTE": 3, "3M": 3, "3MIN": 3, "3minute": 3,
+                "FIVE_MINUTE": 5, "5M": 5, "5MIN": 5, "5minute": 5,
+                "TEN_MINUTE": 10, "10M": 10, "10MIN": 10, "10minute": 10,
+                "FIFTEEN_MINUTE": 15, "15M": 15, "15MIN": 15, "15minute": 15,
+                "ONE_HOUR": 60, "1H": 60, "60M": 60, "60minute": 60
+            }
+            target_minutes = MINUTES_MAP.get(raw_interval, 5)
+
+        to_date = datetime.datetime.now(IST).strftime("%Y-%m-%d")
+        from_date = (datetime.datetime.now(IST) - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
+
+        headers = {
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {ACCESS_TOKEN}'
+        }
+
+        all_raw_candles = []
+
+        async with aiohttp.ClientSession() as session:
+            # If market is closed, v2 historical endpoint serves all closed data seamlessly
+            hist_url = f"https://api.upstox.com/v2/historical-candle/{instrument_key}/{unit}/{to_date}/{from_date}"
+            async with session.get(hist_url, headers=headers) as resp_hist:
+                if resp_hist.status == 200:
+                    res_hist = await resp_hist.json()
+                    if res_hist.get("status") == "success":
+                        candles = res_hist.get("data", {}).get("candles", [])
+                        all_raw_candles.extend(candles)
+
+        if all_raw_candles:
+            seen_times = set()
+            unique_candles = []
+            for c in all_raw_candles:
+                timestamp = c[0]
+                if timestamp not in seen_times:
+                    seen_times.add(timestamp)
+                    unique_candles.append(c)
+
+            unique_candles.sort(key=lambda x: x[0])
+
+            if unit == "1minute" and target_minutes > 1:
+                resampled = []
+                current_agg = None
+                
+                for c in unique_candles:
+                    t_str = c[0]
+                    try:
+                        if isinstance(t_str, str):
+                            dt = datetime.datetime.fromisoformat(t_str.replace('Z', '+00:00'))
+                        else:
+                            dt = datetime.datetime.fromtimestamp(int(t_str), IST)
+                    except Exception:
+                        continue
+                    
+                    mins_from_open = (dt.hour * 60 + dt.minute) - (9 * 60 + 15)
+                    if mins_from_open < 0:
+                        mins_from_open = 0
+                        
+                    block_idx = mins_from_open // target_minutes
+                    block_key = (dt.date(), block_idx)
+                    
+                    if current_agg is None or current_agg['key'] != block_key:
+                        if current_agg is not None:
+                            resampled.append([
+                                current_agg['time'],
+                                current_agg['open'],
+                                current_agg['high'],
+                                current_agg['low'],
+                                current_agg['close']
+                            ])
+                        current_agg = {
+                            'key': block_key,
+                            'time': t_str,
+                            'open': float(c[1]),
+                            'high': float(c[2]),
+                            'low': float(c[3]),
+                            'close': float(c[4])
+                        }
+                    else:
+                        current_agg['high'] = max(current_agg['high'], float(c[2]))
+                        current_agg['low'] = min(current_agg['low'], float(c[3]))
+                        current_agg['close'] = float(c[4])
+                
+                if current_agg is not None:
+                    resampled.append([
+                        current_agg['time'],
+                        current_agg['open'],
+                        current_agg['high'],
+                        current_agg['low'],
+                        current_agg['close']
+                    ])
+                
+                unique_candles = resampled
+
+            formatted_candles = []
+            for c in unique_candles:
+                t_raw = c[0]
+                try:
+                    if isinstance(t_raw, (int, float)):
+                        t_val = int(t_raw)
+                    elif isinstance(t_raw, str):
+                        dt = datetime.datetime.fromisoformat(t_raw.replace('Z', '+00:00'))
+                        t_val = int(dt.timestamp())
+                    else:
+                        t_val = int(datetime.datetime.now().timestamp())
+                except Exception:
+                    t_val = int(datetime.datetime.now().timestamp())
+
+                formatted_candles.append({
+                    "time": t_val,
+                    "open": float(c[1]),
+                    "high": float(c[2]),
+                    "low": float(c[3]),
+                    "close": float(c[4])
+                })
+
+            # Append live building candles from websocket cache if available
+            if instrument_key in LIVE_CANDLES_CACHE:
+                for k_min, c_val in LIVE_CANDLES_CACHE[instrument_key].items():
+                    formatted_candles.append({
+                        "time": c_val["time"],
+                        "open": c_val["open"],
+                        "high": c_val["high"],
+                        "low": c_val["low"],
+                        "close": c_val["close"]
+                    })
+
+            return web.json_response({"status": True, "message": "SUCCESS", "data": formatted_candles})
+
+        return web.json_response({"status": False, "message": "Historical data unavailable from Upstox", "data": []})
+
+    except Exception as e:
+        logger.error(f"Exception in fetch_chart_data: {e}")
+        return web.json_response({"status": False, "message": str(e), "data": []}, status=500)
 
 app.router.add_get('/', home_route)
 app.router.add_get('/ws', websocket_handler)
+app.router.add_post('/api/get_chart_data', fetch_chart_data)
 
 # --- 🔄 BACKGROUND TASKS ---
 async def start_background_tasks(app):
     global MAIN_EVENT_LOOP
     MAIN_EVENT_LOOP = asyncio.get_running_loop()
+    
+    # Only start websocket streamer loop if market is open or background thread is needed
     asyncio.create_task(start_upstox_websocket_streamer())
-    logger.info("✅ Upstox WebSocket Streamer Background Task Started.")
+    logger.info("✅ Upstox Background Task Initialized.")
 
 app.on_startup.append(start_background_tasks)
 
