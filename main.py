@@ -1,7 +1,6 @@
 import asyncio
 import json
 import logging
-import time
 import datetime
 import os
 import pytz
@@ -141,7 +140,7 @@ async def handle_subscription(sid, data):
             else:
                 token = str(item).strip()
             if token:
-                token = token.replace(":", "|") # Fix format compatibility
+                token = token.replace(":", "|") 
                 SUBSCRIBED_TOKENS.add(token)
                 try:
                     if streamer:
@@ -164,37 +163,50 @@ async def subscribe_request(sid, data):
 async def disconnect(sid):
     logger.info(f"📱 Android Client Disconnected: {sid}")
 
-# --- 🌐 REST HTTP API ENDPOINTS (FULL HISTORICAL CANDLE FETCHING) ---
+# --- 🌐 REST HTTP API ENDPOINTS (FIXED HISTORICAL & LIVE CANDLE FORMAT) ---
 async def home_route(request: web.Request):
     return web.json_response({
         "status": True,
         "message": "MUNH Titan Upstox Backend Service is Live & Running via MarketDataStreamerV3!",
-        "version": "1.0.0"
+        "version": "1.0.1"
     })
 
 async def fetch_chart_data(request: web.Request):
     try:
         d = await request.json()
         instrument_key = str(d.get('token', '') or d.get('instrument_key', '')).strip()
-        raw_interval = str(d.get('interval', "5minute")).strip().upper()
+        raw_interval = str(d.get('interval', "FIVE_MINUTE")).strip().upper()
+        
+        # Accept dynamic limit/fromdate/todate requested by Android app
+        limit = int(d.get('limit', 150))
+        passed_from = d.get('fromdate')
+        passed_to = d.get('todate')
+
         if not instrument_key:
             return web.json_response({"status": False, "message": "Missing instrument_key"}, status=400)
         
         instrument_key = instrument_key.replace(":", "|")
-        dt = datetime.datetime.now(IST)
         
+        # Comprehensive interval mapping matching Upstox V2 API specifications
         interval_map = {
-            "1MIN": "1minute", "1MINUTE": "1minute",
-            "5MIN": "5minute", "5MINUTE": "5minute",
-            "15MIN": "15minute", "15MINUTE": "15minute",
-            "30MIN": "30minute", "30MINUTE": "30minute",
-            "1HOUR": "60minute", "60MIN": "60minute",
-            "DAY": "day", "1DAY": "day"
+            "ONE_MINUTE": "1minute", "1M": "1minute", "1MIN": "1minute",
+            "THREE_MINUTE": "3minute", "3M": "3minute", "3MIN": "3minute",
+            "FIVE_MINUTE": "5minute", "5M": "5minute", "5MIN": "5minute",
+            "TEN_MINUTE": "10minute", "10M": "10minute", "10MIN": "10minute",
+            "FIFTEEN_MINUTE": "15minute", "15M": "15minute", "15MIN": "15minute",
+            "THIRTY_MINUTE": "30minute", "30M": "30minute", "30MIN": "30minute",
+            "ONE_HOUR": "60minute", "1H": "60minute", "60MIN": "60minute",
+            "ONE_DAY": "day", "1D": "day", "DAY": "day"
         }
         interval = interval_map.get(raw_interval, "5minute")
         
-        to_date = dt.strftime("%Y-%m-%d")
-        from_date = (dt - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
+        dt = datetime.datetime.now(IST)
+        to_date = passed_to if passed_to else dt.strftime("%Y-%m-%d")
+        
+        if passed_from:
+            from_date = passed_from.split(" ")[0] if " " in passed_from else passed_from
+        else:
+            from_date = (dt - datetime.timedelta(days=45)).strftime("%Y-%m-%d")
         
         historical_url = f"https://api.upstox.com/v2/historical-candle/{instrument_key}/{interval}/{to_date}/{from_date}"
         headers = {
@@ -206,16 +218,39 @@ async def fetch_chart_data(request: web.Request):
             async with session.get(historical_url, headers=headers) as resp:
                 if resp.status == 200:
                     res_json = await resp.json()
-                    if res_json.get("status") == "success":
+                    status_val = res_json.get("status")
+                    if status_val == "success" or status_val is True:
                         candles = res_json.get("data", {}).get("candles", [])
-                        return web.json_response({"status": True, "message": "SUCCESS", "data": candles})
+                        
+                        # Upstox returns candles in descending order (latest first). 
+                        # Reverse them to chronological ascending order so lightweight-charts plots properly.
+                        candles.reverse()
+                        
+                        # Respect requested limit slice
+                        if len(candles) > limit:
+                            candles = candles[-limit:]
+
+                        return web.json_response({
+                            "status": True, 
+                            "message": "SUCCESS", 
+                            "data": candles
+                        })
                 
-                logger.warning(f"⚠️ Failed to fetch historical candles from Upstox, status: {resp.status}")
-                return web.json_response({"status": False, "message": "Failed to fetch from Upstox", "data": []}, status=resp.status)
+                resp_text = await resp.text()
+                logger.warning(f"⚠️ Upstox Historical API Error [{resp.status}]: {resp_text}")
+                return web.json_response({
+                    "status": False, 
+                    "message": f"Upstox API returned status {resp.status}", 
+                    "data": []
+                }, status=200)
 
     except Exception as e:
         logger.error(f"Exception in fetch_chart_data: {e}")
-        return web.json_response({"status": False, "message": str(e), "data": []}, status=500)
+        return web.json_response({
+            "status": False, 
+            "message": str(e), 
+            "data": []
+        }, status=200)
 
 app.router.add_get('/', home_route)
 app.router.add_post('/api/get_chart_data', fetch_chart_data)
