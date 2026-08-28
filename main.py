@@ -23,9 +23,9 @@ API_KEY = "eba0a80f-c907-42fa-a926-6672a120254d"
 API_SECRET = os.getenv("UPSTOX_API_SECRET", "cg0pdqyg8t")
 
 # 1-YEAR ANALYTICS ACCESS TOKEN
-NEW_ANALYTICS_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI2MkFIN0siLCJqdGkiOiI2YTdhMTJlZjk1YjgyYzEzZjc5OWEyMmIiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwlZSpNQWx0aXNQbGFuIjpmYWxzZSwiaXNFeHRlbmRlZCI6dHJ1ZSwiaWF0IjoxNzg2Mzg1MTM1LCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE4MTc5MzUyMDB9.0z7HMMUZUwJ6mRkzY3EUE1bB36_i1c7M-6yiNc8clgs"
+DEFAULT_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI2MkFIN0siLCJqdGkiOiI2YTdhMTJlZjk1YjgyYzEzZjc5OWEyMmIiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlzRXh0ZW5kZWQiOnRydWUsImlhdCI6MTc4NjM4NTEzNSwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxODE3OTM1MjAwfQ.0z7HMMUZUwJ6mRkzY3EUE1bB36_i1c7M-6yiNc8clgs"
 
-ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", NEW_ANALYTICS_TOKEN).strip()
+ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", DEFAULT_TOKEN).strip()
 
 configuration = upstox_client.Configuration()
 configuration.access_token = ACCESS_TOKEN
@@ -60,6 +60,32 @@ async def broadcast_tick(token: str, price: float):
         LTP_CACHE["SENSEX"] = price_str
         await sio.emit("live_data", {"instrument_key": "SENSEX", "ltp": price_str})
 
+# --- 🔄 FETCH REST LTP FALLBACK (SO 0.00 NEVER SHOWS) ---
+async def fetch_rest_ltp(tokens_list):
+    if not tokens_list:
+        return
+    headers = {
+        'Accept': 'application/json',
+        'Authorization': f'Bearer {ACCESS_TOKEN}'
+    }
+    try:
+        # Upstox quote endpoint accepts comma-separated keys
+        tokens_str = ",".join(tokens_list)
+        url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={tokens_str}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status == 200:
+                    res_data = await resp.json()
+                    if res_data.get("status") == "success":
+                        feeds = res_data.get("data", {})
+                        for inst_key, details in feeds.items():
+                            ltp_val = details.get("last_price")
+                            if ltp_val is not None:
+                                await broadcast_tick(inst_key, float(ltp_val))
+                                logger.info(f"📊 REST LTP Fallback Loaded -> {inst_key}: {ltp_val}")
+    except Exception as e:
+        logger.error(f"❌ Error fetching REST LTP fallback: {e}")
+
 # --- 🔄 UPSTOX OFFICIAL WEBSOCKET STREAMER (100% REAL-TIME) ---
 async def start_upstox_websocket_streamer():
     global streamer
@@ -71,6 +97,9 @@ async def start_upstox_websocket_streamer():
             try:
                 streamer.subscribe(list(SUBSCRIBED_TOKENS), "ltpc")
                 logger.info(f"📡 Subscribed Tokens on WS Open: {list(SUBSCRIBED_TOKENS)}")
+                # Fetch REST fallback immediately on open so 0.00 doesn't appear
+                if MAIN_EVENT_LOOP and MAIN_EVENT_LOOP.is_running():
+                    asyncio.run_coroutine_threadsafe(fetch_rest_ltp(list(SUBSCRIBED_TOKENS)), MAIN_EVENT_LOOP)
             except Exception as e:
                 logger.error(f"❌ Error in streamer subscription: {e}")
 
@@ -130,6 +159,7 @@ async def handle_subscription(sid, data):
             data = json.loads(data)
             
         tokens_input = data.get("instrumentKeys") or data.get("tokens", [])
+        new_tokens = []
         
         for item in tokens_input:
             if isinstance(item, dict):
@@ -140,6 +170,7 @@ async def handle_subscription(sid, data):
             if token:
                 norm_token = token.replace(":", "|")
                 SUBSCRIBED_TOKENS.add(norm_token)
+                new_tokens.append(norm_token)
                 try:
                     if streamer:
                         streamer.subscribe([norm_token], "ltpc")
@@ -147,6 +178,10 @@ async def handle_subscription(sid, data):
                 except Exception as sub_err:
                     logger.error(f"❌ Dynamic WebSocket subscription error for {norm_token}: {sub_err}")
                 
+        # Fetch REST LTP immediately for newly subscribed tokens so 0.00 doesn't show
+        if new_tokens:
+            asyncio.create_task(fetch_rest_ltp(new_tokens))
+
         logger.info(f"Total Subscribed Upstox Keys Count: {len(SUBSCRIBED_TOKENS)}")
     except Exception as e:
         logger.error(f"❌ Error in subscribe tokens handler: {e}")
@@ -168,7 +203,7 @@ async def home_route(request: web.Request):
     return web.json_response({
         "status": True,
         "message": "MUNH Titan Upstox WebSocket Streamer Service is Live!",
-        "version": "1.0.5"
+        "version": "1.0.7"
     })
 
 async def fetch_chart_data(request: web.Request):
