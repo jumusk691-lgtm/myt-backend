@@ -40,6 +40,7 @@ configuration.access_token = ACCESS_TOKEN
 # --- 🚀 GLOBAL STATES & SCORE TRACKING ---
 LTP_CACHE = {} 
 SUBSCRIBED_TOKENS = set(["NSE_INDEX|Nifty 50", "BSE_INDEX|SENSEX"])
+MAIN_EVENT_LOOP = None
 
 # Socket.IO & Aiohttp Setup
 sio = socketio.AsyncServer(async_mode='aiohttp', cors_allowed_origins='*')
@@ -92,9 +93,8 @@ async def start_upstox_websocket_streamer():
                     elif "ff" in details:
                         ltp_val = details.get("ff", {}).get("market_ff", {}).get("ltp")
                     
-                    if ltp_val is not None:
-                        loop = asyncio.get_event_loop()
-                        loop.create_task(broadcast_tick(inst_key, float(ltp_val)))
+                    if ltp_val is not None and MAIN_EVENT_LOOP and MAIN_EVENT_LOOP.is_running():
+                        asyncio.run_coroutine_threadsafe(broadcast_tick(inst_key, float(ltp_val)), MAIN_EVENT_LOOP)
         except Exception as e:
             logger.error(f"❌ Error parsing message: {e}")
 
@@ -220,6 +220,8 @@ app.router.add_post('/api/get_chart_data', fetch_chart_data)
 
 # --- 🔄 BACKGROUND TASKS ---
 async def start_background_tasks(app):
+    global MAIN_EVENT_LOOP
+    MAIN_EVENT_LOOP = asyncio.get_running_loop()
     asyncio.create_task(start_upstox_websocket_streamer())
     logger.info("✅ Upstox Backend Service Initialized with Official MarketDataStreamerV3.")
 
