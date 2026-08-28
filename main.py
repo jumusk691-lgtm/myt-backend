@@ -69,7 +69,6 @@ async def fetch_rest_ltp(tokens_list):
         'Authorization': f'Bearer {ACCESS_TOKEN}'
     }
     try:
-        # Upstox quote endpoint accepts comma-separated keys
         tokens_str = ",".join(tokens_list)
         url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={tokens_str}"
         async with aiohttp.ClientSession() as session:
@@ -97,7 +96,6 @@ async def start_upstox_websocket_streamer():
             try:
                 streamer.subscribe(list(SUBSCRIBED_TOKENS), "ltpc")
                 logger.info(f"📡 Subscribed Tokens on WS Open: {list(SUBSCRIBED_TOKENS)}")
-                # Fetch REST fallback immediately on open so 0.00 doesn't appear
                 if MAIN_EVENT_LOOP and MAIN_EVENT_LOOP.is_running():
                     asyncio.run_coroutine_threadsafe(fetch_rest_ltp(list(SUBSCRIBED_TOKENS)), MAIN_EVENT_LOOP)
             except Exception as e:
@@ -178,7 +176,6 @@ async def handle_subscription(sid, data):
                 except Exception as sub_err:
                     logger.error(f"❌ Dynamic WebSocket subscription error for {norm_token}: {sub_err}")
                 
-        # Fetch REST LTP immediately for newly subscribed tokens so 0.00 doesn't show
         if new_tokens:
             asyncio.create_task(fetch_rest_ltp(new_tokens))
 
@@ -198,12 +195,12 @@ async def subscribe_request(sid, data):
 async def disconnect(sid):
     logger.info(f"📱 Android Client Disconnected: {sid}")
 
-# --- 🌐 REST HTTP API ENDPOINTS (ONLY FOR CHART HISTORICAL DATA) ---
+# --- 🌐 REST HTTP API ENDPOINTS (UPSTOX V3 API WITH 60-DAY CHUNKING FOR ALL TIMEFRAMES) ---
 async def home_route(request: web.Request):
     return web.json_response({
         "status": True,
         "message": "MUNH Titan Upstox WebSocket Streamer Service is Live!",
-        "version": "1.0.7"
+        "version": "1.0.9"
     })
 
 async def fetch_chart_data(request: web.Request):
@@ -217,28 +214,33 @@ async def fetch_chart_data(request: web.Request):
 
         instrument_key = instrument_key.replace(":", "|")
 
-        if raw_interval in ["DAY", "ONE_DAY", "1D"]:
-            unit = "day"
+        # --- 🚀 UPSTOX V3 MAPPING (UNIT & INTERVAL) FOR ALL TIMEFRAMES ---
+        unit = "minutes"
+        interval = "5"
+
+        if raw_interval in ["1MINUTE", "1M", "1"]:
+            unit, interval = "minutes", "1"
+        elif raw_interval in ["3MINUTE", "3M", "3"]:
+            unit, interval = "minutes", "3"
+        elif raw_interval in ["5MINUTE", "5M", "5"]:
+            unit, interval = "minutes", "5"
+        elif raw_interval in ["10MINUTE", "10M", "10"]:
+            unit, interval = "minutes", "10"
+        elif raw_interval in ["15MINUTE", "15M", "15"]:
+            unit, interval = "minutes", "15"
+        elif raw_interval in ["30MINUTE", "30M", "30"]:
+            unit, interval = "minutes", "30"
+        elif raw_interval in ["60MINUTE", "1HOUR", "1H", "60"]:
+            unit, interval = "hours", "1"
+        elif raw_interval in ["DAY", "ONE_DAY", "1D"]:
+            unit, interval = "days", "1"
         elif raw_interval in ["WEEK", "1W", "1WEEK"]:
-            unit = "week"
+            unit, interval = "weeks", "1"
         elif raw_interval in ["MONTH", "1MON", "1MONTH"]:
-            unit = "month"
-        else:
-            unit = "1minute" 
+            unit, interval = "months", "1"
 
-        MINUTES_MAP = {
-            "3MINUTE": 3, "THREE_MINUTE": 3, "3M": 3, "3minute": 3,
-            "5MINUTE": 5, "FIVE_MINUTE": 5, "5M": 5, "5minute": 5,
-            "10MINUTE": 10, "TEN_MINUTE": 10, "10M": 10, "10minute": 10,
-            "15MINUTE": 15, "FIFTEEN_MINUTE": 15, "15M": 15, "15minute": 15,
-            "30MINUTE": 30, "THIRTY_MINUTE": 30, "30M": 30, "30minute": 30,
-            "60MINUTE": 60, "SIXTY_MINUTE": 60, "1HOUR": 60, "1H": 60, "60M": 60, "60minute": 60
-        }
-        target_minutes = MINUTES_MAP.get(raw_interval, 1)
-
-        to_date = datetime.datetime.now(IST).strftime("%Y-%m-%d")
-        from_date = (datetime.datetime.now(IST) - datetime.timedelta(days=60)).strftime("%Y-%m-%d")
-
+        now_ist = datetime.datetime.now(IST)
+        
         headers = {
             'Accept': 'application/json',
             'Authorization': f'Bearer {ACCESS_TOKEN}'
@@ -247,21 +249,39 @@ async def fetch_chart_data(request: web.Request):
         all_raw_candles = []
 
         async with aiohttp.ClientSession() as session:
-            intraday_url = f"https://api.upstox.com/v2/historical-candle/intraday/{instrument_key}/{unit}"
-            async with session.get(intraday_url, headers=headers) as resp_intra:
-                if resp_intra.status == 200:
-                    res_intra = await resp_intra.json()
-                    if res_intra.get("status") == "success":
-                        intra_candles = res_intra.get("data", {}).get("candles", [])
-                        all_raw_candles.extend(intra_candles)
+            if unit in ["minutes", "hours"]:
+                # --- 🧠 SMART CHUNKING: FETCH 60 DAYS IN TWO 30-DAY BLOCKS TO AVOID API LIMITS ---
+                date_ranges = [
+                    (
+                        (now_ist - datetime.timedelta(days=30)).strftime("%Y-%m-%d"),
+                        now_ist.strftime("%Y-%m-%d")
+                    ),
+                    (
+                        (now_ist - datetime.timedelta(days=60)).strftime("%Y-%m-%d"),
+                        (now_ist - datetime.timedelta(days=31)).strftime("%Y-%m-%d")
+                    )
+                ]
 
-            hist_url = f"https://api.upstox.com/v2/historical-candle/{instrument_key}/{unit}/{to_date}/{from_date}"
-            async with session.get(hist_url, headers=headers) as resp_hist:
-                if resp_hist.status == 200:
-                    res_hist = await resp_hist.json()
-                    if res_hist.get("status") == "success":
-                        hist_candles = res_hist.get("data", {}).get("candles", [])
-                        all_raw_candles.extend(hist_candles)
+                for from_d, to_d in date_ranges:
+                    v3_url = f"https://api.upstox.com/v3/historical-candle/{instrument_key}/{unit}/{interval}?to_date={to_d}&from_date={from_d}"
+                    async with session.get(v3_url, headers=headers) as resp:
+                        if resp.status == 200:
+                            res_data = await resp.json()
+                            if res_data.get("status") == "success":
+                                candles = res_data.get("data", {}).get("candles", [])
+                                if candles:
+                                    all_raw_candles.extend(candles)
+            else:
+                # --- 📅 FOR DAYS, WEEKS, MONTHS: FETCH FULL 60 DAYS DIRECTLY ---
+                to_date = now_ist.strftime("%Y-%m-%d")
+                from_date = (now_ist - datetime.timedelta(days=60)).strftime("%Y-%m-%d")
+                
+                v3_url = f"https://api.upstox.com/v3/historical-candle/{instrument_key}/{unit}/{interval}?to_date={to_date}&from_date={from_date}"
+                async with session.get(v3_url, headers=headers) as resp:
+                    if resp.status == 200:
+                        res_data = await resp.json()
+                        if res_data.get("status") == "success":
+                            all_raw_candles = res_data.get("data", {}).get("candles", [])
 
         if all_raw_candles:
             seen_times = set()
@@ -274,61 +294,6 @@ async def fetch_chart_data(request: web.Request):
                     unique_candles.append(c)
 
             unique_candles.sort(key=lambda x: x[0])
-
-            if unit == "1minute" and target_minutes > 1:
-                resampled = []
-                current_agg = None
-                
-                for c in unique_candles:
-                    t_str = c[0]
-                    try:
-                        dt = datetime.datetime.fromisoformat(str(t_str).replace('Z', '+00:00'))
-                    except ValueError:
-                        try:
-                            dt = datetime.datetime.strptime(str(t_str)[:19], "%Y-%m-%dT%H:%M:%S")
-                        except ValueError:
-                            resampled.append(c)
-                            continue
-                    
-                    mins_from_open = (dt.hour * 60 + dt.minute) - (9 * 60 + 15)
-                    if mins_from_open < 0:
-                        mins_from_open = 0
-                        
-                    block_idx = mins_from_open // target_minutes
-                    block_key = (dt.date(), block_idx)
-                    
-                    if current_agg is None or current_agg['key'] != block_key:
-                        if current_agg is not None:
-                            resampled.append([
-                                current_agg['time'],
-                                current_agg['open'],
-                                current_agg['high'],
-                                current_agg['low'],
-                                current_agg['close']
-                            ])
-                        current_agg = {
-                            'key': block_key,
-                            'time': t_str,
-                            'open': float(c[1]),
-                            'high': float(c[2]),
-                            'low': float(c[3]),
-                            'close': float(c[4])
-                        }
-                    else:
-                        current_agg['high'] = max(current_agg['high'], float(c[2]))
-                        current_agg['low'] = min(current_agg['low'], float(c[3]))
-                        current_agg['close'] = float(c[4])
-                
-                if current_agg is not None:
-                    resampled.append([
-                        current_agg['time'],
-                        current_agg['open'],
-                        current_agg['high'],
-                        current_agg['low'],
-                        current_agg['close']
-                    ])
-                
-                unique_candles = resampled
 
             formatted_candles = []
             for c in unique_candles:
@@ -354,7 +319,7 @@ async def fetch_chart_data(request: web.Request):
 
             return web.json_response({"status": True, "message": "SUCCESS", "data": formatted_candles})
 
-        return web.json_response({"status": False, "message": "Real historical data unavailable from Upstox", "data": []})
+        return web.json_response({"status": False, "message": "Real historical data unavailable from Upstox v3", "data": []})
 
     except Exception as e:
         logger.error(f"Exception in fetch_chart_data: {e}")
