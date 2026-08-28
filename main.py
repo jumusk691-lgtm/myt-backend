@@ -31,7 +31,7 @@ API_SECRET = os.getenv("UPSTOX_API_SECRET", "cg0pdqyg8t")
 
 # 1-YEAR ANALYTICS ACCESS TOKEN
 NEW_ANALYTICS_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI2MkFIN0siLCJqdGkiOiI2YTdhMTJlZjk1YjgyYzEzZjc5OWEyMmIiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlzRXh0ZW5kZWQiOnRydWUsImlhdCI6MTc4NjM4NTEzNSwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxODE3OTM1MjAwfQ.0z7HMMUZUwJ6mRkzY3EUE1bB36_i1c7M-6yiNc8clgs"
-ACCESS_TOKEN = os.getenv("UPSTox_ACCESS_TOKEN", NEW_ANALYTICS_TOKEN).strip()
+ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", NEW_ANALYTICS_TOKEN).strip()
 
 configuration = upstox_client.Configuration()
 configuration.access_token = ACCESS_TOKEN
@@ -47,6 +47,38 @@ sio = socketio.AsyncServer(async_mode='aiohttp', cors_allowed_origins='*')
 app = web.Application()
 sio.attach(app)
 
+# REST Fallback fetcher to grab instant index prices if websocket feed hasn't ticked yet
+async def fetch_initial_index_prices():
+    headers = {
+        'Accept': 'application/json',
+        'Authorization': f'Bearer {ACCESS_TOKEN}'
+    }
+    # Upstox V2 Market Quote LTP API endpoint
+    quote_url = "https://api.upstox.com/v2/market-quote/ltp?instrument_key=NSE_INDEX%7CNifty%2050,BSE_INDEX%7CSENSEX"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(quote_url, headers=headers) as resp:
+                if resp.status == 200:
+                    res_json = await resp.json()
+                    if res_json.get("status") == "success":
+                        data = res_json.get("data", {})
+                        for key, val in data.items():
+                            ltp = val.get("last_price")
+                            if ltp is not None:
+                                price_str = f"{float(ltp):.2f}"
+                                LTP_CACHE[key] = price_str
+                                if key == "NSE_INDEX|Nifty 50":
+                                    LTP_CACHE["NIFTY"] = price_str
+                                    await sio.emit("live_data", {"instrument_key": "NIFTY", "ltp": price_str})
+                                    await sio.emit("live_data", {"instrument_key": "NSE_INDEX|Nifty 50", "ltp": price_str})
+                                elif key == "BSE_INDEX|SENSEX":
+                                    LTP_CACHE["SENSEX"] = price_str
+                                    await sio.emit("live_data", {"instrument_key": "SENSEX", "ltp": price_str})
+                                    await sio.emit("live_data", {"instrument_key": "BSE_INDEX|SENSEX", "ltp": price_str})
+                        logger.info(f"📊 Initial REST Indices LTP Fetched: {LTP_CACHE}")
+    except Exception as e:
+        logger.error(f"❌ Error fetching REST initial quote: {e}")
+
 # Helper function to broadcast live price tick to clients
 async def broadcast_tick(token: str, price: float):
     price_str = f"{price:.2f}"
@@ -57,7 +89,7 @@ async def broadcast_tick(token: str, price: float):
     }
     await sio.emit("live_data", payload)
 
-    # Standardize Index aliases for Android Client mapping (Ensures both exact tokens & aliases broadcast)
+    # Standardize Index aliases for Android Client mapping
     if token == "NSE_INDEX|Nifty 50":
         LTP_CACHE["NIFTY"] = price_str
         await sio.emit("live_data", {"instrument_key": "NIFTY", "ltp": price_str})
@@ -126,9 +158,12 @@ async def start_upstox_websocket_streamer():
 @sio.event
 async def connect(sid, environ):
     logger.info(f"📱 Android Client Connected: {sid}")
-    # Force auto-subscribe Nifty and Sensex on every client connection
     SUBSCRIBED_TOKENS.add("NSE_INDEX|Nifty 50")
     SUBSCRIBED_TOKENS.add("BSE_INDEX|SENSEX")
+    
+    # Fetch fresh REST quote immediately upon client connection to populate instant indices
+    await fetch_initial_index_prices()
+    
     if LTP_CACHE:
         await sio.emit('initial_ltps', LTP_CACHE, room=sid)
 
@@ -166,12 +201,12 @@ async def subscribe_request(sid, data):
 async def disconnect(sid):
     logger.info(f"📱 Android Client Disconnected: {sid}")
 
-# --- 🌐 REST HTTP API ENDPOINTS (FIXED HISTORICAL & LIVE CANDLE FORMAT) ---
+# --- 🌐 REST HTTP API ENDPOINTS ---
 async def home_route(request: web.Request):
     return web.json_response({
         "status": True,
         "message": "MUNH Titan Upstox Backend Service is Live & Running via MarketDataStreamerV3!",
-        "version": "1.0.2"
+        "version": "1.0.3"
     })
 
 async def fetch_chart_data(request: web.Request):
@@ -275,7 +310,8 @@ async def start_background_tasks(app):
     global MAIN_EVENT_LOOP
     MAIN_EVENT_LOOP = asyncio.get_running_loop()
     asyncio.create_task(start_upstox_websocket_streamer())
-    logger.info("✅ Upstox Backend Service Initialized with Official MarketDataStreamerV3.")
+    asyncio.create_task(fetch_initial_index_prices())
+    logger.info("✅ Upstox Backend Service Initialized with Official MarketDataStreamerV3 & REST Fallback.")
 
 app.on_startup.append(start_background_tasks)
 
