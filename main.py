@@ -8,8 +8,6 @@ import pytz
 import socketio
 import aiohttp
 from aiohttp import web
-import ssl
-import websockets
 
 # --- Upstox Official SDK ---
 import upstox_client
@@ -48,7 +46,7 @@ sio = socketio.AsyncServer(async_mode='aiohttp', cors_allowed_origins='*')
 app = web.Application()
 sio.attach(app)
 
-# Helper function to broadcast live price tick to clients (Keeping exact original payload format)
+# Helper function to broadcast live price tick to clients
 async def broadcast_tick(token: str, price: float):
     price_str = f"{price:.2f}"
     LTP_CACHE[token] = price_str
@@ -66,82 +64,59 @@ async def broadcast_tick(token: str, price: float):
         LTP_CACHE["SENSEX"] = price_str
         await sio.emit("live_data", {"instrument_key": "SENSEX", "ltp": price_str})
 
-# --- 🔄 UPSTOX WEBSOCKET FEED STREAMER (REPLACES REST POLLING) ---
+# --- 🔄 UPSTOX OFFICIAL SDK MARKET DATA STREAMER V3 ---
 async def start_upstox_websocket_streamer():
-    logger.info("⚡ Upstox WebSocket Streamer Initializing...")
+    logger.info("⚡ Upstox MarketDataStreamerV3 Initializing...")
     
-    # Get Authorized WebSocket URL from Upstox API
-    api_version = "v2"
-    url = f"https://api.upstox.com/{api_version}/feed/market-data-feed/authorize"
-    headers = {
-        'Accept': 'application/json',
-        'Authorization': f'Bearer {ACCESS_TOKEN}'
-    }
-
-    ws_url = None
-    async with aiohttp.ClientSession() as session:
-        while ws_url is None:
+    def on_open():
+        logger.info("🟢 Connected to Upstox Market Data Feed V3 WebSocket successfully!")
+        if SUBSCRIBED_TOKENS:
             try:
-                async with session.get(url, headers=headers) as resp:
-                    if resp.status == 200:
-                        res_data = await resp.json()
-                        if res_data.get("status") == "success":
-                            ws_url = res_data.get("data", {}).get("authorized_redirect_uri")
-                            logger.info("✅ Successfully authorized Upstox WebSocket feed URL.")
-                    else:
-                        logger.error(f"❌ Failed to authorize WebSocket feed: {resp.status}")
+                streamer.subscribe(list(SUBSCRIBED_TOKENS), "ltp")
             except Exception as e:
-                logger.error(f"❌ Exception during WebSocket authorization: {e}")
-            
-            if ws_url is None:
-                await asyncio.sleep(5)
+                logger.error(f"❌ Error in initial subscription: {e}")
 
-    # Connect to Upstox WebSocket and stream data
-    while True:
+    def on_message(message):
         try:
-            async with websockets.connect(ws_url) as websocket:
-                logger.info("🟢 Connected to Upstox Market Data Feed WebSocket!")
-                
-                # Send subscription message for tokens
-                sub_message = {
-                    "guid": "someguid",
-                    "method": "sub",
-                    "data": {
-                        "mode": "ltp",
-                        "instrumentKeys": list(SUBSCRIBED_TOKENS)
-                    }
-                }
-                await websocket.send(json.dumps(sub_message))
+            # Handling incoming feed data safely from SDK streamer
+            if isinstance(message, dict):
+                feeds = message.get("feeds", {})
+                for inst_key, details in feeds.items():
+                    ltp_val = None
+                    if "ltpc" in details:
+                        ltp_val = details["ltpc"].get("ltp")
+                    elif "ff" in details:
+                        ltp_val = details.get("ff", {}).get("market_ff", {}).get("ltp")
+                    
+                    if ltp_val is not None:
+                        loop = asyncio.get_event_loop()
+                        loop.create_task(broadcast_tick(inst_key, float(ltp_val)))
+        except Exception as e:
+            pass
 
-                async for message in websocket:
-                    try:
-                        if isinstance(message, bytes):
-                            pass
-                        else:
-                            data_dict = json.loads(message)
-                            feeds = data_dict.get("feeds", {})
-                            for inst_key, details in feeds.items():
-                                ltp = details.get("ff", {}).get("market_ff", {}).get("ltp")
-                                if ltp:
-                                    await broadcast_tick(inst_key, float(ltp))
-                    except Exception as parse_err:
-                        pass
+    def on_error(error):
+        logger.error(f"❌ Upstox Streamer Error: {error}")
 
-                    # Dynamically update subscriptions if new tokens are added by Android users
-                    current_tokens = list(SUBSCRIBED_TOKENS)
-                    sub_message = {
-                        "guid": "dynamic_sub",
-                        "method": "sub",
-                        "data": {
-                            "mode": "ltp",
-                            "instrumentKeys": current_tokens
-                        }
-                    }
-                    await websocket.send(json.dumps(sub_message))
+    def on_close(close_status_code, close_msg):
+        logger.warning(f"⚠️ Upstox Streamer Closed: {close_msg}")
 
-        except Exception as ws_err:
-            logger.warning(f"⚠️ WebSocket connection dropped: {ws_err}. Reconnecting in 3 seconds...")
-            await asyncio.sleep(3.0)
+    try:
+        api_client = upstox_client.ApiClient(configuration)
+        global streamer
+        streamer = upstox_client.MarketDataStreamerV3(api_client)
+
+        streamer.on("open", on_open)
+        streamer.on("message", on_message)
+        streamer.on("error", on_error)
+        streamer.on("close", on_close)
+
+        # Run streamer connection asynchronously without blocking the event loop
+        await asyncio.to_thread(streamer.connect)
+
+    except Exception as e:
+        logger.error(f"❌ Exception in MarketDataStreamerV3: {e}")
+        await asyncio.sleep(5.0)
+        asyncio.create_task(start_upstox_websocket_streamer())
 
 # --- 🌐 SOCKET.IO HANDLERS ---
 @sio.event
@@ -162,6 +137,12 @@ async def handle_subscription(sid, data):
                 token = str(item).strip()
             if token:
                 SUBSCRIBED_TOKENS.add(token)
+                try:
+                    global streamer
+                    if 'streamer' in globals() and streamer:
+                        streamer.subscribe([token], "ltp")
+                except Exception:
+                    pass
         logger.info(f"Subscribed Upstox Keys Count: {len(SUBSCRIBED_TOKENS)}")
     except Exception as e:
         logger.error(f"❌ Error in subscribe_tokens: {e}")
@@ -182,7 +163,7 @@ async def disconnect(sid):
 async def home_route(request: web.Request):
     return web.json_response({
         "status": True,
-        "message": "MUNH Titan Upstox Backend Service is Live & Running via WebSocket!",
+        "message": "MUNH Titan Upstox Backend Service is Live & Running via MarketDataStreamerV3!",
         "version": "1.0.0"
     })
 
@@ -197,20 +178,6 @@ async def fetch_chart_data(request: web.Request):
         instrument_key = instrument_key.replace(":", "|")
         dt = datetime.datetime.now(IST)
         
-        target_minutes = 5
-        if "1MIN" in raw_interval:
-            target_minutes = 1
-        elif "15MIN" in raw_interval:
-            target_minutes = 15
-        elif "30MIN" in raw_interval:
-            target_minutes = 30
-        elif "1HOUR" in raw_interval or "60MIN" in raw_interval:
-            target_minutes = 60
-
-        mins_from_open = (dt.hour * 60 + dt.minute) - (9 * 60 + 15)
-        if mins_from_open < 0:
-            mins_from_open = 0
-
         return web.json_response({"status": True, "message": "SUCCESS", "data": []})
     except Exception as e:
         logger.error(f"Exception in fetch_chart_data: {e}")
@@ -222,7 +189,7 @@ app.router.add_post('/api/get_chart_data', fetch_chart_data)
 # --- 🔄 BACKGROUND TASKS ---
 async def start_background_tasks(app):
     asyncio.create_task(start_upstox_websocket_streamer())
-    logger.info("✅ Upstox Backend Service Initialized with WebSocket Streamer Engine.")
+    logger.info("✅ Upstox Backend Service Initialized with Official MarketDataStreamerV3.")
 
 app.on_startup.append(start_background_tasks)
 
