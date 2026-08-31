@@ -22,7 +22,7 @@ API_KEY = "eba0a80f-c907-42fa-a926-6672a120254d"
 API_SECRET = os.getenv("UPSTOX_API_SECRET", "cg0pdqyg8t")
 
 # 1-YEAR ANALYTICS ACCESS TOKEN
-DEFAULT_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI2MkFIN0siLCJqdGkiOiI2YTdhMTJlZjk1YjgyYzEzZjc5OWEyMmIiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlzRXh0ZW5kZWQiOnRydWUsImlhdCI6MTc4NjM4NTEzNSwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxODE3OTM1MjAwfQ.0z7HMMUZUwJ6mRkzY3EUE1bB36_i1c7M-6yiNc8clgs"
+DEFAULT_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza1_2MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI2MkFIN0siLCJqdGkiOiI2YTdhMTJlZjk1YjgyYzEzZjc5OWEyMmIiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlzRXh0ZW5kZWQiOnRydWUsImlhdCI6MTc4NjM4NTEzNSwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxODE3OTM1MjAwfQ.0z7HMMUZUwJ6mRkzY3EUE1bB36_i1c7M-6yiNc8clgs"
 
 ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", DEFAULT_TOKEN).strip()
 
@@ -31,7 +31,7 @@ configuration.access_token = ACCESS_TOKEN
 
 # --- 🚀 REAL WEBSOCKET DATA & LIVE CANDLE STORAGE ---
 LTP_CACHE = {}                 
-LIVE_CANDLES_CACHE = {}        # Real-time candle builder cache from websocket ticks
+LIVE_CANDLES_CACHE = {}        # Real-time 1-min candle cache from websocket ticks
 LAST_BROADCAST_TIME = {}       # Throttling dictionary (1-second limit)
 SUBSCRIBED_TOKENS = set(["NSE_INDEX|Nifty 50", "BSE_INDEX|SENSEX", "MCX_FO|495213", "MCX_FO|563946"])
 CONNECTED_CLIENTS = set()
@@ -61,7 +61,7 @@ async def broadcast_tick(token: str, price: float):
     now_ts = now_dt.timestamp()
     current_minute_key = now_dt.strftime("%Y-%m-%d %H:%M")
     
-    # 1. Update internal candle structure on every tick
+    # Update internal 1-minute candle structure on every tick
     if token not in LIVE_CANDLES_CACHE:
         LIVE_CANDLES_CACHE[token] = {}
         
@@ -85,7 +85,7 @@ async def broadcast_tick(token: str, price: float):
     elif "SENSEX" in token:
         LTP_CACHE["SENSEX"] = price_str
 
-    # 2. Throttle WS Broadcast to maximum 1 update per second per token
+    # Throttle WS Broadcast to maximum 1 update per second per token
     if now_ts - LAST_BROADCAST_TIME.get(token, 0) < 1.0:
         return
         
@@ -245,7 +245,7 @@ async def home_route(request: web.Request):
         "active_stream_mode": active_mode,
         "subscribed_tokens_count": len(SUBSCRIBED_TOKENS),
         "connected_android_clients": len(CONNECTED_CLIENTS),
-        "version": "1.3.2"
+        "version": "1.3.3"
     })
 
 async def fetch_chart_data(request: web.Request):
@@ -312,6 +312,18 @@ async def fetch_chart_data(request: web.Request):
             except Exception as hist_err:
                 logger.error(f"❌ Error fetching historical candles: {hist_err}")
 
+        # 3. Append WebSocket live building 1-min candles into the raw candles list
+        if instrument_key in LIVE_CANDLES_CACHE:
+            for k_min, c_val in LIVE_CANDLES_CACHE[instrument_key].items():
+                dt_str = datetime.datetime.fromtimestamp(c_val["time"], IST).isoformat()
+                all_raw_candles.append([
+                    dt_str,
+                    c_val["open"],
+                    c_val["high"],
+                    c_val["low"],
+                    c_val["close"]
+                ])
+
         if all_raw_candles:
             seen_times = set()
             unique_candles = []
@@ -323,6 +335,7 @@ async def fetch_chart_data(request: web.Request):
 
             unique_candles.sort(key=lambda x: x[0])
 
+            # Resample all candles (Intraday + Historical + Live WS) for selected timeframe
             if unit == "1minute" and target_minutes > 1:
                 resampled = []
                 current_agg = None
@@ -331,7 +344,7 @@ async def fetch_chart_data(request: web.Request):
                     t_str = c[0]
                     try:
                         if isinstance(t_str, str):
-                            dt = datetime.datetime.fromisoformat(t_str.replace('Z', '+00:00'))
+                            dt = datetime.datetime.fromisoformat(t_str.replace('Z', '+00:00')).astimezone(IST)
                         else:
                             dt = datetime.datetime.fromtimestamp(int(t_str), IST)
                     except Exception:
@@ -398,17 +411,6 @@ async def fetch_chart_data(request: web.Request):
                     "low": float(c[3]),
                     "close": float(c[4])
                 })
-
-            # Append live building candles from websocket cache if available
-            if instrument_key in LIVE_CANDLES_CACHE:
-                for k_min, c_val in LIVE_CANDLES_CACHE[instrument_key].items():
-                    formatted_candles.append({
-                        "time": c_val["time"],
-                        "open": c_val["open"],
-                        "high": c_val["high"],
-                        "low": c_val["low"],
-                        "close": c_val["close"]
-                    })
 
             return web.json_response({"status": True, "message": "SUCCESS", "data": formatted_candles})
 
