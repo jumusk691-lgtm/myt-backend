@@ -286,6 +286,16 @@ async def fetch_chart_data(request: web.Request):
         }
 
         all_raw_candles = []
+        
+        
+        async with aiohttp.ClientSession() as session:
+    # 1. Today's live  candles (9:15 AM to current time)
+    intra_url = f"https://api.upstox.com/v2/historical-candle/intraday/{instrument_key}/{unit}"
+    async with session.get(intra_url, headers=headers) as resp_intra:
+        if resp_intra.status == 200:
+            res_intra = await resp_intra.json()
+            if res_intra.get("status") == "success":
+                all_raw_candles.extend(res_intra.get("data", {}).get("candles", []))
 
         async with aiohttp.ClientSession() as session:
             hist_url = f"https://api.upstox.com/v2/historical-candle/{instrument_key}/{unit}/{to_date}/{from_date}"
