@@ -32,7 +32,7 @@ configuration.access_token = ACCESS_TOKEN
 # --- 🚀 REAL WEBSOCKET DATA & LIVE CANDLE STORAGE ---
 LTP_CACHE = {}                 
 LIVE_CANDLES_CACHE = {}        # Real-time candle builder cache from websocket ticks
-SUBSCRIBED_TOKENS = set(["NSE_INDEX|Nifty 50", "BSE_INDEX|SENSEX"])
+SUBSCRIBED_TOKENS = set(["NSE_INDEX|Nifty 50", "BSE_INDEX|SENSEX", "MCX_FO|495213", "MCX_FO|563946"])
 CONNECTED_CLIENTS = set()
 MAIN_EVENT_LOOP = None
 streamer = None
@@ -48,7 +48,7 @@ def is_market_open() -> bool:
         return False
     
     market_start = now.replace(hour=9, minute=15, second=0, microsecond=0)
-    market_end = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    market_end = now.replace(hour=23, minute=30, second=0, microsecond=0) # MCX stays open till late, general check
     
     return market_start <= now <= market_end
 
@@ -202,11 +202,19 @@ async def websocket_handler(request: web.Request):
                             SUBSCRIBED_TOKENS.add(norm_token)
                             new_tokens.append(norm_token)
                             try:
-                                if streamer and is_market_open():
+                                if streamer:
                                     streamer.subscribe([norm_token], "ltpc")
                                     logger.info(f"📡 Dynamically Subscribed via Upstox WS: {norm_token}")
                             except Exception as sub_err:
-                                logger.error(f"❌ Dynamic WebSocket subscription error for {norm_token}: {sub_err}")
+                                # Handled gracefully if streamer connection is still initializing
+                                logger.info(f"ℹ️ Subscription queued/deferred for {norm_token} until WS open.")
+                    
+                    # If streamer is open, ensure all tokens are synced
+                    if streamer and new_tokens:
+                        try:
+                            streamer.subscribe(list(SUBSCRIBED_TOKENS), "ltpc")
+                        except Exception:
+                            pass
 
                     logger.info(f"Total Subscribed Upstox Keys Count: {len(SUBSCRIBED_TOKENS)}")
                 except Exception as parse_err:
@@ -225,7 +233,6 @@ async def websocket_handler(request: web.Request):
 async def home_route(request: web.Request):
     market_status = is_market_open()
     
-    # Dynamic mode indicator for Render home page
     if market_status:
         active_mode = "100% Pure WebSocket Mode (Market is OPEN)"
     else:
@@ -238,7 +245,7 @@ async def home_route(request: web.Request):
         "active_stream_mode": active_mode,
         "subscribed_tokens_count": len(SUBSCRIBED_TOKENS),
         "connected_android_clients": len(CONNECTED_CLIENTS),
-        "version": "1.3.0"
+        "version": "1.3.1"
     })
 
 async def fetch_chart_data(request: web.Request):
@@ -281,7 +288,6 @@ async def fetch_chart_data(request: web.Request):
         all_raw_candles = []
 
         async with aiohttp.ClientSession() as session:
-            # If market is closed, v2 historical endpoint serves all closed data seamlessly
             hist_url = f"https://api.upstox.com/v2/historical-candle/{instrument_key}/{unit}/{to_date}/{from_date}"
             async with session.get(hist_url, headers=headers) as resp_hist:
                 if resp_hist.status == 200:
@@ -405,7 +411,6 @@ async def start_background_tasks(app):
     global MAIN_EVENT_LOOP
     MAIN_EVENT_LOOP = asyncio.get_running_loop()
     
-    # Only start websocket streamer loop if market is open or background thread is needed
     asyncio.create_task(start_upstox_websocket_streamer())
     logger.info("✅ Upstox Background Task Initialized.")
 
