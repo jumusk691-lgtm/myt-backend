@@ -32,6 +32,7 @@ configuration.access_token = ACCESS_TOKEN
 # --- 🚀 REAL WEBSOCKET DATA & LIVE CANDLE STORAGE ---
 LTP_CACHE = {}                 
 LIVE_CANDLES_CACHE = {}        # Real-time candle builder cache from websocket ticks
+LAST_BROADCAST_TIME = {}       # Throttling dictionary (1-second limit)
 SUBSCRIBED_TOKENS = set(["NSE_INDEX|Nifty 50", "BSE_INDEX|SENSEX", "MCX_FO|495213", "MCX_FO|563946"])
 CONNECTED_CLIENTS = set()
 MAIN_EVENT_LOOP = None
@@ -43,12 +44,11 @@ app = web.Application()
 # --- 🕒 MARKET STATUS CHECKER (ON / OFF) ---
 def is_market_open() -> bool:
     now = datetime.datetime.now(IST)
-    # Weekend check (Saturday = 5, Sunday = 6)
     if now.weekday() >= 5:
         return False
     
     market_start = now.replace(hour=9, minute=15, second=0, microsecond=0)
-    market_end = now.replace(hour=23, minute=30, second=0, microsecond=0) # MCX stays open till late, general check
+    market_end = now.replace(hour=23, minute=30, second=0, microsecond=0)
     
     return market_start <= now <= market_end
 
@@ -57,10 +57,11 @@ async def broadcast_tick(token: str, price: float):
     price_str = f"{price:.2f}"
     LTP_CACHE[token] = price_str
     
-    # Real-time 1-minute Candle Aggregation from WebSocket Ticks
     now_dt = datetime.datetime.now(IST)
+    now_ts = now_dt.timestamp()
     current_minute_key = now_dt.strftime("%Y-%m-%d %H:%M")
     
+    # 1. Update internal candle structure on every tick
     if token not in LIVE_CANDLES_CACHE:
         LIVE_CANDLES_CACHE[token] = {}
         
@@ -78,6 +79,18 @@ async def broadcast_tick(token: str, price: float):
         candle["low"] = min(candle["low"], price)
         candle["close"] = price
 
+    # Standardize Index aliases for Android Client mapping
+    if "Nifty 50" in token:
+        LTP_CACHE["NIFTY"] = price_str
+    elif "SENSEX" in token:
+        LTP_CACHE["SENSEX"] = price_str
+
+    # 2. Throttle WS Broadcast to maximum 1 update per second per token
+    if now_ts - LAST_BROADCAST_TIME.get(token, 0) < 1.0:
+        return
+        
+    LAST_BROADCAST_TIME[token] = now_ts
+
     current_candle = LIVE_CANDLES_CACHE[token][current_minute_key]
 
     payload = {
@@ -91,12 +104,6 @@ async def broadcast_tick(token: str, price: float):
             "close": f"{current_candle['close']:.2f}"
         }
     }
-    
-    # Standardize Index aliases for Android Client mapping
-    if "Nifty 50" in token:
-        LTP_CACHE["NIFTY"] = price_str
-    elif "SENSEX" in token:
-        LTP_CACHE["SENSEX"] = price_str
 
     if CONNECTED_CLIENTS:
         message_str = json.dumps(payload)
@@ -176,7 +183,6 @@ async def websocket_handler(request: web.Request):
     CONNECTED_CLIENTS.add(ws)
     logger.info("📱 Native WebSocket Android Client Connected")
 
-    # Send initial LTP cache on connection
     if LTP_CACHE:
         try:
             await ws.send_str(json.dumps({"type": "initial_ltps", "data": LTP_CACHE}))
@@ -206,10 +212,8 @@ async def websocket_handler(request: web.Request):
                                     streamer.subscribe([norm_token], "ltpc")
                                     logger.info(f"📡 Dynamically Subscribed via Upstox WS: {norm_token}")
                             except Exception as sub_err:
-                                # Handled gracefully if streamer connection is still initializing
-                                logger.info(f"ℹ️ Subscription queued/deferred for {norm_token} until WS open.")
+                                logger.info(f"ℹ️ Subscription deferred for {norm_token} until WS open.")
                     
-                    # If streamer is open, ensure all tokens are synced
                     if streamer and new_tokens:
                         try:
                             streamer.subscribe(list(SUBSCRIBED_TOKENS), "ltpc")
@@ -232,11 +236,7 @@ async def websocket_handler(request: web.Request):
 # --- 🌐 REST HTTP API ENDPOINTS (STATUS & CHART HISTORICAL DATA) ---
 async def home_route(request: web.Request):
     market_status = is_market_open()
-    
-    if market_status:
-        active_mode = "100% Pure WebSocket Mode (Market is OPEN)"
-    else:
-        active_mode = "REST API v2 / Historical Mode (Market is CLOSED)"
+    active_mode = "100% Pure WebSocket Mode (Market is OPEN)" if market_status else "REST API v2 / Historical Mode (Market is CLOSED)"
 
     return web.json_response({
         "status": True,
@@ -245,7 +245,7 @@ async def home_route(request: web.Request):
         "active_stream_mode": active_mode,
         "subscribed_tokens_count": len(SUBSCRIBED_TOKENS),
         "connected_android_clients": len(CONNECTED_CLIENTS),
-        "version": "1.3.1"
+        "version": "1.3.2"
     })
 
 async def fetch_chart_data(request: web.Request):
@@ -286,25 +286,31 @@ async def fetch_chart_data(request: web.Request):
         }
 
         all_raw_candles = []
-        
-        
-        async with aiohttp.ClientSession() as session:
-    # 1. Today's live  candles (9:15 AM to current time)
-    intra_url = f"https://api.upstox.com/v2/historical-candle/intraday/{instrument_key}/{unit}"
-    async with session.get(intra_url, headers=headers) as resp_intra:
-        if resp_intra.status == 200:
-            res_intra = await resp_intra.json()
-            if res_intra.get("status") == "success":
-                all_raw_candles.extend(res_intra.get("data", {}).get("candles", []))
 
         async with aiohttp.ClientSession() as session:
+            # 1. Fetch Today's Intraday Candles (9:15 AM to Current Time)
+            intra_url = f"https://api.upstox.com/v2/historical-candle/intraday/{instrument_key}/{unit}"
+            try:
+                async with session.get(intra_url, headers=headers) as resp_intra:
+                    if resp_intra.status == 200:
+                        res_intra = await resp_intra.json()
+                        if res_intra.get("status") == "success":
+                            candles_intra = res_intra.get("data", {}).get("candles", [])
+                            all_raw_candles.extend(candles_intra)
+            except Exception as intra_err:
+                logger.error(f"❌ Error fetching intraday candles: {intra_err}")
+
+            # 2. Fetch Past Days Historical Candles
             hist_url = f"https://api.upstox.com/v2/historical-candle/{instrument_key}/{unit}/{to_date}/{from_date}"
-            async with session.get(hist_url, headers=headers) as resp_hist:
-                if resp_hist.status == 200:
-                    res_hist = await resp_hist.json()
-                    if res_hist.get("status") == "success":
-                        candles = res_hist.get("data", {}).get("candles", [])
-                        all_raw_candles.extend(candles)
+            try:
+                async with session.get(hist_url, headers=headers) as resp_hist:
+                    if resp_hist.status == 200:
+                        res_hist = await resp_hist.json()
+                        if res_hist.get("status") == "success":
+                            candles_hist = res_hist.get("data", {}).get("candles", [])
+                            all_raw_candles.extend(candles_hist)
+            except Exception as hist_err:
+                logger.error(f"❌ Error fetching historical candles: {hist_err}")
 
         if all_raw_candles:
             seen_times = set()
