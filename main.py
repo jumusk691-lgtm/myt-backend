@@ -48,7 +48,7 @@ def is_market_open() -> bool:
         return False
     
     market_start = now.replace(hour=9, minute=15, second=0, microsecond=0)
-    market_end = now.replace(hour=23, minute=30, second=0, microsecond=0)
+    market_end = now.replace(hour=23, minute=30, second=0, microsecond=0) # MCX stays open till late, general check
     
     return market_start <= now <= market_end
 
@@ -80,14 +80,9 @@ async def broadcast_tick(token: str, price: float):
 
     current_candle = LIVE_CANDLES_CACHE[token][current_minute_key]
 
-    # Providing all possible key aliases so your APK parses it successfully without any code change
     payload = {
         "instrument_key": token,
-        "instrumentKey": token,
-        "token": token,
         "ltp": price_str,
-        "price": price_str,
-        "last_price": price_str,
         "live_candle": {
             "time": current_candle["time"],
             "open": f"{current_candle['open']:.2f}",
@@ -181,7 +176,7 @@ async def websocket_handler(request: web.Request):
     CONNECTED_CLIENTS.add(ws)
     logger.info("📱 Native WebSocket Android Client Connected")
 
-    # Send initial LTP cache on connection matching APK initial_ltps expectation
+    # Send initial LTP cache on connection
     if LTP_CACHE:
         try:
             await ws.send_str(json.dumps({"type": "initial_ltps", "data": LTP_CACHE}))
@@ -193,14 +188,12 @@ async def websocket_handler(request: web.Request):
             if msg.type == aiohttp.WSMsgType.TEXT:
                 try:
                     data = json.loads(msg.data)
-                    tokens_input = data.get("instrumentKeys") or data.get("tokens", []) or data.get("instrument_key", [])
-                    if isinstance(tokens_input, str):
-                        tokens_input = [tokens_input]
-                        
+                    tokens_input = data.get("instrumentKeys") or data.get("tokens", [])
                     new_tokens = []
+                    
                     for item in tokens_input:
                         if isinstance(item, dict):
-                            token = str(item.get("token") or item.get("instrument_key", "") or item.get("instrumentKey", "")).strip()
+                            token = str(item.get("token") or item.get("instrument_key", "")).strip()
                         else:
                             token = str(item).strip()
                             
@@ -208,14 +201,20 @@ async def websocket_handler(request: web.Request):
                             norm_token = token.replace(":", "|")
                             SUBSCRIBED_TOKENS.add(norm_token)
                             new_tokens.append(norm_token)
-
-                    # If streamer is active, subscribe immediately
+                            try:
+                                if streamer:
+                                    streamer.subscribe([norm_token], "ltpc")
+                                    logger.info(f"📡 Dynamically Subscribed via Upstox WS: {norm_token}")
+                            except Exception as sub_err:
+                                # Handled gracefully if streamer connection is still initializing
+                                logger.info(f"ℹ️ Subscription queued/deferred for {norm_token} until WS open.")
+                    
+                    # If streamer is open, ensure all tokens are synced
                     if streamer and new_tokens:
                         try:
                             streamer.subscribe(list(SUBSCRIBED_TOKENS), "ltpc")
-                            logger.info(f"📡 Synced Subscriptions to Upstox WS: {new_tokens}")
-                        except Exception as sub_err:
-                            logger.info(f"ℹ️ Subscription queued for Upstox WS connection.")
+                        except Exception:
+                            pass
 
                     logger.info(f"Total Subscribed Upstox Keys Count: {len(SUBSCRIBED_TOKENS)}")
                 except Exception as parse_err:
@@ -246,13 +245,13 @@ async def home_route(request: web.Request):
         "active_stream_mode": active_mode,
         "subscribed_tokens_count": len(SUBSCRIBED_TOKENS),
         "connected_android_clients": len(CONNECTED_CLIENTS),
-        "version": "1.3.2"
+        "version": "1.3.1"
     })
 
 async def fetch_chart_data(request: web.Request):
     try:
         d = await request.json()
-        instrument_key = str(d.get('token', '') or d.get('instrument_key', '') or d.get('instrumentKey', '')).strip()
+        instrument_key = str(d.get('token', '') or d.get('instrument_key', '')).strip()
         raw_interval = str(d.get('interval', "FIVE_MINUTE")).strip().upper()
 
         if not instrument_key:
@@ -279,7 +278,7 @@ async def fetch_chart_data(request: web.Request):
             target_minutes = MINUTES_MAP.get(raw_interval, 5)
 
         to_date = datetime.datetime.now(IST).strftime("%Y-%m-%d")
-        from_date = (datetime.datetime.now(IST) - datetime.timedelta(days=60)).strftime("%Y-%m-%d")
+        from_date = (datetime.datetime.now(IST) - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
 
         headers = {
             'Accept': 'application/json',
@@ -384,6 +383,7 @@ async def fetch_chart_data(request: web.Request):
                     "close": float(c[4])
                 })
 
+            # Append live building candles from websocket cache if available
             if instrument_key in LIVE_CANDLES_CACHE:
                 for k_min, c_val in LIVE_CANDLES_CACHE[instrument_key].items():
                     formatted_candles.append({
