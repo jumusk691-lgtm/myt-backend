@@ -55,13 +55,25 @@ async def auto_login_and_get_token():
 
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
-            page = await browser.new_page()
-            await page.goto(auth_url)
-            await page.wait_for_load_state("networkidle")
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-blink-features=AutomationControlled"
+                ]
+            )
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            )
+            page = await context.new_page()
+            
+            await page.set_extra_http_headers({"Accept-Language": "en-US,en;q=0.9"})
+            await page.goto(auth_url, wait_until="domcontentloaded", timeout=60000)
+            await asyncio.sleep(3)
 
             # 1. Fill Mobile Number
-            await page.wait_for_selector("input[type='tel'], #mobileNum, input[name='mobileNumber']", timeout=15000)
+            await page.wait_for_selector("input[type='tel'], #mobileNum, input[name='mobileNumber']", timeout=30000)
             await page.fill("input[type='tel'], #mobileNum, input[name='mobileNumber']", MOBILE_NO)
             await page.click("button:has-text('Get OTP'), button[type='submit']")
 
@@ -70,18 +82,18 @@ async def auto_login_and_get_token():
             totp_code = pyotp.TOTP(TOTP_KEY).now()
             logger.info(f"🔑 Generated TOTP: {totp_code}")
             
-            await page.wait_for_selector("input[type='text'], #otpNum, input[name='otp']", timeout=15000)
+            await page.wait_for_selector("input[type='text'], #otpNum, input[name='otp']", timeout=30000)
             await page.fill("input[type='text'], #otpNum, input[name='otp']", totp_code)
             await page.click("button:has-text('Continue'), button[type='submit']")
 
             # 3. Fill PIN
             await asyncio.sleep(2)
-            await page.wait_for_selector("input[type='password'], #pinCode, input[name='pin']", timeout=15000)
+            await page.wait_for_selector("input[type='password'], #pinCode, input[name='pin']", timeout=30000)
             await page.fill("input[type='password'], #pinCode, input[name='pin']", PIN)
             await page.click("button:has-text('Continue'), button[type='submit']")
 
             # 4. Wait for redirect and extract auth code
-            await page.wait_for_url(f"*{REDIRECT_URI}*", timeout=30000)
+            await page.wait_for_url(f"*{REDIRECT_URI}*", timeout=40000)
             final_url = page.url
             await browser.close()
 
@@ -335,4 +347,5 @@ async def start_background_tasks(app):
 app.on_startup.append(start_background_tasks)
 
 if __name__ == "__main__":
-    web.run_app(app, host="0.0.0.0", port=10000)
+    port = int(os.getenv("PORT", 10000))
+    web.run_app(app, host="0.0.0.0", port=port)
