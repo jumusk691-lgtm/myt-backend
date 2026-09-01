@@ -4,9 +4,11 @@ import logging
 import datetime
 import os
 import pytz
+import urllib.parse
 import aiohttp
 import pyotp
 from aiohttp import web
+from playwright.async_api import async_playwright
 
 # --- Upstox Official SDK ---
 import upstox_client
@@ -14,23 +16,23 @@ from upstox_client.rest import ApiException
 
 # --- 🕒 TIMEZONE & LOGGING SETUP ---
 IST = pytz.timezone('Asia/Kolkata')
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("MUNH_TITAN_WEBSOCKET")
 
 # --- 🔑 UPSTOX CREDENTIALS ---
 API_KEY = os.getenv("UPSTOX_API_KEY", "eba0a80f-c907-42fa-a926-6672a120254d")
 API_SECRET = os.getenv("UPSTOX_API_SECRET", "cg0pdqyg8t")
-REDIRECT_URI = "https://myt-backend-1.onrender.com/callback"
+REDIRECT_URI = os.getenv("UPSTOX_REDIRECT_URI", "https://myt-backend-1.onrender.com/callback")
+
+MOBILE_NO = os.getenv("UPSTOX_MOBILE_NO", "7735493540")
+PIN = os.getenv("UPSTOX_PIN", "865895")
 TOTP_KEY = os.getenv("UPSTOX_TOTP_KEY", "TOB3BGAEHGQADCIBT64GE4UT3Q7UX3BB")
 
-DEFAULT_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza1_2MS4wIiwiYWxnIjoiSFMyNTYifQ..."
-ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", DEFAULT_TOKEN).strip()
+ACCESS_TOKEN = ""
 
 configuration = upstox_client.Configuration()
-configuration.access_token = ACCESS_TOKEN
 
-# --- 🚀 REAL WEBSOCKET DATA & LIVE CANDLE STORAGE ---
+# --- 🚀 DATA CACHE ---
 LTP_CACHE = {}                 
 LIVE_CANDLES_CACHE = {}        
 LAST_BROADCAST_TIME = {}       
@@ -41,14 +43,81 @@ streamer = None
 
 app = web.Application()
 
-def get_current_totp():
-    """Generate live 6-digit TOTP"""
+# --- 🤖 100% FULLY AUTOMATED LOGIN VIA PLAYWRIGHT ---
+async def auto_login_and_get_token():
+    global ACCESS_TOKEN, configuration
+    logger.info("🤖 Starting 100% Fully Automated Upstox Login Flow...")
+    
+    auth_url = (
+        f"https://api.upstox.com/v2/login/authorization/dialog"
+        f"?response_type=code&client_id={API_KEY}&redirect_uri={urllib.parse.quote(REDIRECT_URI)}"
+    )
+
     try:
-        totp = pyotp.TOTP(TOTP_KEY)
-        return totp.now()
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
+            page = await browser.new_page()
+            await page.goto(auth_url)
+            await page.wait_for_load_state("networkidle")
+
+            # 1. Fill Mobile Number
+            await page.wait_for_selector("input[type='tel'], #mobileNum, input[name='mobileNumber']", timeout=15000)
+            await page.fill("input[type='tel'], #mobileNum, input[name='mobileNumber']", MOBILE_NO)
+            await page.click("button:has-text('Get OTP'), button[type='submit']")
+
+            # 2. Fill TOTP
+            await asyncio.sleep(2)
+            totp_code = pyotp.TOTP(TOTP_KEY).now()
+            logger.info(f"🔑 Generated TOTP: {totp_code}")
+            
+            await page.wait_for_selector("input[type='text'], #otpNum, input[name='otp']", timeout=15000)
+            await page.fill("input[type='text'], #otpNum, input[name='otp']", totp_code)
+            await page.click("button:has-text('Continue'), button[type='submit']")
+
+            # 3. Fill PIN
+            await asyncio.sleep(2)
+            await page.wait_for_selector("input[type='password'], #pinCode, input[name='pin']", timeout=15000)
+            await page.fill("input[type='password'], #pinCode, input[name='pin']", PIN)
+            await page.click("button:has-text('Continue'), button[type='submit']")
+
+            # 4. Wait for redirect and extract auth code
+            await page.wait_for_url(f"*{REDIRECT_URI}*", timeout=30000)
+            final_url = page.url
+            await browser.close()
+
+            parsed = urllib.parse.urlparse(final_url)
+            code = urllib.parse.parse_qs(parsed.query).get('code', [None])[0]
+
+            if not code:
+                logger.error("❌ Failed to capture Auth Code from Redirect URL")
+                return False
+
+            # 5. Exchange Auth Code for Access Token
+            token_url = "https://api.upstox.com/v2/login/authorization/token"
+            headers = {"accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"}
+            payload = {
+                "code": code,
+                "client_id": API_KEY,
+                "client_secret": API_SECRET,
+                "redirect_uri": REDIRECT_URI,
+                "grant_type": "authorization_code"
+            }
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(token_url, headers=headers, data=payload) as resp:
+                    res = await resp.json()
+                    if resp.status == 200 and "access_token" in res:
+                        ACCESS_TOKEN = res["access_token"]
+                        configuration.access_token = ACCESS_TOKEN
+                        logger.info("🎉 SUCCESS: Access Token Automatically Generated & Updated!")
+                        return True
+                    else:
+                        logger.error(f"❌ Token Exchange Failed: {res}")
+                        return False
+
     except Exception as e:
-        logger.error(f"❌ TOTP Generation Error: {e}")
-        return None
+        logger.error(f"❌ Auto-Login Exception: {e}")
+        return False
 
 def is_market_open() -> bool:
     now = datetime.datetime.now(IST)
@@ -109,7 +178,7 @@ async def broadcast_tick(token: str, price: float):
         for ws in CONNECTED_CLIENTS:
             try:
                 await ws.send_str(message_str)
-            except Exception as e:
+            except Exception:
                 disconnected.add(ws)
         for ws in disconnected:
             CONNECTED_CLIENTS.discard(ws)
@@ -169,60 +238,11 @@ async def start_upstox_websocket_streamer():
         await asyncio.sleep(5.0)
         asyncio.create_task(start_upstox_websocket_streamer())
 
-# --- 🔐 AUTO TOKEN GENERATION ROUTES ---
-async def login_route(request: web.Request):
-    """Redirects user to Upstox Authorization URL"""
-    auth_url = (
-        f"https://api.upstox.com/v2/login/authorization/dialog"
-        f"?response_type=code&client_id={API_KEY}&redirect_uri={REDIRECT_URI}"
-    )
-    raise web.HTTPFound(auth_url)
-
-async def callback_route(request: web.Request):
-    """Receives Code from Upstox and Exchanges for Access Token automatically"""
-    global ACCESS_TOKEN, configuration
-    code = request.query.get("code")
-    
-    if not code:
-        return web.json_response({"status": False, "message": "Auth Code missing"}, status=400)
-
-    token_url = "https://api.upstox.com/v2/login/authorization/token"
-    headers = {
-        "accept": "application/json",
-        "Content-Type": "application/x-www-form-urlencoded"
-    }
-    payload = {
-        "code": code,
-        "client_id": API_KEY,
-        "client_secret": API_SECRET,
-        "redirect_uri": REDIRECT_URI,
-        "grant_type": "authorization_code"
-    }
-
-    async with aiohttp.ClientSession() as session:
-        async with session.post(token_url, headers=headers, data=payload) as resp:
-            res = await resp.json()
-            if resp.status == 200 and "access_token" in res:
-                ACCESS_TOKEN = res["access_token"]
-                configuration.access_token = ACCESS_TOKEN
-                logger.info("🔑 New Access Token generated successfully!")
-                
-                # Restart WS with new Token
-                asyncio.create_task(start_upstox_websocket_streamer())
-                return web.json_response({
-                    "status": True,
-                    "message": "Access Token updated automatically!",
-                    "access_token": ACCESS_TOKEN
-                })
-            else:
-                return web.json_response({"status": False, "error": res}, status=400)
-
-# --- 🌐 NATIVE WEBSOCKET & REST HANDLERS ---
 async def websocket_handler(request: web.Request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
-    
     CONNECTED_CLIENTS.add(ws)
+
     if LTP_CACHE:
         try:
             await ws.send_str(json.dumps({"type": "initial_ltps", "data": LTP_CACHE}))
@@ -248,15 +268,14 @@ async def websocket_handler(request: web.Request):
     return ws
 
 async def home_route(request: web.Request):
-    totp_now = get_current_totp()
     return web.json_response({
         "status": True,
-        "message": "MUNH Titan Upstox Streamer Service is Live!",
+        "message": "MUNH Titan Upstox Streamer Service Live!",
+        "access_token_active": bool(ACCESS_TOKEN),
         "market_is_open": is_market_open(),
         "subscribed_tokens_count": len(SUBSCRIBED_TOKENS),
         "connected_clients": len(CONNECTED_CLIENTS),
-        "current_totp": totp_now,
-        "version": "1.4.0"
+        "version": "2.0.0-fully-automated"
     })
 
 async def fetch_chart_data(request: web.Request):
@@ -298,15 +317,20 @@ async def fetch_chart_data(request: web.Request):
         return web.json_response({"status": False, "message": str(e)}, status=500)
 
 app.router.add_get('/', home_route)
-app.router.add_get('/login', login_route)
-app.router.add_get('/callback', callback_route)
 app.router.add_get('/ws', websocket_handler)
 app.router.add_post('/api/get_chart_data', fetch_chart_data)
 
+# --- 🔄 AUTOMATED STARTUP FLOW ---
 async def start_background_tasks(app):
     global MAIN_EVENT_LOOP
     MAIN_EVENT_LOOP = asyncio.get_running_loop()
-    asyncio.create_task(start_upstox_websocket_streamer())
+    
+    # Run Playwright Auto Login
+    success = await auto_login_and_get_token()
+    if success:
+        asyncio.create_task(start_upstox_websocket_streamer())
+    else:
+        logger.error("❌ Auto-login failed on startup.")
 
 app.on_startup.append(start_background_tasks)
 
