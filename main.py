@@ -60,16 +60,25 @@ async def auto_login_and_get_token():
                 args=[
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
-                    "--disable-blink-features=AutomationControlled"
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-infobars"
                 ]
             )
             context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                viewport={'width': 1366, 'height': 768}
             )
-            page = await context.new_page()
             
+            # Hide webdriver flag to bypass Upstox Anti-Bot
+            await context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                });
+            """)
+
+            page = await context.new_page()
             await page.set_extra_http_headers({"Accept-Language": "en-US,en;q=0.9"})
-            await page.goto(auth_url, wait_until="domcontentloaded", timeout=60000)
+            await page.goto(auth_url, wait_until="networkidle", timeout=60000)
             await asyncio.sleep(3)
 
             # 1. Fill Mobile Number
@@ -92,7 +101,7 @@ async def auto_login_and_get_token():
             await page.fill("input[type='password'], #pinCode, input[name='pin']", PIN)
             await page.click("button:has-text('Continue'), button[type='submit']")
 
-            # 4. Wait for redirect and extract auth code
+            # 4. Wait for redirect code
             await page.wait_for_url(f"*{REDIRECT_URI}*", timeout=40000)
             final_url = page.url
             await browser.close()
@@ -333,16 +342,18 @@ app.router.add_get('/ws', websocket_handler)
 app.router.add_post('/api/get_chart_data', fetch_chart_data)
 
 # --- 🔄 AUTOMATED STARTUP FLOW ---
-async def start_background_tasks(app):
-    global MAIN_EVENT_LOOP
-    MAIN_EVENT_LOOP = asyncio.get_running_loop()
-    
-    # Run Playwright Auto Login
+async def run_login_flow():
     success = await auto_login_and_get_token()
     if success:
         asyncio.create_task(start_upstox_websocket_streamer())
     else:
         logger.error("❌ Auto-login failed on startup.")
+
+async def start_background_tasks(app):
+    global MAIN_EVENT_LOOP
+    MAIN_EVENT_LOOP = asyncio.get_running_loop()
+    # Execute non-blocking login task
+    asyncio.create_task(run_login_flow())
 
 app.on_startup.append(start_background_tasks)
 
