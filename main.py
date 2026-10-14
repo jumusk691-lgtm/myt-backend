@@ -24,11 +24,11 @@ logger = logging.getLogger("MUNH_TITAN_WEBSOCKET")
 
 # --- 🔑 UPSTOX CREDENTIALS & AUTO-LOGIN CONFIG ---
 API_KEY = "eba0a80f-c907-42fa-a926-6672a120254d"
-API_SECRET = os.getenv("UPSTOX_API_SECRET", "cg0pdqyg8t")
+API_SECRET = "cg0pdqyg8t"
 
-UPSTOX_MOBILE = os.getenv("UPSTOX_MOBILE", "YOUR_MOBILE_NUMBER")
-UPSTOX_PIN = os.getenv("UPSTOX_PIN", "YOUR_6_DIGIT_PIN")
-UPSTOX_TOTP_KEY = os.getenv("UPSTOX_TOTP_KEY", "YOUR_TOTP_SECRET_KEY")
+UPSTOX_MOBILE = "7735493540"
+UPSTOX_PIN = "000000"
+UPSTOX_TOTP_KEY = "7IAVCJOYBS4MNJFEX55TR52DJKLW6FPA"
 REDIRECT_URI = "https://127.0.0.1/"
 
 DEFAULT_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza1_2MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI2MkFIN0siLCJqdGkiOiI2YTdhMTJlZjk1YjgyYzEzZjc5OWEyMmIiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlzRXh0ZW5kZWQiOnRydWUsImlhdCI6MTc4NjM4NTEzNSwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxODE3OTM1MjAwfQ.0z7HMMUZUwJ6mRkzY3EUE1bB36_i1c7M-6yiNc8clgs"
@@ -311,7 +311,7 @@ async def home_route(request: web.Request):
         "active_stream_mode": active_mode,
         "subscribed_tokens_count": len(SUBSCRIBED_TOKENS),
         "connected_android_clients": len(CONNECTED_CLIENTS),
-        "version": "1.3.5-playwright"
+        "version": "1.3.6-playwright-configured"
     })
 
 async def fetch_chart_data(request: web.Request):
