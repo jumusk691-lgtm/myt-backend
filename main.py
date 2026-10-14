@@ -6,6 +6,14 @@ import os
 import pytz
 import aiohttp
 from aiohttp import web
+import pyotp
+import requests
+
+# --- Selenium Imports for Auto Token Generation ---
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
 # --- Upstox Official SDK ---
 import upstox_client
@@ -17,42 +25,117 @@ IST = pytz.timezone('Asia/Kolkata')
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("MUNH_TITAN_WEBSOCKET")
 
-# --- 🔑 UPSTOX CREDENTIALS ---
+# --- 🔑 UPSTOX CREDENTIALS & AUTO-LOGIN CONFIG ---
 API_KEY = "eba0a80f-c907-42fa-a926-6672a120254d"
 API_SECRET = os.getenv("UPSTOX_API_SECRET", "cg0pdqyg8t")
 
-# 1-YEAR ANALYTICS ACCESS TOKEN
+UPSTOX_MOBILE = os.getenv("UPSTOX_MOBILE", "YOUR_MOBILE_NUMBER")
+UPSTOX_PIN = os.getenv("UPSTOX_PIN", "YOUR_6_DIGIT_PIN")
+UPSTOX_TOTP_KEY = os.getenv("UPSTOX_TOTP_KEY", "YOUR_TOTP_SECRET_KEY")
+REDIRECT_URI = "https://127.0.0.1/"
+
 DEFAULT_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza1_2MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI2MkFIN0siLCJqdGkiOiI2YTdhMTJlZjk1YjgyYzEzZjc5OWEyMmIiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlzRXh0ZW5kZWQiOnRydWUsImlhdCI6MTc4NjM4NTEzNSwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxODE3OTM1MjAwfQ.0z7HMMUZUwJ6mRkzY3EUE1bB36_i1c7M-6yiNc8clgs"
 
-ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", DEFAULT_TOKEN).strip()
+# --- 🔐 AUTOMATIC UPSTOX ACCESS TOKEN GENERATOR ---
+def get_live_access_token() -> str:
+    logger.info("🔄 Auto-generating fresh Upstox Access Token...")
+    
+    options = webdriver.ChromeOptions()
+    options.add_argument("--headless")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    
+    driver = webdriver.Chrome(options=options)
+    try:
+        auth_url = (
+            f"https://api.upstox.com/v2/login/authorization/dialog?"
+            f"client_id={API_KEY}&redirect_uri={REDIRECT_URI}&response_type=code"
+        )
+        driver.get(auth_url)
+        
+        wait = WebDriverWait(driver, 15)
+        
+        # 1. Enter Mobile Number
+        mobile_input = wait.until(EC.presence_of_element_located((By.ID, "mobileNum")))
+        mobile_input.send_keys(UPSTOX_MOBILE)
+        
+        continue_btn = driver.find_element(By.XPATH, "//button[@type='submit']")
+        continue_btn.click()
+        
+        # 2. Enter TOTP (OTP)
+        totp_code = pyotp.TOTP(UPSTOX_TOTP_KEY).now()
+        otp_input = wait.until(EC.presence_of_element_located((By.ID, "otpNum")))
+        otp_input.send_keys(totp_code)
+        
+        verify_btn = driver.find_element(By.XPATH, "//button[@type='submit']")
+        verify_btn.click()
+        
+        # 3. Enter Pin
+        pin_input = wait.until(EC.presence_of_element_located((By.ID, "pinCode")))
+        pin_input.send_keys(UPSTOX_PIN)
+        
+        pin_submit = driver.find_element(By.XPATH, "//button[@type='submit']")
+        pin_submit.click()
+        
+        # 4. Extract Code and Exchange for Token
+        wait.until(lambda d: "code=" in d.current_url)
+        current_url = driver.current_url
+        
+        code_part = current_url.split("code=")[1].split("&")[0]
+        logger.info("✅ Authorization Code मिल गया है!")
+        
+        token_url = "https://api.upstox.com/v2/login/authorization/token"
+        payload = {
+            'code': code_part,
+            'client_id': API_KEY,
+            'client_secret': API_SECRET,
+            'redirect_uri': REDIRECT_URI,
+            'grant_type': 'authorization_code'
+        }
+        resp = requests.post(token_url, data=payload)
+        res_data = resp.json()
+        
+        if "access_token" in res_data:
+            new_token = res_data["access_token"]
+            logger.info("🎉 नया Access Token सफलतापूर्वक जनरेट हो गया!")
+            return new_token
+        else:
+            logger.error(f"❌ Token exchange failed: {res_data}")
+            return DEFAULT_TOKEN
+            
+    except Exception as e:
+        logger.error(f"❌ Auto token generation error: {e}, falling back to default token.")
+        return DEFAULT_TOKEN
+    finally:
+        driver.quit()
+
+# Automatically fetch token on start, fallback to default if automation fails
+ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", "").strip()
+if not ACCESS_TOKEN:
+    ACCESS_TOKEN = get_live_access_token()
 
 configuration = upstox_client.Configuration()
 configuration.access_token = ACCESS_TOKEN
 
 # --- 🚀 REAL WEBSOCKET DATA & LIVE CANDLE STORAGE ---
 LTP_CACHE = {}                 
-LIVE_CANDLES_CACHE = {}        # Real-time 1-min candle cache from websocket ticks
-LAST_BROADCAST_TIME = {}       # Throttling dictionary (1-second limit)
+LIVE_CANDLES_CACHE = {}        
+LAST_BROADCAST_TIME = {}       
 SUBSCRIBED_TOKENS = set(["NSE_INDEX|Nifty 50", "BSE_INDEX|SENSEX", "MCX_FO|495213", "MCX_FO|563946"])
 CONNECTED_CLIENTS = set()
 MAIN_EVENT_LOOP = None
 streamer = None
 
-# Aiohttp App Setup
 app = web.Application()
 
-# --- 🕒 MARKET STATUS CHECKER (ON / OFF) ---
 def is_market_open() -> bool:
     now = datetime.datetime.now(IST)
     if now.weekday() >= 5:
         return False
-    
     market_start = now.replace(hour=9, minute=15, second=0, microsecond=0)
     market_end = now.replace(hour=23, minute=30, second=0, microsecond=0)
-    
     return market_start <= now <= market_end
 
-# --- 📡 BROADCAST LIVE TICK & REAL-TIME CANDLE TO NATIVE WEBSOCKET CLIENTS ---
 async def broadcast_tick(token: str, price: float):
     price_str = f"{price:.2f}"
     LTP_CACHE[token] = price_str
@@ -61,7 +144,6 @@ async def broadcast_tick(token: str, price: float):
     now_ts = now_dt.timestamp()
     current_minute_key = now_dt.strftime("%Y-%m-%d %H:%M")
     
-    # Update internal 1-minute candle structure on every tick
     if token not in LIVE_CANDLES_CACHE:
         LIVE_CANDLES_CACHE[token] = {}
         
@@ -79,18 +161,15 @@ async def broadcast_tick(token: str, price: float):
         candle["low"] = min(candle["low"], price)
         candle["close"] = price
 
-    # Standardize Index aliases for Android Client mapping
     if "Nifty 50" in token:
         LTP_CACHE["NIFTY"] = price_str
     elif "SENSEX" in token:
         LTP_CACHE["SENSEX"] = price_str
 
-    # Throttle WS Broadcast to maximum 1 update per second per token
     if now_ts - LAST_BROADCAST_TIME.get(token, 0) < 1.0:
         return
         
     LAST_BROADCAST_TIME[token] = now_ts
-
     current_candle = LIVE_CANDLES_CACHE[token][current_minute_key]
 
     payload = {
@@ -114,11 +193,9 @@ async def broadcast_tick(token: str, price: float):
             except Exception as e:
                 logger.error(f"❌ Error sending tick to client: {e}")
                 disconnected.add(ws)
-        
         for ws in disconnected:
             CONNECTED_CLIENTS.discard(ws)
 
-# --- 🔄 UPSTOX OFFICIAL WEBSOCKET STREAMER (100% REAL-TIME) ---
 async def start_upstox_websocket_streamer():
     global streamer
     logger.info("⚡ Upstox MarketDataStreamerV3 WebSocket Connecting...")
@@ -136,7 +213,6 @@ async def start_upstox_websocket_streamer():
         try:
             if isinstance(message, str):
                 message = json.loads(message)
-
             if isinstance(message, dict):
                 feeds = message.get("feeds", {})
                 for inst_key, details in feeds.items():
@@ -175,7 +251,6 @@ async def start_upstox_websocket_streamer():
         await asyncio.sleep(5.0)
         asyncio.create_task(start_upstox_websocket_streamer())
 
-# --- 🌐 NATIVE WEBSOCKET HANDLER FOR ANDROID CLIENT ---
 async def websocket_handler(request: web.Request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
@@ -210,21 +285,15 @@ async def websocket_handler(request: web.Request):
                             try:
                                 if streamer:
                                     streamer.subscribe([norm_token], "ltpc")
-                                    logger.info(f"📡 Dynamically Subscribed via Upstox WS: {norm_token}")
-                            except Exception as sub_err:
-                                logger.info(f"ℹ️ Subscription deferred for {norm_token} until WS open.")
-                    
+                            except Exception:
+                                pass
                     if streamer and new_tokens:
                         try:
                             streamer.subscribe(list(SUBSCRIBED_TOKENS), "ltpc")
                         except Exception:
                             pass
-
-                    logger.info(f"Total Subscribed Upstox Keys Count: {len(SUBSCRIBED_TOKENS)}")
                 except Exception as parse_err:
-                    logger.error(f"❌ Error parsing client websocket message: {parse_err}")
-            elif msg.type == aiohttp.WSMsgType.ERROR:
-                logger.error(f"❌ WebSocket connection closed with exception {ws.exception()}")
+                    logger.error(f"❌ Error parsing client message: {parse_err}")
     except Exception as e:
         logger.error(f"❌ WebSocket session error: {e}")
     finally:
@@ -233,7 +302,6 @@ async def websocket_handler(request: web.Request):
 
     return ws
 
-# --- 🌐 REST HTTP API ENDPOINTS (STATUS & CHART HISTORICAL DATA) ---
 async def home_route(request: web.Request):
     market_status = is_market_open()
     active_mode = "100% Pure WebSocket Mode (Market is OPEN)" if market_status else "REST API v2 / Historical Mode (Market is CLOSED)"
@@ -245,7 +313,7 @@ async def home_route(request: web.Request):
         "active_stream_mode": active_mode,
         "subscribed_tokens_count": len(SUBSCRIBED_TOKENS),
         "connected_android_clients": len(CONNECTED_CLIENTS),
-        "version": "1.3.3"
+        "version": "1.3.4-auto"
     })
 
 async def fetch_chart_data(request: web.Request):
@@ -288,31 +356,26 @@ async def fetch_chart_data(request: web.Request):
         all_raw_candles = []
 
         async with aiohttp.ClientSession() as session:
-            # 1. Fetch Today's Intraday Candles (9:15 AM to Current Time)
             intra_url = f"https://api.upstox.com/v2/historical-candle/intraday/{instrument_key}/{unit}"
             try:
                 async with session.get(intra_url, headers=headers) as resp_intra:
                     if resp_intra.status == 200:
                         res_intra = await resp_intra.json()
                         if res_intra.get("status") == "success":
-                            candles_intra = res_intra.get("data", {}).get("candles", [])
-                            all_raw_candles.extend(candles_intra)
+                            all_raw_candles.extend(res_intra.get("data", {}).get("candles", []))
             except Exception as intra_err:
                 logger.error(f"❌ Error fetching intraday candles: {intra_err}")
 
-            # 2. Fetch Past Days Historical Candles
             hist_url = f"https://api.upstox.com/v2/historical-candle/{instrument_key}/{unit}/{to_date}/{from_date}"
             try:
                 async with session.get(hist_url, headers=headers) as resp_hist:
                     if resp_hist.status == 200:
                         res_hist = await resp_hist.json()
                         if res_hist.get("status") == "success":
-                            candles_hist = res_hist.get("data", {}).get("candles", [])
-                            all_raw_candles.extend(candles_hist)
+                            all_raw_candles.extend(res_hist.get("data", {}).get("candles", []))
             except Exception as hist_err:
                 logger.error(f"❌ Error fetching historical candles: {hist_err}")
 
-        # 3. Append WebSocket live building 1-min candles into the raw candles list
         if instrument_key in LIVE_CANDLES_CACHE:
             for k_min, c_val in LIVE_CANDLES_CACHE[instrument_key].items():
                 dt_str = datetime.datetime.fromtimestamp(c_val["time"], IST).isoformat()
@@ -335,7 +398,6 @@ async def fetch_chart_data(request: web.Request):
 
             unique_candles.sort(key=lambda x: x[0])
 
-            # Resample all candles (Intraday + Historical + Live WS) for selected timeframe
             if unit == "1minute" and target_minutes > 1:
                 resampled = []
                 current_agg = None
@@ -424,11 +486,9 @@ app.router.add_get('/', home_route)
 app.router.add_get('/ws', websocket_handler)
 app.router.add_post('/api/get_chart_data', fetch_chart_data)
 
-# --- 🔄 BACKGROUND TASKS ---
 async def start_background_tasks(app):
     global MAIN_EVENT_LOOP
     MAIN_EVENT_LOOP = asyncio.get_running_loop()
-    
     asyncio.create_task(start_upstox_websocket_streamer())
     logger.info("✅ Upstox Background Task Initialized.")
 
