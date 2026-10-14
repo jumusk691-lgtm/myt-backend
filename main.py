@@ -9,11 +9,8 @@ from aiohttp import web
 import pyotp
 import requests
 
-# --- Selenium Imports for Auto Token Generation ---
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+# --- Playwright for Auto Token Generation on Cloud ---
+from playwright.async_api import async_playwright
 
 # --- Upstox Official SDK ---
 import upstox_client
@@ -36,80 +33,81 @@ REDIRECT_URI = "https://127.0.0.1/"
 
 DEFAULT_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza1_2MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI2MkFIN0siLCJqdGkiOiI2YTdhMTJlZjk1YjgyYzEzZjc5OWEyMmIiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlzRXh0ZW5kZWQiOnRydWUsImlhdCI6MTc4NjM4NTEzNSwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxODE3OTM1MjAwfQ.0z7HMMUZUwJ6mRkzY3EUE1bB36_i1c7M-6yiNc8clgs"
 
-# --- 🔐 AUTOMATIC UPSTOX ACCESS TOKEN GENERATOR ---
-def get_live_access_token() -> str:
-    logger.info("🔄 Auto-generating fresh Upstox Access Token...")
+# --- 🔐 AUTOMATIC UPSTOX ACCESS TOKEN GENERATOR VIA PLAYWRIGHT ---
+async def get_live_access_token_async() -> str:
+    logger.info("🔄 Auto-generating fresh Upstox Access Token using Playwright...")
     
-    options = webdriver.ChromeOptions()
-    options.add_argument("--headless")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    
-    driver = webdriver.Chrome(options=options)
-    try:
-        auth_url = (
-            f"https://api.upstox.com/v2/login/authorization/dialog?"
-            f"client_id={API_KEY}&redirect_uri={REDIRECT_URI}&response_type=code"
-        )
-        driver.get(auth_url)
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+        context = await browser.new_context()
+        page = await context.new_page()
         
-        wait = WebDriverWait(driver, 15)
-        
-        # 1. Enter Mobile Number
-        mobile_input = wait.until(EC.presence_of_element_located((By.ID, "mobileNum")))
-        mobile_input.send_keys(UPSTOX_MOBILE)
-        
-        continue_btn = driver.find_element(By.XPATH, "//button[@type='submit']")
-        continue_btn.click()
-        
-        # 2. Enter TOTP (OTP)
-        totp_code = pyotp.TOTP(UPSTOX_TOTP_KEY).now()
-        otp_input = wait.until(EC.presence_of_element_located((By.ID, "otpNum")))
-        otp_input.send_keys(totp_code)
-        
-        verify_btn = driver.find_element(By.XPATH, "//button[@type='submit']")
-        verify_btn.click()
-        
-        # 3. Enter Pin
-        pin_input = wait.until(EC.presence_of_element_located((By.ID, "pinCode")))
-        pin_input.send_keys(UPSTOX_PIN)
-        
-        pin_submit = driver.find_element(By.XPATH, "//button[@type='submit']")
-        pin_submit.click()
-        
-        # 4. Extract Code and Exchange for Token
-        wait.until(lambda d: "code=" in d.current_url)
-        current_url = driver.current_url
-        
-        code_part = current_url.split("code=")[1].split("&")[0]
-        logger.info("✅ Authorization Code मिल गया है!")
-        
-        token_url = "https://api.upstox.com/v2/login/authorization/token"
-        payload = {
-            'code': code_part,
-            'client_id': API_KEY,
-            'client_secret': API_SECRET,
-            'redirect_uri': REDIRECT_URI,
-            'grant_type': 'authorization_code'
-        }
-        resp = requests.post(token_url, data=payload)
-        res_data = resp.json()
-        
-        if "access_token" in res_data:
-            new_token = res_data["access_token"]
-            logger.info("🎉 नया Access Token सफलतापूर्वक जनरेट हो गया!")
-            return new_token
-        else:
-            logger.error(f"❌ Token exchange failed: {res_data}")
-            return DEFAULT_TOKEN
+        try:
+            auth_url = (
+                f"https://api.upstox.com/v2/login/authorization/dialog?"
+                f"client_id={API_KEY}&redirect_uri={REDIRECT_URI}&response_type=code"
+            )
+            await page.goto(auth_url)
             
-    except Exception as e:
-        logger.error(f"❌ Auto token generation error: {e}, falling back to default token.")
-        return DEFAULT_TOKEN
-    finally:
-        driver.quit()
+            # 1. Enter Mobile Number
+            await page.wait_for_selector("#mobileNum", timeout=15000)
+            await page.fill("#mobileNum", UPSTOX_MOBILE)
+            await page.click("button[type='submit']")
+            
+            # 2. Enter TOTP
+            totp_code = pyotp.TOTP(UPSTOX_TOTP_KEY).now()
+            await page.wait_for_selector("#otpNum", timeout=15000)
+            await page.fill("#otpNum", totp_code)
+            await page.click("button[type='submit']")
+            
+            # 3. Enter PIN
+            await page.wait_for_selector("#pinCode", timeout=15000)
+            await page.fill("#pinCode", UPSTOX_PIN)
+            await page.click("button[type='submit']")
+            
+            # 4. Wait for Redirect URL containing code
+            await page.wait_for_url("**/code=*", timeout=20000)
+            current_url = page.url
+            
+            code_part = current_url.split("code=")[1].split("&")[0]
+            logger.info("✅ Authorization Code मिल गया है!")
+            
+            token_url = "https://api.upstox.com/v2/login/authorization/token"
+            payload = {
+                'code': code_part,
+                'client_id': API_KEY,
+                'client_secret': API_SECRET,
+                'redirect_uri': REDIRECT_URI,
+                'grant_type': 'authorization_code'
+            }
+            
+            loop = asyncio.get_running_loop()
+            resp = await loop.run_in_executor(None, lambda: requests.post(token_url, data=payload))
+            res_data = resp.json()
+            
+            await browser.close()
+            
+            if "access_token" in res_data:
+                new_token = res_data["access_token"]
+                logger.info("🎉 नया Access Token सफलतापूर्वक जनरेट हो गया!")
+                return new_token
+            else:
+                logger.error(f"❌ Token exchange failed: {res_data}")
+                return DEFAULT_TOKEN
+                
+        except Exception as e:
+            logger.error(f"❌ Playwright auto token error: {e}, falling back to default token.")
+            await browser.close()
+            return DEFAULT_TOKEN
 
-# Automatically fetch token on start, fallback to default if automation fails
+# Helper wrapper to run async token generator synchronously during startup if needed
+def get_live_access_token() -> str:
+    try:
+        return asyncio.run(get_live_access_token_async())
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        return loop.run_until_complete(get_live_access_token_async())
+
 ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", "").strip()
 if not ACCESS_TOKEN:
     ACCESS_TOKEN = get_live_access_token()
@@ -313,7 +311,7 @@ async def home_route(request: web.Request):
         "active_stream_mode": active_mode,
         "subscribed_tokens_count": len(SUBSCRIBED_TOKENS),
         "connected_android_clients": len(CONNECTED_CLIENTS),
-        "version": "1.3.4-auto"
+        "version": "1.3.5-playwright"
     })
 
 async def fetch_chart_data(request: web.Request):
